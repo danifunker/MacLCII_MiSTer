@@ -634,13 +634,14 @@ module dataController_top(
 	// here but synthesized its 256-entry PRAM as flat flops, eating ~48k ALMs
 	// — about 94% of the entire design. The HC05 wrapper has the exact same
 	// port signature ("drop-in replacement") and infers block RAM for ROM/PRAM.
-	// We keep the behavioral version available for SIMULATION because the
-	// HC05 core (converted from VHDL via GHDL) has multiple Verilator-
-	// unfriendly constructs (BLKLOOPINIT, etc.) and because the boot-ROM
-	// debugging we typically do in Verilator doesn't depend on faithful
-	// Egret-firmware simulation — the behavioral SM is close enough to
-	// release the 68020 from reset and answer initial VIA SR exchanges.
-`ifdef SIMULATION
+	// CONSOLIDATED: the real HC05 wrapper is now used for BOTH Verilator and
+	// FPGA so the simulation matches hardware. The behavioral SM hid the Egret
+	// CB1/overlay-escape bug (it drives CB1 slowly, so the VIA SR never drops
+	// edges); using the HC05 in sim lets us reproduce and fix that bug without
+	// burning Quartus builds. The behavioral SM remains available only if
+	// EGRET_BEHAVIORAL is defined. The GHDL-converted HC05 core needs a few
+	// -Wno-* in the Verilator Makefile (BLKLOOPINIT, etc.).
+`ifdef EGRET_BEHAVIORAL
 	egret_behavioral egret_inst(
 `else
 	egret_wrapper egret_inst(

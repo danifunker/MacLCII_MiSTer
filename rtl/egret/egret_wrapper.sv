@@ -700,7 +700,7 @@ always @(posedge clk) begin
         // Copy PRAM to internal RAM: PRAM[0-255] -> CPU 0x100-0x1FF
         // Offset 0x70 = (0x100 - 0x90) to convert CPU address to intram index
         // NOTE: blocking `=` (not `<=`) inside the for-loop is required for
-        // Verilator (BLKLOOPINIT — non-delayed array-write-in-loop is ok,
+        // the sim build's BLKLOOPINIT lint (BLKLOOPINIT — non-delayed array-write-in-loop is ok,
         // delayed is not). Quartus accepts both; the effective behavior is
         // the same here because every iteration writes a DIFFERENT index
         // and there's no read-modify-write within the loop.
