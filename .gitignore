@@ -46,3 +46,6 @@ verilator/*.png
 
 # analysis scratchpad (Track A/C diffs, sim summaries, screenshots)
 scratch/
+verilator/*.out
+verilator/*.err
+verilator/build*.log

@@ -527,7 +527,9 @@ module scc
 	// Reset channel B on: WR9 with bits 7:6 = 01 (channel B reset) OR 11 (hardware reset)
 	assign reset_b = ((wreg_a | wreg_b) & (rindex_latch == 9) & ((wdata[7:6] == 2'b01) | (wdata[7:6] == 2'b11))) | reset;
 
-	// Debug: Show resets
+	// Debug: Show resets (fires every cen cycle while reset held -> stdout flood;
+	// gated behind VERBOSE_TRACE, same as the BERR/RAM_WR diagnostics)
+`ifdef VERBOSE_TRACE
 	always @(posedge clk) begin
 		if (cen) begin
 			if (reset) $display("SCC_RESET: Hardware reset triggered");
@@ -535,6 +537,7 @@ module scc
 			if (reset_b) $display("SCC_RESET: Channel B reset triggered");
 		end
 	end
+`endif
 
 	/* WR1
 	 * Reset: bit 5 and 2 unchanged */
@@ -1305,10 +1308,14 @@ end
 	always@(posedge clk or posedge reset) begin
 		if (reset) begin
 			tx_empty_latch_a <= 1'b1;  // Reset: transmitter is empty
+`ifdef VERBOSE_TRACE
 			$display("SCC_LATCH: tx_empty_latch_a <= 1 (hardware reset)");
+`endif
 		end else if (reset_a) begin
 			tx_empty_latch_a <= 1'b1;  // Channel reset: transmitter is empty
+`ifdef VERBOSE_TRACE
 			$display("SCC_LATCH: tx_empty_latch_a <= 1 (channel reset)");
+`endif
     end else begin
         // Combinational detect of ADATA write (channel A data port)
         // Clear TXEMPTY immediately on ADATA write
