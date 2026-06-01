@@ -682,6 +682,9 @@ module via6522 (
     reg [2:0]  bit_cnt = 3'd0;
     reg        shift_pulse;
     reg        shift_active_prev_rising = 1'b0;  // For detecting shift completion
+    reg        cb2_shift_out = 1'b1;             // Registered shift-out data bit on CB2
+                                                 // (presents MSB, held across the CB1
+                                                 // edge before rotating - MAME shift_out)
 
     always @(*) begin
         case (shift_clk_sel)
@@ -784,7 +787,7 @@ module via6522 (
         cb1_t_int = (ext_clock_mode) ?
                     1'b0 : serport_en;
         cb1_o_int = shift_clock_d;
-        ser_cb2_o = shift_reg[7];
+        ser_cb2_o = cb2_shift_out;   // registered MSB (see cb2_shift_out)
     end
 
     always @(*) begin
@@ -798,10 +801,12 @@ module via6522 (
     always @(posedge clock) begin
         if (reset == 1'b1) begin
             shift_reg <= 8'hFF;
+            cb2_shift_out <= 1'b1;
         end else begin
             // CPU writes the SR (E-timed bus access) - highest priority.
             if (falling == 1'b1 && wen == 1'b1 && addr == 4'hA) begin
                 shift_reg <= data_in;
+                cb2_shift_out <= data_in[7];   // present MSB immediately on load
                 `ifdef SIMULATION
                 $display("VIA: SR write = 0x%02x, ACR=0x%02x (mode=%d, dir=%b, serport_en=%b, cb2_o=%b)",
                          data_in, acr, shift_mode_control, shift_dir, serport_en, ser_cb2_o);
@@ -814,6 +819,12 @@ module via6522 (
             // coalescing into one shift per E-period (the Egret SR hang).
             end else if (ext_clock_mode) begin
                 if (shift_dir == 1'b1 && shift_tick_f == 1'b1) begin            // output (falling)
+                    // MAME shift_out: latch the current MSB onto CB2 (held across
+                    // the edge) BEFORE rotating, so the Egret - which reads CB2
+                    // AFTER its CB1 falling+rising ($14EF-$14F3) - samples bit7
+                    // first. Combinational CB2=shift_reg[7] was one bit early and
+                    // rotated every received byte (the byte-4 turnaround stall).
+                    cb2_shift_out <= shift_reg[7];
                     shift_reg <= {shift_reg[6:0], shift_reg[7]};
                 end else if (shift_dir == 1'b0 && shift_mode_control != 3'b000 && shift_tick_r == 1'b1) begin // input (rising)
                     `ifdef SIMULATION
@@ -824,6 +835,7 @@ module via6522 (
             // Internal-clock modes (T2 / O2): unchanged, E-paced.
             end else if (falling == 1'b1) begin
                 if (shift_dir == 1'b1 && shift_tick_f == 1'b1) begin            // output
+                    cb2_shift_out <= shift_reg[7];
                     shift_reg <= {shift_reg[6:0], shift_reg[7]};
                 end else if (shift_mode_control != 3'b000 && shift_dir == 1'b0 && shift_clk_sel != 2'b11 && shift_tick_r == 1'b1) begin // input
                     shift_reg <= {shift_reg[6:0], cb2_i};
