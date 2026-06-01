@@ -13,8 +13,9 @@ while tasklist 2>/dev/null | grep -qiE "quartus_(map|fit|asm|sta|sh|pgm)\.exe"; 
 done
 touch output_files/.compile_in_progress
 echo "[$(date)] Starting compile" | tee -a "$LOG"
+# `| tee` would mask Quartus's real exit code via the pipeline. Use PIPESTATUS.
 quartus_sh --flow compile MacLC 2>&1 | tee -a "$LOG"
-RC=$?
+RC=${PIPESTATUS[0]}
 rm -f output_files/.compile_in_progress
 echo "[$(date)] Compile exit=$RC at $(date)" | tee -a "$LOG"
 ls -la output_files/MacLC.{sof,rbf} 2>&1 | tee -a "$LOG"

@@ -25,6 +25,27 @@ if [ ! -f output_files/$RBF_NAME ]; then
     log "ERROR: output_files/$RBF_NAME does not exist - build failed?"
     exit 1
 fi
+# Refuse to deploy if the latest build was a failed Quartus run that left
+# a stale rbf behind. We trust output_files/MacLC.fit.summary's first line
+# ("Fitter Status : Successful" vs "...: Failed") and the log file's
+# trailing "Compile exit=N" line. The previous mtime check was too strict
+# — Quartus writes the rbf, then our build.sh appends "Compile exit=N" to
+# the log, so the log is always a few seconds newer than the rbf even
+# after a clean build.
+FIT_STATUS=$(awk 'NR==1' output_files/MacLC.fit.summary 2>/dev/null)
+LATEST_LOG=$(ls -1t output_files/auto_compile_*.log 2>/dev/null | head -1)
+LAST_EXIT_LINE=$(grep -E "^\[.+\] Compile exit=" "$LATEST_LOG" 2>/dev/null | tail -1)
+case "$FIT_STATUS" in
+    *Successful*) ;;
+    *Failed*)
+        log "ERROR: Quartus Fitter reported Failed in MacLC.fit.summary:"
+        log "  $FIT_STATUS"
+        log "  Inspect $LATEST_LOG."
+        exit 1 ;;
+    *)
+        log "WARN: no parseable Fitter Status in MacLC.fit.summary. Build state unknown."
+        log "  Continuing — but $LATEST_LOG should have the last exit line: $LAST_EXIT_LINE" ;;
+esac
 LOCAL_MD5=$(md5sum output_files/$RBF_NAME | awk '{print $1}')
 log "local rbf md5 = $LOCAL_MD5"
 

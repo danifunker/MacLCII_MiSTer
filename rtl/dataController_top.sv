@@ -617,7 +617,12 @@ module dataController_top(
 	end
 
 `ifdef USE_EGRET_CPU
-	egret_behavioral egret_inst(
+	// Use the real 68HC05 + 341S0851 firmware (rtl/egret/egret_wrapper.sv).
+	// The behavioral SM (rtl/egret_behavioral.sv) was previously instantiated
+	// here but synthesized its 256-entry PRAM as flat flops, eating ~48k ALMs
+	// — about 94% of the entire design. The HC05 wrapper has the exact same
+	// port signature ("drop-in replacement") and infers block RAM for ROM/PRAM.
+	egret_wrapper egret_inst(
 		.clk            (clk32),
 		.clk8_en        (clk8_en_p),
 		.reset          (egretReset),  // Egret uses shorter reset than 68000

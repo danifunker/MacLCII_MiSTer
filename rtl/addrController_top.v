@@ -17,6 +17,12 @@ module addrController_top(
 	input _cpuLDS,
 	input _cpuRW,
 	input _cpuAS,
+	// Function code: FC[1]=1 distinguishes program access (FC=2/6) from
+	// data access (FC=1/5) and the reset-vector fetch (FC=5). We use it
+	// to gate the overlay-disable trigger so that only a real instruction
+	// fetch in $A0xxxx clears the overlay, not an incidental data read
+	// of a ROM table. MAME's equivalent gate is !side_effects_disabled.
+	input [2:0] cpuFC,
 
 	// RAM/ROM:
 	output [22:0] memoryAddr,  // 23-bit SDRAM word address
@@ -231,7 +237,14 @@ module addrController_top(
 	assign memoryOverlayOn = rom_overlay;
 	assign overlay_trigger_addr = overlay_trigger_addr_r;
 
-	wire overlay_trigger = !_cpuAS && (cpuAddr[23:20] == 4'hA);
+	// Overlay disables on first INSTRUCTION FETCH in $A00000-$AFFFFF.
+	// Without the cpuFC[1] gate, an incidental data read of a ROM table at
+	// $A0xxxx (e.g. boot ROM reading a pointer at $ABC146) would clear
+	// overlay while the CPU is still executing in the $0xxxxx overlay
+	// region — the next code fetch at $0xxxxx would then read RAM=0 and
+	// the CPU would wild-branch. MAME enforces the same intent via
+	// !side_effects_disabled in v8.cpp:rom_switch_r.
+	wire overlay_trigger = !_cpuAS && (cpuAddr[23:20] == 4'hA) && cpuFC[1];
 
 	always @(posedge clk) begin
 		if (!_cpuReset) begin

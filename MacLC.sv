@@ -381,9 +381,12 @@ module emu
 	wire debug_ovhex  = (dbg_y >= 10'd76) && (dbg_y < 10'd91) && (dbg_x < 10'd92);
 	wire debug_r1hex  = (dbg_y >= 10'd96) && (dbg_y < 10'd111) && (dbg_x < 10'd92);
 	wire debug_vmon   = (dbg_y >= 10'd116) && (dbg_y < 10'd124) && (dbg_x < 10'd64);
+	// Row M (y=128..142): last instruction-fetch PC in the ROM region.
+	// Six hex digits, orange-on-dark — distinct from green (live PC).
+	wire debug_rmhex  = (dbg_y >= 10'd128) && (dbg_y < 10'd143) && (dbg_x < 10'd92);
 	wire debug_any    = debug_egret
 	                  || debug_pchex || debug_ophex || debug_sahex || debug_ovhex || debug_r1hex
-	                  || debug_vmon;
+	                  || debug_vmon || debug_rmhex;
 
 	// Egret status row: 8 blocks, each 8px wide
 	// Block 0: running (Green=yes)
@@ -430,11 +433,26 @@ module emu
 	reg [7:0] cpu_pc_upper = 0;
 	reg [7:0] cpu_pc_lower = 0;
 	reg [7:0] cpu_pc_lowest = 0;
+	// Last ROM PC — only captures fetches whose cpuAddr falls in the ROM
+	// region ($A00000-$AFFFFF). When the CPU wild-branches into RAM
+	// (e.g. lands on $0000-filled words and starts executing ORI.B #0,D0),
+	// the live cpu_pc_* drifts through RAM and tells us nothing about
+	// where the boot actually derailed. last_rom_pc_* freezes at the
+	// most recent legitimate ROM PC, so the HUD shows the exact ROM
+	// address the CPU was last executing before it ran off the rails.
+	reg [7:0] last_rom_pc_upper  = 0;
+	reg [7:0] last_rom_pc_lower  = 0;
+	reg [7:0] last_rom_pc_lowest = 0;
 	always @(posedge clk_sys) begin
 		if (cpu_as_prev && !_cpuAS && cpuFC[1]) begin
 			cpu_pc_upper <= cpuAddr[23:16];
 			cpu_pc_lower <= cpuAddr[15:8];
 			cpu_pc_lowest <= cpuAddr[7:0];
+			if (cpuAddr[23:20] == 4'hA) begin
+				last_rom_pc_upper  <= cpuAddr[23:16];
+				last_rom_pc_lower  <= cpuAddr[15:8];
+				last_rom_pc_lowest <= cpuAddr[7:0];
+			end
 		end
 	end
 	// Capture last opcode data and SDRAM address during instruction fetches
@@ -528,7 +546,8 @@ module emu
 	wire [9:0] hex_base_y = debug_pchex ? 10'd16 :
 	                         debug_ophex ? 10'd36 :
 	                         debug_sahex ? 10'd56 :
-	                         debug_ovhex ? 10'd76 : 10'd96;
+	                         debug_ovhex ? 10'd76 :
+	                         debug_r1hex ? 10'd96 : 10'd128;
 	wire [9:0] hex_local_y = dbg_y - hex_base_y;
 	wire [2:0] hex_font_row = (hex_local_y < 10'd3) ? 3'd0 :
 	                           (hex_local_y < 10'd6) ? 3'd1 :
@@ -567,10 +586,18 @@ module emu
 	                        (hex_digit_idx == 3'd3) ? first_rom_data[11:8] :
 	                        (hex_digit_idx == 3'd4) ? first_rom_data[7:4] :
 	                                                  first_rom_data[3:0];
+	// Last ROM PC: 6 digits = last_rom_pc[23:0]
+	wire [3:0] rm_nibble = (hex_digit_idx == 3'd0) ? last_rom_pc_upper[7:4] :
+	                        (hex_digit_idx == 3'd1) ? last_rom_pc_upper[3:0] :
+	                        (hex_digit_idx == 3'd2) ? last_rom_pc_lower[7:4] :
+	                        (hex_digit_idx == 3'd3) ? last_rom_pc_lower[3:0] :
+	                        (hex_digit_idx == 3'd4) ? last_rom_pc_lowest[7:4] :
+	                                                  last_rom_pc_lowest[3:0];
 	wire [3:0] hex_nibble = debug_pchex ? pc_nibble :
 	                         debug_ophex ? op_nibble :
 	                         debug_sahex ? sa_nibble :
-	                         debug_ovhex ? ov_nibble : r1_nibble;
+	                         debug_ovhex ? ov_nibble :
+	                         debug_r1hex ? r1_nibble : rm_nibble;
 
 	// 4×5 hex font glyphs — each digit is 5 rows of 4 bits (MSB=left)
 	reg [19:0] hex_glyph;
@@ -649,6 +676,15 @@ module emu
 				dbg_r = 8'hFF; dbg_g = 8'hFF; dbg_b = 8'hFF;
 			end else begin
 				dbg_r = 8'h10; dbg_g = 8'h10; dbg_b = 8'h10;
+			end
+		end else if (debug_rmhex) begin
+			// Row M: Last ROM PC — orange on dark.
+			// Frozen at the most recent fetch in $A00000-$AFFFFF;
+			// remains visible after the CPU wild-branches into RAM.
+			if (hex_in_glyph && hex_pixel_on) begin
+				dbg_r = 8'hFF; dbg_g = 8'h80; dbg_b = 8'h00;
+			end else begin
+				dbg_r = 8'h18; dbg_g = 8'h0C; dbg_b = 8'h00;
 			end
 		end else if (debug_vmon) begin
 			// Row G: V8 video monitor — 8 colored blocks
@@ -902,6 +938,7 @@ module emu
 		._cpuLDS(_cpuLDS),
 		._cpuRW(_cpuRW),
 		._cpuAS(_cpuAS),
+		.cpuFC(cpuFC),
 		.ram_config(pvia_ram_config_out),
 		.memoryAddr(memoryAddr),
 		.memoryLatch(memoryLatch),

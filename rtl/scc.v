@@ -77,6 +77,20 @@ module scc
 	reg scc_state_a;  // 0 = READY (next write to WR0), 1 = REGISTER (next write to selected reg)
 	reg scc_state_b;
 
+	/* Pending-cleanup flags for the WR0-pointer-vs-read race.
+	 * Background: per the MAME baseline (z80scc.cpp:1716-1736), the SCC's
+	 * register pointer is consumed by the *completed* ctl access. Previously
+	 * we reset rindex_a/scc_state_a on the first cen-cycle inside the CS
+	 * window; combined with the combinational rdata_mux that reads rindex_a
+	 * directly, this caused rdata_mux to flip from RR1 to RR0 mid-CS,
+	 * before the 68020 sampled. Now: when the cleanup condition triggers,
+	 * we only SET pending_cleanup_X. The actual rindex/scc_state reset is
+	 * deferred to the cen-cycle where CS goes low. This holds rindex_a
+	 * stable for the entire CS window so the CPU sees a consistent RR1
+	 * read for the Apple STM "All Sent" poll at $A49F08. */
+	reg pending_cleanup_a;
+	reg pending_cleanup_b;
+
 	/* Resets via WR9, one clk pulses */
 	wire		reset_a;
 	wire		reset_b;
@@ -279,6 +293,8 @@ module scc
 			rindex_b <= 0;
 			scc_state_a <= 0;  // READY state
 			scc_state_b <= 0;
+			pending_cleanup_a <= 0;
+			pending_cleanup_b <= 0;
 			//data_a <= 0;
 			tx_data_a<=0;
 			tx_data_b<=0;
@@ -298,30 +314,51 @@ module scc
 		end else begin
 			// Track CS edges - only process one access per CS assertion
 			if (cen) begin
-				if (!cs) cs_access_done <= 0;  // Reset when CS deasserts
+				if (!cs) begin
+					cs_access_done <= 0;  // Reset when CS deasserts
+					// Deferred WR0-pointer cleanup: now that the CPU has
+					// completed its bus access and sampled rdata, it's
+					// safe to reset rindex_a/scc_state_a. Previously this
+					// reset fired inside the CS window, causing rdata_mux
+					// to flip from RR1 to RR0 before the CPU's data latch.
+					// MAME consumes m_wr0_ptrbits at the END of the
+					// accessor; we mirror that by deferring to CS deassert.
+					if (pending_cleanup_a) begin
+						rindex_a <= 0;
+						scc_state_a <= 0;
+						pending_cleanup_a <= 0;
+					end
+					if (pending_cleanup_b) begin
+						rindex_b <= 0;
+						scc_state_b <= 0;
+						pending_cleanup_b <= 0;
+					end
+				end
 			end
 			if (cen && cs && !cs_access_done) begin
 				cs_access_done <= 1;  // Mark as processed for this CS assertion
             if (!rs[1]) begin
-                /* Reset register pointer after completing access to the selected register */
-                /* - Writes: when state==REGISTER, the write targets the selected register; reset afterward */
-                /* - Reads:  when state==REGISTER, the read targets the selected register; reset afterward */
-                /* Note: Use non-blocking <= so the current access uses the OLD pointer/state */
+                /* Defer the register-pointer reset to CS deassert (see
+                 * pending_cleanup_a/b declaration). The rdata_mux remains
+                 * combinational off rindex_a, so we MUST keep rindex_a
+                 * stable for the entire CS window — otherwise the CPU
+                 * samples rdata_mux after rindex_a has already flipped to
+                 * 0 and reads RR0 instead of the intended RR1.
+                 * - Writes: targeted-register write fires elsewhere via
+                 *   wreg_X & rindex_latch == N; flag cleanup for CS-low.
+                 * - Reads:  rdata_mux returns the correct RRx for the
+                 *   entire CS window; flag cleanup for CS-low. */
                 if (we) begin
                     if (rs[0] && scc_state_a == 1) begin
-                        rindex_a <= 0;
-                        scc_state_a <= 0;
+                        pending_cleanup_a <= 1;
                     end else if (!rs[0] && scc_state_b == 1) begin
-                        rindex_b <= 0;
-                        scc_state_b <= 0;
+                        pending_cleanup_b <= 1;
                     end
                 end else begin
                     if (rs[0] && scc_state_a == 1) begin
-                        rindex_a <= 0;
-                        scc_state_a <= 0;
+                        pending_cleanup_a <= 1;
                     end else if (!rs[0] && scc_state_b == 1) begin
-                        rindex_b <= 0;
-                        scc_state_b <= 0;
+                        pending_cleanup_b <= 1;
                     end
                 end
 
