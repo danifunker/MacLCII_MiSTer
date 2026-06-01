@@ -798,31 +798,34 @@ module via6522 (
     always @(posedge clock) begin
         if (reset == 1'b1) begin
             shift_reg <= 8'hFF;
-        end else if (falling == 1'b1) begin
-            if (wen == 1'b1 && addr == 4'hA) begin
+        end else begin
+            // CPU writes the SR (E-timed bus access) - highest priority.
+            if (falling == 1'b1 && wen == 1'b1 && addr == 4'hA) begin
                 shift_reg <= data_in;
                 `ifdef SIMULATION
                 $display("VIA: SR write = 0x%02x, ACR=0x%02x (mode=%d, dir=%b, serport_en=%b, cb2_o=%b)",
                          data_in, acr, shift_mode_control, shift_dir, serport_en, ser_cb2_o);
                 `endif
-            end else if (shift_dir == 1'b1 &&
-                         ((ext_clock_mode && ext_fall_edge_pending) ||
-                          (!ext_clock_mode && shift_tick_f))) begin // output
-                shift_reg <= {shift_reg[6:0], shift_reg[7]};
-            end else if (shift_mode_control != 3'b000 && shift_dir == 1'b0) begin // input (only when mode != 0)
-                // In external clock mode (mode 3), use ext_edge_pending to catch CB1 edges
-                // that happen between falling phases. For internal clock modes, use shift_tick_r.
-                // The shift_active flag controls IRQ generation, not the actual shifting
-                // Per 6522 datasheet: "shift register counter is disabled" in mode 3
-                if ((ext_clock_mode && ext_edge_pending == 1'b1) ||
-                    (shift_clk_sel != 2'b11 && shift_tick_r == 1'b1)) begin
-`ifdef SIMULATION
+            // External-clock mode (Egret): match MAME 6522via.cpp write_cb1() -
+            // shift the SR on EACH CB1 edge, decoupled from the VIA E phase:
+            // shift-in on CB1 rising, shift-out on CB1 falling. Using the
+            // per-clk edge pulses (shift_tick_r/shift_tick_f) instead of the
+            // E-consumed ext_edge_pending flags stops fast HC05 CB1 edges from
+            // coalescing into one shift per E-period (the Egret SR hang).
+            end else if (ext_clock_mode) begin
+                if (shift_dir == 1'b1 && shift_tick_f == 1'b1) begin            // output (falling)
+                    shift_reg <= {shift_reg[6:0], shift_reg[7]};
+                end else if (shift_dir == 1'b0 && shift_mode_control != 3'b000 && shift_tick_r == 1'b1) begin // input (rising)
+                    `ifdef SIMULATION
                     $display("VIA: shift-in cb2_i=%b SR_before=0x%02x bit_cnt=%0d", cb2_i, shift_reg, bit_cnt);
-`endif
-                    `ifdef VERBOSE_TRACE
-                    $display("VIA: SR shift IN - CB2=%b (cb2_i=%b), SR 0x%02x -> 0x%02x, mode=%d, ext_clk=%b",
-                             ser_cb2_c, cb2_i, shift_reg, {shift_reg[6:0], cb2_i}, shift_mode_control, (ext_clock_mode));
                     `endif
+                    shift_reg <= {shift_reg[6:0], cb2_i};
+                end
+            // Internal-clock modes (T2 / O2): unchanged, E-paced.
+            end else if (falling == 1'b1) begin
+                if (shift_dir == 1'b1 && shift_tick_f == 1'b1) begin            // output
+                    shift_reg <= {shift_reg[6:0], shift_reg[7]};
+                end else if (shift_mode_control != 3'b000 && shift_dir == 1'b0 && shift_clk_sel != 2'b11 && shift_tick_r == 1'b1) begin // input
                     shift_reg <= {shift_reg[6:0], cb2_i};
                 end
             end
@@ -851,52 +854,43 @@ module via6522 (
 `endif
             if (shift_active == 1'b0 && shift_mode_control != 3'b000) begin
                 if (trigger_serial == 1'b1) begin
-                    // In external clock mode, if a CB1 rising edge happens on the SAME
-                    // falling phase as the trigger, that edge is already consumed by the
-                    // shift-in/out path. Account for it by starting at 6 instead of 7.
-                    // Note: we do NOT accumulate missed_ext_edge across idle periods,
-                    // because dummy CB1 edges (e.g. SEND_NOTIFY) would falsely trigger it.
-                    if (ext_clock_mode && shift_pulse == 1'b1) begin
-                        bit_cnt <= 3'd6;
-                        `ifdef SIMULATION
-                        $display("VIA: SR triggered + simultaneous_edge - mode=%d, dir=%b, start_cnt=6",
-                                 shift_mode_control, shift_dir);
-                        `endif
-                    end else begin
-                        bit_cnt <= 3'd7;
-                        `ifdef SIMULATION
-                        $display("VIA: SR triggered - mode=%d, dir=%b, ext_clk=%b, start_cnt=7",
-                                 shift_mode_control, shift_dir, (ext_clock_mode));
-                        `endif
-                    end
+                    // Start a transfer: 8 bits = 8 relevant CB1 edges. Per-edge
+                    // counting (below, decoupled from E) handles edge timing, so
+                    // no more "simultaneous edge" -6 hack is needed.
+                    bit_cnt <= 3'd7;
+                    `ifdef SIMULATION
+                    $display("VIA: SR triggered - mode=%d, dir=%b, ext_clk=%b, start_cnt=7",
+                             shift_mode_control, shift_dir, (ext_clock_mode));
+                    `endif
                     shift_active <= 1'b1;
-                // Auto-trigger on CB1 DISABLED - was causing protocol issues where
-                // stray CB1 edges after a transfer would trigger new shifts that
-                // never complete. The CPU should explicitly read/write SR to trigger.
-                // end else if (ext_clock_mode && shift_pulse == 1'b1 && shift_clock == 1'b1) begin
-                //     bit_cnt <= 3'd7;
-                //     shift_active <= 1'b1;
-                // end
                 end
-            end else begin // we're active
-// SHIFT active debug disabled - too verbose
+            end else if (!ext_clock_mode) begin // internal-clock active decrement (E-paced, unchanged)
                 if (shift_clk_sel == 2'b00) begin
                     shift_active <= shift_dir;
-                    // when '1' we're active, but for mode 000 we go inactive.
-                // Per VIA schematic: bit counter responds to edge pulse, not current CB1 level
-                // In external clock mode, CB1 may have already gone low by falling phase
-                end else if (shift_pulse == 1'b1 && (ext_clock_mode || shift_clock == 1'b1)) begin
+                end else if (shift_pulse == 1'b1 && shift_clock == 1'b1) begin
                     if (bit_cnt == 3'd0) begin
                         shift_active <= 1'b0;
-`ifdef SIMULATION
-                        $display("VIA_SR[%0t]: COMPLETE SR=0x%02x dir=%b", $time, shift_reg, shift_dir);
-`endif
                     end else begin
                         bit_cnt <= bit_cnt - 3'd1;
-                        `ifdef VERBOSE_TRACE
-                        $display("VIA: SR bit_cnt decremented to %d", bit_cnt - 3'd1);
-                        `endif
                     end
+                end
+            end
+        end
+        // External-clock active count: match MAME (6522via.cpp shift_in/shift_out
+        // called per CB1 edge from write_cb1). One count per CB1 edge, decoupled
+        // from E: shift-in counts on CB1 rising, shift-out on CB1 falling. The
+        // matching shift_reg shift happens on the same edge (above), so 8 edges
+        // shift 8 bits and complete -> serial_event -> IFR[2].
+        if (ext_clock_mode && shift_active == 1'b1) begin
+            if ((shift_dir == 1'b0 && shift_tick_r == 1'b1) ||
+                (shift_dir == 1'b1 && shift_tick_f == 1'b1)) begin
+                if (bit_cnt == 3'd0) begin
+                    shift_active <= 1'b0;
+`ifdef SIMULATION
+                    $display("VIA_SR[%0t]: COMPLETE (ext) SR=0x%02x dir=%b", $time, shift_reg, shift_dir);
+`endif
+                end else begin
+                    bit_cnt <= bit_cnt - 3'd1;
                 end
             end
         end
