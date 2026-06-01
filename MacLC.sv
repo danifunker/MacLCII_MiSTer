@@ -202,6 +202,9 @@ module emu
 		"ODE,CPU,68020;",
 		"O4,Memory,2MB,10MB;",
 		"O6,Palette Test,Off,On;",
+		"O5,V8 Bypass Test,Off,On;",
+		"OHI,V8 Test Pat,Hbars,Vbars,Checker,XOR;",
+		"OJ,Seed VRAM,On,Off;",
 		"-;",
 		"R0,Reset & Apply CPU+Memory;",
 		"V,v",`BUILD_DATE
@@ -232,7 +235,7 @@ module emu
 			// NOTE: Do NOT include ~_cpuReset_o here — the CPU executes the RESET
 			// instruction during boot to reset peripherals, which would cause an
 			// infinite reset loop if fed back to the system reset.
-			if(~pll_locked || status[0] || buttons[1] || RESET || dio_download) begin
+			if(~pll_locked || status[0] || buttons[1] || RESET || dio_download || vinit_active) begin
 				rst_cnt <= '1;
 				n_reset <= 0;
 			end
@@ -377,8 +380,10 @@ module emu
 	wire debug_sahex  = (dbg_y >= 10'd56) && (dbg_y < 10'd71) && (dbg_x < 10'd92);
 	wire debug_ovhex  = (dbg_y >= 10'd76) && (dbg_y < 10'd91) && (dbg_x < 10'd92);
 	wire debug_r1hex  = (dbg_y >= 10'd96) && (dbg_y < 10'd111) && (dbg_x < 10'd92);
+	wire debug_vmon   = (dbg_y >= 10'd116) && (dbg_y < 10'd124) && (dbg_x < 10'd64);
 	wire debug_any    = debug_egret
-	                  || debug_pchex || debug_ophex || debug_sahex || debug_ovhex || debug_r1hex;
+	                  || debug_pchex || debug_ophex || debug_sahex || debug_ovhex || debug_r1hex
+	                  || debug_vmon;
 
 	// Egret status row: 8 blocks, each 8px wide
 	// Block 0: running (Green=yes)
@@ -398,6 +403,23 @@ module emu
 	                 (egret_block == 5) ? egret_dbg_byteack :
 	                 (egret_block == 6) ? egret_dbg_reset_680x0 :
 	                                      egret_dbg_cpu_reset_out;
+
+	// Row G (y=116..123): V8 video monitor — 8 blocks of 8 px each
+	//   0: V8 fetching heartbeat (latch_count[20] toggles ~every 0.03s @ 32.5MHz)
+	//   1: V8 receiving non-trivial data (nonzero_count[7])
+	//   2: vinit_active (lit while VRAM init writer is running)
+	//   3: vinit_state[1] (lit once VRAM init has reached DONE state)
+	//   4-6: video_mode[2:0] bits
+	//   7: ariel_written (CPU has written palette)
+	wire [2:0] vmon_block = dbg_x[5:3];
+	wire vmon_val = (vmon_block == 0) ? v8_dbg_latch_count[20] :
+	                (vmon_block == 1) ? v8_dbg_nonzero_count[7] :
+	                (vmon_block == 2) ? vinit_active :
+	                (vmon_block == 3) ? vinit_state[1] :
+	                (vmon_block == 4) ? v8_video_mode[0] :
+	                (vmon_block == 5) ? v8_video_mode[1] :
+	                (vmon_block == 6) ? v8_video_mode[2] :
+	                                    ariel_written;
 
 	// 68K AS edge detection
 	reg cpu_as_prev = 1;
@@ -467,24 +489,19 @@ module emu
 		end
 
 		// VBlank-based hex display update (~1x/sec)
+		// TURN 7: Always show LIVE PC + opcode + SDRAM addr (no longer
+		// the frozen overlay-disable snapshot). The overlay-trigger and
+		// first-rom-read snapshots still appear in their own rows. This
+		// lets us see whether the CPU is moving, looping, or stuck.
 		vblank_prev <= v8_vblank;
 		if (v8_vblank && !vblank_prev) begin
 			if (vblank_count >= 6'd59) begin
 				vblank_count <= 0;
-				// Show overlay snapshot if taken, otherwise show live values
-				if (overlay_snapshot_taken) begin
-					hex_pc_upper <= snap_pc_upper;
-					hex_pc_lower <= snap_pc_lower;
-					hex_pc_lowest <= snap_pc_lowest;
-					hex_opcode <= snap_opcode;
-					hex_sdram_addr <= snap_sdram_addr;
-				end else begin
-					hex_pc_upper <= cpu_pc_upper;
-					hex_pc_lower <= cpu_pc_lower;
-					hex_pc_lowest <= cpu_pc_lowest;
-					hex_opcode <= fetch_opcode;
-					hex_sdram_addr <= fetch_sdram_addr;
-				end
+				hex_pc_upper  <= cpu_pc_upper;
+				hex_pc_lower  <= cpu_pc_lower;
+				hex_pc_lowest <= cpu_pc_lowest;
+				hex_opcode    <= fetch_opcode;
+				hex_sdram_addr <= fetch_sdram_addr;
 			end else begin
 				vblank_count <= vblank_count + 1'd1;
 			end
@@ -633,6 +650,18 @@ module emu
 			end else begin
 				dbg_r = 8'h10; dbg_g = 8'h10; dbg_b = 8'h10;
 			end
+		end else if (debug_vmon) begin
+			// Row G: V8 video monitor — 8 colored blocks
+			case (vmon_block)
+				0: begin dbg_r = 8'h00; dbg_g = vmon_val ? 8'hFF : 8'h30; dbg_b = 8'h00; end // fetch heartbeat: Green
+				1: begin dbg_r = vmon_val ? 8'hFF : 8'h30; dbg_g = vmon_val ? 8'hFF : 8'h30; dbg_b = 8'h00; end // nonzero heartbeat: Yellow
+				2: begin dbg_r = 8'h00; dbg_g = vmon_val ? 8'hFF : 8'h30; dbg_b = vmon_val ? 8'hFF : 8'h30; end // bypass test: Cyan
+				3: begin dbg_r = vmon_val ? 8'hFF : 8'h30; dbg_g = 8'h00; dbg_b = vmon_val ? 8'hFF : 8'h30; end // palette test: Magenta
+				4: begin dbg_r = vmon_val ? 8'hFF : 8'h30; dbg_g = 8'h00; dbg_b = 8'h00; end // mode bit 0: Red
+				5: begin dbg_r = vmon_val ? 8'hFF : 8'h30; dbg_g = 8'h00; dbg_b = 8'h00; end // mode bit 1: Red
+				6: begin dbg_r = vmon_val ? 8'hFF : 8'h30; dbg_g = 8'h00; dbg_b = 8'h00; end // mode bit 2: Red
+				default: begin dbg_r = 8'hFF; dbg_g = vmon_val ? 8'hFF : 8'h30; dbg_b = 8'hFF; end // ariel_written: W
+			endcase
 		end
 	end
 
@@ -747,6 +776,16 @@ module emu
 	wire        stp_dtack         = _cpuDTACK              /* synthesis keep */;
 	wire        stp_dtack_en      = dtack_en               /* synthesis keep */;
 	wire [15:0] stp_dataOut       = dataControllerDataOut  /* synthesis keep */;
+	// V8 video debug signals (preserved for SignalTap / JTAG probes)
+	wire [31:0] stp_v8_latch_cnt  = v8_dbg_latch_count     /* synthesis keep */;
+	wire [15:0] stp_v8_last_data  = v8_dbg_last_data       /* synthesis keep */;
+	wire [21:0] stp_v8_last_addr  = v8_dbg_last_addr       /* synthesis keep */;
+	wire [15:0] stp_v8_nonzero    = v8_dbg_nonzero_count   /* synthesis keep */;
+	wire [2:0]  stp_v8_mode       = v8_video_mode          /* synthesis keep */;
+	wire [3:0]  stp_v8_monid      = v8_monitor_id          /* synthesis keep */;
+	wire        stp_v8_de         = v8_de                  /* synthesis keep */;
+	wire        stp_v8_vsync      = v8_vsync               /* synthesis keep */;
+	wire        stp_v8_vlatch     = v8_video_latch         /* synthesis keep */;
 
 	// floppy disk image interface
 	wire dskReadAckInt;
@@ -961,20 +1000,31 @@ module emu
 		.ram_config_out(pvia_ram_config_out)
 	);
 
+	wire [31:0] v8_dbg_latch_count;
+	wire [15:0] v8_dbg_last_data;
+	wire [21:0] v8_dbg_last_addr;
+	wire [15:0] v8_dbg_nonzero_count;
+
 	maclc_v8_video v8_video(
 		.clk_sys(clk_sys),
 		.clk8_en_p(clk8_en_p),
 		.reset(~n_reset),
-		
+
 		// VRAM Interface (byte offset from VRAM start, translated in addrController)
 		.video_addr(v8_video_addr),
 		.video_data_in(sdram_do), // Data from SDRAM (valid when video_latch=1)
 		.video_latch(v8_video_latch),
-		
+
 		// Configuration
 		.video_mode(v8_video_mode),
 		.monitor_id(v8_monitor_id),
-		
+
+		// Test / diagnostic controls (OSD-controlled).
+		// Turn 2 confirmed pipeline works with hardwired bypass=1;
+		// reverted to status[5] for Turn 3+.
+		.test_bypass_vram(status[5]),
+		.test_pattern_sel(status[18:17]),
+
 		// Video Signals
 		.hsync(v8_hsync),
 		.vsync(v8_vsync),
@@ -985,10 +1035,16 @@ module emu
 		.vga_b(v8_vga_b),
 		.de(v8_de),
 		.ce_pix(v8_ce_pix),
-		
+
 		// Palette Interface (Connected to Ariel RAMDAC)
 		.palette_addr(ariel_pixel_addr),
-		.palette_data(ariel_palette_data)
+		.palette_data(ariel_palette_data),
+
+		// Debug telemetry
+		.dbg_latch_count(v8_dbg_latch_count),
+		.dbg_last_data(v8_dbg_last_data),
+		.dbg_last_addr(v8_dbg_last_addr),
+		.dbg_nonzero_count(v8_dbg_nonzero_count)
 	);
 
 	// ASC sample outputs (Commit C will route to AUDIO_L/R)
@@ -1219,20 +1275,118 @@ module emu
 
 	// sdram used for ram/rom maps directly into 68k address space
 	wire download_cycle = dio_download && dioBusControl;
+
+	// ============================================================
+	// VRAM Init Writer (Turn 3)
+	// ============================================================
+	// After ROM download finishes, sweeps the 256K-word VRAM region
+	// ($580000-$5BFFFF) and writes a known pattern so the V8 video can
+	// render real-looking pixels even before the CPU writes the framebuffer.
+	// The CPU is held in reset until init completes (~130ms).
+	//
+	// Pattern: 32x32 px checker cells, palette index per cell =
+	//   { cell_y[2:0] /*hue 0-7*/, cell_x[4:0] /*brightness 0-31*/ }
+	// In SDRAM word terms, counter c maps to byte address 2*c at VRAM base:
+	//   y         = c[17:9]   (row, 0..511 — only 0..383 visible)
+	//   x_word    = c[8:0]    (word offset in row, 0..511)
+	//   x_byte    = c[8:0]*2  (= byte position in 1024-byte stride row)
+	//   cell_y    = y[8:5]    = c[14:10]
+	//   cell_x    = x_byte[8:5] = c[6:4]
+	// Cell color encodes:
+	//   bits[7:5] = hue   = cell_y[2:0] = c[12:10]
+	//   bits[4:0] = bri/8 = cell_x      = c[6:4] → 5-bit brightness 0..7
+	// Resulting visual: 8 hue rows (every 32 px tall), 8 brightness columns
+	// (every 32 px wide), giving a 64-cell 8x8 patch repeated to fill VRAM.
+	localparam [22:0] VINIT_SDRAM_BASE = 23'h580000;
+	localparam [17:0] VINIT_LAST_WORD  = 18'h3FFFF;  // 256K-1 = 262143
+	reg [1:0]  vinit_state;
+	localparam [1:0] VINIT_IDLE = 2'd0, VINIT_WRITING = 2'd1, VINIT_DONE = 2'd2;
+	reg [17:0] vinit_cnt;
+	reg        vinit_dio_was;
+	reg        dio_dl_prev2;
+
+	wire        vinit_active     = (vinit_state == VINIT_WRITING);
+	wire [22:0] vinit_sdram_addr = VINIT_SDRAM_BASE + {5'b0, vinit_cnt};
+	// Address decomposition for the 1024-byte stride / 8bpp layout:
+	//   y       = vinit_cnt[17:9]   (scanline row 0..511, visible 0..383)
+	//   x_word  = vinit_cnt[8:0]    (word offset within row 0..511)
+	//   x_byte  = vinit_cnt[8:0]*2  (byte position 0..1022, visible <1024)
+	// Cells of 32 rows tall × 64 px wide. With the V8's current 8x
+	// horizontal stretching (1 word per 16 clk_sys vs. 2 px per word in
+	// 8bpp) each c value visually covers ~8 pixels, so 8 c values give
+	// us a 64-pixel-wide cell.
+	//   hue  = y[7:5]      = vinit_cnt[16:14]      (8 hue rows × 32 px)
+	//   bri  = x_word[5:3] = vinit_cnt[5:3]        (8 bri cols × 64 px)
+	// Encoded byte = {hue, 2'b10, bri} → palette index whose top 3 bits
+	// pick the hue bin and bottom 5 bits give a moderate brightness.
+	wire [7:0]  vinit_byte       = {vinit_cnt[16:14], 2'b10, vinit_cnt[5:3]};
+	wire [15:0] vinit_pattern    = {vinit_byte, vinit_byte};
+	wire        vinit_cycle      = vinit_active && dioBusControl;
+
+	always @(posedge clk_sys) begin
+		dio_dl_prev2 <= dio_download;
+		vinit_dio_was <= dioBusControl;
+		if (!pll_locked) begin
+			vinit_state <= VINIT_IDLE;
+			vinit_cnt   <= 18'd0;
+		end else case (vinit_state)
+			VINIT_IDLE: begin
+				// Start when dio_download falls (ROM finished). The
+				// status[19] OSD bit ("Seed VRAM") gates this: when set
+				// (=Off), the writer skips straight to DONE and VRAM is
+				// left zeroed, so the V8 displays whatever the CPU writes
+				// (or black if it never does).
+				if (dio_dl_prev2 && !dio_download) begin
+					if (status[19]) begin
+						vinit_state <= VINIT_DONE;
+					end else begin
+						vinit_state <= VINIT_WRITING;
+						vinit_cnt   <= 18'd0;
+					end
+				end
+			end
+			VINIT_WRITING: begin
+				// Advance counter after each dioBusControl pulse falls
+				if (vinit_dio_was && !dioBusControl) begin
+					if (vinit_cnt == VINIT_LAST_WORD) begin
+						vinit_state <= VINIT_DONE;
+					end else begin
+						vinit_cnt <= vinit_cnt + 1'd1;
+					end
+				end
+			end
+			VINIT_DONE: ;
+			default: vinit_state <= VINIT_IDLE;
+		endcase
+	end
+
+	// SignalTap-keep wires for JTAG probing
+	wire [1:0]  stp_vinit_state = vinit_state /* synthesis keep */;
+	wire [17:0] stp_vinit_cnt   = vinit_cnt   /* synthesis keep */;
+
 	////////////////////////// SDRAM /////////////////////////////////
 
 	// SDRAM Address mapping for Mac LC (V8-style):
 	// memoryAddr[22:0] is already the SDRAM word address from addrController
 	// Download path uses dio_a[22:0] directly
-	wire [24:0] sdram_addr = download_cycle ? {2'b00, dio_a[22:0]} :
+	wire [24:0] sdram_addr = vinit_cycle    ? {2'b00, vinit_sdram_addr} :
+	                         download_cycle ? {2'b00, dio_a[22:0]} :
 	                                          {2'b00, memoryAddr[22:0]};
-	wire [15:0] sdram_din  = download_cycle ? dio_data              : memoryDataOut;
-	wire  [1:0] sdram_ds   = download_cycle ? 2'b11                 : { !_memoryUDS, !_memoryLDS };
-	wire        sdram_we   = download_cycle ?
-							 dio_write             : !_ramWE;
-	wire        sdram_oe   = download_cycle ?
-							 1'b0                  : (!_ramOE || !_romOE || dskReadAckInt || dskReadAckExt);
-	wire [15:0] sdram_do   = download_cycle ? 16'hffff : (dskReadAckInt || dskReadAckExt) ? extra_rom_data_demux : sdram_out;
+	wire [15:0] sdram_din  = vinit_cycle    ? vinit_pattern :
+	                         download_cycle ? dio_data :
+	                                          memoryDataOut;
+	wire  [1:0] sdram_ds   = vinit_cycle    ? 2'b11 :
+	                         download_cycle ? 2'b11 :
+	                                          { !_memoryUDS, !_memoryLDS };
+	wire        sdram_we   = vinit_cycle    ? 1'b1 :
+	                         download_cycle ? dio_write :
+	                                          !_ramWE;
+	wire        sdram_oe   = vinit_cycle    ? 1'b0 :
+	                         download_cycle ? 1'b0 :
+	                                          (!_ramOE || !_romOE || dskReadAckInt || dskReadAckExt);
+	wire [15:0] sdram_do   = (download_cycle || vinit_active) ? 16'hffff :
+	                         (dskReadAckInt || dskReadAckExt) ? extra_rom_data_demux :
+	                                                            sdram_out;
 	// during rom/disk download ffff is returned so the screen is black during download
 	// "extra rom" is used to hold the disk image. It's expected to be byte wide and
 	// we thus need to properly demultiplex the word returned from sdram in that case
