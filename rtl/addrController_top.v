@@ -18,10 +18,15 @@ module addrController_top(
 	input _cpuRW,
 	input _cpuAS,
 	// Function code: FC[1]=1 distinguishes program access (FC=2/6) from
-	// data access (FC=1/5) and the reset-vector fetch (FC=5). We use it
-	// to gate the overlay-disable trigger so that only a real instruction
-	// fetch in $A0xxxx clears the overlay, not an incidental data read
-	// of a ROM table. MAME's equivalent gate is !side_effects_disabled.
+	// data access (FC=1/5). We gate overlay-disable on it so an incidental
+	// data read of $A0xxxxx (e.g. TG68-driven access to $ABC146 before the
+	// boot ROM is ready to leave the overlay mirror) doesn't prematurely
+	// clear overlay and crash the CPU through zero-RAM.
+	// Note: this is STRICTER than MAME (which clears on any non-debugger
+	// read), but MAME's behavior caused us to wild-execute through RAM=0
+	// (build 20260601_073828 confirmed: overlay-trigger=$ABC146 → opcode
+	// $0000 wild branch). The FC[1] gate is the empirically-correct fit
+	// for our TG68 + SDRAM stack even though it diverges from MAME.
 	input [2:0] cpuFC,
 
 	// RAM/ROM:
@@ -238,12 +243,13 @@ module addrController_top(
 	assign overlay_trigger_addr = overlay_trigger_addr_r;
 
 	// Overlay disables on first INSTRUCTION FETCH in $A00000-$AFFFFF.
-	// Without the cpuFC[1] gate, an incidental data read of a ROM table at
-	// $A0xxxx (e.g. boot ROM reading a pointer at $ABC146) would clear
-	// overlay while the CPU is still executing in the $0xxxxx overlay
-	// region — the next code fetch at $0xxxxx would then read RAM=0 and
-	// the CPU would wild-branch. MAME enforces the same intent via
-	// !side_effects_disabled in v8.cpp:rom_switch_r.
+	// MAME clears overlay on any read (v8.cpp:rom_switch_r), but in our
+	// TG68 + SDRAM stack the boot ROM's data read of $ABC146 happens
+	// while PC is still in the $0xxxxx overlay mirror; if that data
+	// read clears overlay, the next code fetch at $0xxxxx returns RAM=0
+	// and the CPU wild-branches through ORI.B #0,D0. Gating on FC[1]=1
+	// (program access) holds overlay until the boot ROM does its real
+	// JMP-to-ROM, at which point overlay clears safely.
 	wire overlay_trigger = !_cpuAS && (cpuAddr[23:20] == 4'hA) && cpuFC[1];
 
 	always @(posedge clk) begin

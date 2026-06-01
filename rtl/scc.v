@@ -870,15 +870,27 @@ module scc
 	wire tx_empty_gated_a = post_loopback_a ? 1'b0 : tx_empty_latch_a;
 	wire tx_empty_gated_b = post_loopback_b ? 1'b0 : tx_empty_latch_b;
 
-	/* RR0 */
-	assign rr0_a = { post_loopback_a, /* Break/Abort - 1 after loopback cleared (no cable) */
-			 eom_latch_a, /* Tx Underrun/EOM */
-			 rr0_cts_a, /* CTS - forced 1 in loopback, 0 otherwise (no cable) */
-			 post_loopback_a, /* Sync/Hunt - 1 after loopback cleared (permanently hunting) */
-			 rr0_dcd_a, /* DCD - forced 1 in loopback, 0 otherwise (no cable) */
-			 tx_empty_gated_a, /* Tx Empty - blocked after loopback cleared (no cable) */
-			 1'b0, /* Zero Count */
-			 post_loopback_a ? 1'b0 : (rx_queue_pos_a > 0)  /* Rx Available */
+	/* RR0
+	 * Bit 7 (Break/Abort) and bit 4 (Sync/Hunt) MUST be 0 in async mode per
+	 * the Z8530 datasheet — these are SDLC/sync-only status bits and a real
+	 * Z8530 in async mode reports them as 0. Previously we aliased both to
+	 * post_loopback_a, producing the impossible RR0=0x54 pattern Agent 2's
+	 * MAME-CSV review flagged (bits 7 and 4 set simultaneously in async).
+	 * If the boot ROM's SCC ISR interprets RR0[7] as "BREAK detected", a
+	 * false set sends it down the break-handling branch every time loopback
+	 * clears.
+	 * NOTE: bit 0 (RxAvail) and bit 2 (TxEmpty) keep the post_loopback gate
+	 * — that's the documented intentional "no cable" behavior from
+	 * commit a89c671 (docs/bootproblems.md:138-156).
+	 */
+	assign rr0_a = { 1'b0,           /* Break/Abort — async: always 0 */
+			 eom_latch_a,           /* Tx Underrun/EOM */
+			 rr0_cts_a,             /* CTS */
+			 1'b0,                  /* Sync/Hunt — async: always 0 */
+			 rr0_dcd_a,             /* DCD */
+			 tx_empty_gated_a,      /* Tx Empty (post_loopback gated) */
+			 1'b0,                  /* Zero Count */
+			 post_loopback_a ? 1'b0 : (rx_queue_pos_a > 0)  /* Rx Available (post_loopback gated) */
 			 };
 
 	// Debug: Show RR0 composition when reading from control register
@@ -889,14 +901,14 @@ module scc
 			         rr0_cts_a, rr0_dcd_a, local_loopback_a, post_loopback_a, rx_queue_pos_a);
 		end
 	end
-	assign rr0_b = { post_loopback_b, /* Break/Abort */
-			 eom_latch_b, /* Tx Underrun/EOM */
-			 rr0_cts_b, /* CTS - forced 1 in loopback, 0 otherwise */
-			 post_loopback_b, /* Sync/Hunt */
-			 rr0_dcd_b, /* DCD - forced 1 in loopback, 0 otherwise */
-			 tx_empty_gated_b, /* Tx Empty - blocked after loopback cleared */
-			 1'b0, /* Zero Count */
-			 post_loopback_b ? 1'b0 : (rx_queue_pos_b > 0)  /* Rx Available */
+	assign rr0_b = { 1'b0,           /* Break/Abort — async: always 0 (see rr0_a) */
+			 eom_latch_b,           /* Tx Underrun/EOM */
+			 rr0_cts_b,             /* CTS */
+			 1'b0,                  /* Sync/Hunt — async: always 0 (see rr0_a) */
+			 rr0_dcd_b,             /* DCD */
+			 tx_empty_gated_b,      /* Tx Empty (post_loopback gated) */
+			 1'b0,                  /* Zero Count */
+			 post_loopback_b ? 1'b0 : (rx_queue_pos_b > 0)  /* Rx Available (post_loopback gated) */
 			 };
 
 	/* RR1 */

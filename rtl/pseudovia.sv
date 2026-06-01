@@ -103,6 +103,25 @@ always @(posedge clk_sys) begin
         else
             ifr[1] <= 1'b0;
 
+        // Per-source IFR bits — match MAME pseudovia.cpp asc_irq_w / slot_irq_w
+        // pattern (set when source asserts, clear when source deasserts).
+        // MAME's recalc reads `regs[3] & regs[0x13] & 0x1B` — mask 0x1B
+        // includes bit 4 (ASC), bit 3 (slot), bit 1 (any slot), bit 0. So
+        // these per-source bits matter for the boot ROM's IRQ-source decode.
+        // Previously only bit 1 (summary) was set; the ROM could see "an
+        // IRQ fired" but couldn't tell WHICH source, and any handler that
+        // dispatched off IFR[4] / IFR[3] saw 0 and fell through to a wrong
+        // path.
+        if (asc_irq)
+            ifr[4] <= 1'b1;
+        else
+            ifr[4] <= 1'b0;
+
+        if (slot_irq)
+            ifr[3] <= 1'b1;
+        else
+            ifr[3] <= 1'b0;
+
         // Update IRQ output
         if (irq_pending) begin
             ifr[7] <= 1'b1;
@@ -138,13 +157,16 @@ always @(posedge clk_sys) begin
                             `endif
                         end
 
-                        3'b011: begin  // $03: IFR
-                            if (data_in[7])
-                                ifr <= ifr | (data_in & 8'h7F);
-                            else
-                                ifr <= ifr & ~(data_in & 8'h7F);
+                        3'b011: begin  // $03: IFR - write-1-to-clear (per MAME pseudovia.cpp:269)
+                            // MAME does unconditional `regs[3] &= ~(data & 0x7F)` — i.e.
+                            // writing 1 to a bit ACKs/clears that bit, writing 0 leaves it.
+                            // Our previous code conditioned on data_in[7]: writing $82 was
+                            // SETTING bit 1 instead of clearing it, so any ROM ack with the
+                            // 6522-style "1 bits clear" convention would re-arm the IRQ on
+                            // every write and the CPU would loop in the ISR.
+                            ifr <= ifr & ~(data_in & 8'h7F);
                             `ifdef VERBOSE_TRACE
-                            $display("PVIA: WRITE IFR = %02x @%0t", data_in, $time);
+                            $display("PVIA: WRITE IFR ACK %02x (clearing bits) @%0t", data_in & 8'h7F, $time);
                             `endif
                         end
 
@@ -247,9 +269,15 @@ always @(posedge clk_sys) begin
                 // Per MAME: only registers 13 (IFR) and 14 (IER) are meaningful
                 if (we) begin
                     case (compat_reg)
-                        4'd13: begin  // IFR (write just triggers recalc, per MAME)
+                        4'd13: begin  // IFR - write-1-to-clear (per MAME pseudovia.cpp:269)
+                            // Compat IFR write must mirror native IFR write semantics: the
+                            // 6522-aliased path is the SAME register inside MAME, so the ACK
+                            // behavior is identical. Previous code dropped the write entirely
+                            // (just $display) which meant the ROM's compat-mode IRQ ack was
+                            // a no-op and the IFR bit stayed set.
+                            ifr <= ifr & ~(data_in & 8'h7F);
                             `ifdef VERBOSE_TRACE
-                            $display("PVIA COMPAT: WRITE IFR = %02x @%0t", data_in, $time);
+                            $display("PVIA COMPAT: WRITE IFR ACK %02x @%0t", data_in & 8'h7F, $time);
                             `endif
                         end
                         4'd14: begin  // IER (standard VIA set/clear behavior)
