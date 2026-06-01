@@ -176,6 +176,23 @@ grep -iE 'error|assert|halt|berr|egret|hc05|fail|stuck' "$OUT/run.stderr" | tail
 echo " stderr tail (last 15):"
 tail -15 "$OUT/run.stderr" | sed 's/^/   /'
 echo
+echo "--- Overlay escape + Egret SR (sim \$display) ------------------------"
+# These prove the GOOD path: in sim (egret_behavioral) the Egret SR transaction
+# completes and the ROM overlay escapes (1->0). On FPGA (HC05) the HUD shows it
+# never escapes. Confirms/refutes the SR-handshake root cause for the FPGA bug.
+OVL=$(grep -h 'memoryOverlayOn changed' "$OUT/run.stdout" "$OUT/run.stderr" 2>/dev/null)
+SRW=$(grep -hc 'VIA: SR write' "$OUT/run.stdout" "$OUT/run.stderr" 2>/dev/null | awk '{s+=$1} END{print s+0}')
+SRI=$(grep -hc 'shift-in' "$OUT/run.stdout" "$OUT/run.stderr" 2>/dev/null | awk '{s+=$1} END{print s+0}')
+if echo "$OVL" | grep -q 'changed: 0'; then
+    echo " overlay: ESCAPED in sim (memoryOverlayOn 1->0) <= the path the FPGA fails to reach"
+else
+    echo " overlay: did NOT escape in sim (no 1->0 transition seen)"
+fi
+echo "$OVL" | sed 's/^/   /' | head -8
+echo " VIA SR writes: $SRW    VIA shift-in events: $SRI"
+echo " last 6 SR shift-in events (watch bit_cnt 0..7 per byte):"
+grep -h 'shift-in' "$OUT/run.stdout" "$OUT/run.stderr" 2>/dev/null | tail -6 | sed 's/^/   /'
+echo
 echo "--- Screenshots -----------------------------------------------------"
 ls -1 "$OUT"/screenshot_frame_*.png 2>/dev/null | sed 's/^/  /' || echo "  (none)"
 echo "======================================================================"
