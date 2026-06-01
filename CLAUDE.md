@@ -130,11 +130,11 @@ cd verilator && make clean && make
 
 Check `screenshot_frame_0350.png` — it must show the grey/black alternating line pattern (memory test). Uniform grey means the SR change broke Egret communication.
 
-**Known-bad patterns (do not re-introduce):**
-- `ext_fall_edge_pending` — latching CB1 falling edges for shift-out. Use `shift_tick_f` instead.
-- `cb2_latched` — capturing CB2 at CB1 rising edge for shift-in. Use live `cb2_i` instead.
+**SR edge-detection patterns (history + FPGA caveat):**
+- `cb2_latched` (shift-in: capturing CB2 at the CB1 rising edge) — **removed; do not re-introduce.** Shift-in uses live `cb2_i`. Re-introducing it hung the 4th Egret SR transfer in Verilator (CPU stuck polling IFR bit 2 at `0xA14E5E`).
+- `ext_fall_edge_pending` (shift-out: latching CB1 falling edges in external-clock mode) — **currently IN USE in `via6522.sv`.** It was reverted in `a8f9f33`, then deliberately re-added in `e067857` ("switching to fake egret"). It boots in Verilator only because the behavioral Egret drives CB1 slowly, so edges never coalesce. It is the **suspected cause of the FPGA overlay-stuck bug**: the real HC05 toggles CB1 far faster than the VIA's E-rate (only one pending edge is consumed per E-falling phase), so edges coalesce, SR bytes corrupt, the boot ROM's Egret handshake never completes, and the ROM overlay never clears. Do NOT assume it is FPGA-safe — prefer rate-limiting CB1 in `egret_wrapper` over re-touching this SR path.
 
-These were attempted for FPGA timing improvement but cause the 4th Egret SR transfer to hang in Verilator (CPU stuck polling IFR bit 2 at `0xA14E5E`).
+Re-verify boot (the screenshot check above) after ANY SR change.
 
 ## Known Limitations
 
