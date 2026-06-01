@@ -617,12 +617,23 @@ module dataController_top(
 	end
 
 `ifdef USE_EGRET_CPU
-	// Use the real 68HC05 + 341S0851 firmware (rtl/egret/egret_wrapper.sv).
+	// Use the real 68HC05 + 341S0851 firmware (rtl/egret/egret_wrapper.sv)
+	// for FPGA synthesis, but fall back to egret_behavioral for Verilator.
 	// The behavioral SM (rtl/egret_behavioral.sv) was previously instantiated
 	// here but synthesized its 256-entry PRAM as flat flops, eating ~48k ALMs
 	// — about 94% of the entire design. The HC05 wrapper has the exact same
 	// port signature ("drop-in replacement") and infers block RAM for ROM/PRAM.
+	// We keep the behavioral version available for SIMULATION because the
+	// HC05 core (converted from VHDL via GHDL) has multiple Verilator-
+	// unfriendly constructs (BLKLOOPINIT, etc.) and because the boot-ROM
+	// debugging we typically do in Verilator doesn't depend on faithful
+	// Egret-firmware simulation — the behavioral SM is close enough to
+	// release the 68020 from reset and answer initial VIA SR exchanges.
+`ifdef SIMULATION
+	egret_behavioral egret_inst(
+`else
 	egret_wrapper egret_inst(
+`endif
 		.clk            (clk32),
 		.clk8_en        (clk8_en_p),
 		.reset          (egretReset),  // Egret uses shorter reset than 68000
