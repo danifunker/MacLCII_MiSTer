@@ -300,9 +300,9 @@ module emu
 	reg _cpuAS_d;
 	always @(posedge clk_sys) _cpuAS_d <= _cpuAS;
 	always @(posedge clk_sys) begin
+`ifdef VERBOSE_TRACE
 		if (_cpuAS_d && !_cpuAS && cpuBusControl && selectUnmapped)
 			$display("[F%0d] BERR_UNMAPPED: addr=%h fc=%b rw=%b", sim_frame_count, cpuAddr, cpuFC, _cpuRW);
-`ifdef VERBOSE_TRACE
 		if (_cpuAS_d && !_cpuAS && |cpuAddrFullHi)
 			$display("[F%0d] HIGH_ADDR: hi=%h addr=%h fc=%b rw=%b", sim_frame_count, cpuAddrFullHi, cpuAddr, cpuFC, _cpuRW);
 `endif

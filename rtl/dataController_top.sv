@@ -265,7 +265,18 @@ module dataController_top(
                         selectAriel ? arielDataOut_full :
                         selectPseudoVIA ? pviaDataOut_full :
                         selectASC ? ascDataOut_full :
-                        selectUnmapped ? 16'h0000 :
+                        // Unmapped reads: return 16'hFFFF (MAME's open-bus
+                        // convention). Previously returned 16'h0000 which was
+                        // deterministic — the boot ROM's RAM-probe XOR-pattern
+                        // test cascaded zeros through unmapped SIMM addresses
+                        // and falsely concluded "RAM here, value = 0" instead
+                        // of "no RAM here", because (a) the unmapped writes
+                        // were silently dropped (_ramWE not asserted), and
+                        // (b) the subsequent read returned 0, matching the
+                        // 0 that the XOR test had cascaded. 0xFFFF is the
+                        // conventional "open bus" value that the probe's
+                        // write-pattern/read-mismatch check correctly rejects.
+                        selectUnmapped ? 16'hFFFF :
                         (cpuBusControl && memoryLatch) ? memoryDataIn : cpu_data;
 
 

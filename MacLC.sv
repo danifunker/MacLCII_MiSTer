@@ -883,9 +883,9 @@ module emu
 	reg _cpuAS_d;
 	always @(posedge clk_sys) _cpuAS_d <= _cpuAS;
 	always @(posedge clk_sys) begin
+`ifdef VERBOSE_TRACE
 		if (_cpuAS_d && !_cpuAS && cpuBusControl && selectUnmapped)
 			$display("BERR_UNMAPPED: addr=%h fc=%b rw=%b @%0t", cpuAddr, cpuFC, _cpuRW, $time);
-`ifdef VERBOSE_TRACE
 		if (_cpuAS_d && !_cpuAS && |cpuAddrFullHi)
 			$display("HIGH_ADDR: hi=%h addr=%h fc=%b rw=%b @%0t", cpuAddrFullHi, cpuAddr, cpuFC, _cpuRW, $time);
 `endif
