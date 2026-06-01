@@ -984,6 +984,15 @@ always @(posedge clk) begin
         // Track program counter
         if (rom_cs && cpu_wr) begin  // cpu_wr=1 means read
             last_pc <= cpu_addr;
+`ifdef EGRET_SRDEBUG
+            // Focused stuck-loop finder for the byte-4 BYTEACK/TREQ turnaround.
+            // Samples the HC05 PC + handshake inputs every ~32k fetches, so a hung
+            // loop prints its PC repeatedly (a few dozen lines/run, no flood).
+            // Enable with +define+EGRET_SRDEBUG; grep "EGRET_SRDBG" in the output.
+            if (cycle_count[14:0] == 15'd0)
+                $display("EGRET_SRDBG[%0d]: PC=0x%04x BYTEACK=%b TIP=%b TREQ_out=%b CB1out=%b",
+                         cycle_count, addr13, via_byteack_in_stable, via_tip_stable, pb_out[1], pb_out[4]);
+`endif
 `ifdef SIMULATION
             // Track key init milestones
             if (addr13 == 13'h0FAF)

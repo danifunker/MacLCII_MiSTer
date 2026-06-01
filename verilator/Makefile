@@ -17,6 +17,9 @@ V_DEFINE += -Wno-WIDTH -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-IMPLICIT -Wno-PINMI
 V_DEFINE += --trace-fst
 # Uncomment to enable verbose per-instruction/per-cycle debug traces (HC05, TG68, VIA, PVIA, etc.)
 # V_DEFINE += +define+VERBOSE_TRACE=1
+# Uncomment for a FOCUSED HC05 stuck-loop trace (no flood) - prints the Egret PC +
+# BYTEACK/TIP/TREQ every ~32k fetches. Use to pinpoint the byte-4 SR/BYTEACK hang.
+# V_DEFINE += +define+EGRET_SRDEBUG=1
 V_DEFINE +=
 
 UNAME_S := $(shell uname -s)
