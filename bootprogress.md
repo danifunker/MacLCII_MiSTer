@@ -238,6 +238,74 @@ needs a much longer headless run (or just verify on FPGA, which runs the march i
 Do NOT revert `2206dfb` or `5c3c94f`. The Row-M orange overlay difference is a separate red
 herring (a HEAD-only debug row).
 
+## 8. The "orange screen" + march characterization (2026-06-02, after the cmp.l fix)
+The committed cmp.l fix (`42ae7a6`) makes the bank probe pass; boot now reaches the real
+RAM-test march. The sim screen shows a **whole lot of orange** (orange/grey vertical stripes,
+not black) — this is **uninitialized VRAM being scanned out** through the 4bpp palette. It PROVES
+the V8 scanout path works end-to-end; the ROM just hasn't written a real framebuffer yet because
+it is still in the march. (master's "grey pattern" is the same phenomenon, different palette.)
+
+**The march is a ~21-pass moving-inversion test, not 2 passes.** `$A46910 cmpi.w #21,%d7; beq
+$A4694C` gates up to 21 iterations; `$A46918 cmp.l d0,d1` evolves the pattern and loops back to
+the inner march at `$A468a8`. MAME runs all ~21 passes but its 68020 **instruction cache** holds
+the entire unrolled `move.l (A2)+,D2 / eor.l D2,(A2)` loop, so it rips through them in ~127 MAME
+frames (per-frame PC sampler: march at MAME F97-164 + F195-222, bank-scan $A4A4xx at F188, late
+init by F231). Our **cacheless TG68 re-fetches every opcode AND is bus-starved by video DMA**, so
+each pass costs ~150-280 sim frames.
+
+Measured sim cadence (clean build, `monitor_id=2`/512x384, `--no-cpu-trace`): pass-boundary
+`$A46910` hits at F110, F267, F548, F712, F876 (Δ ≈ 157, 281, 164, 164 → ~191 frames/pass).
+Extrapolated march completion (`$A4694C`) ≈ **F3900-4000**, after which the ROM video-init writes
+the real framebuffer at `$F40000`→SDRAM `$580000`. So seeing real video in SIM needs a run to
+~F4000+; the FPGA runs the same march in real time (a multi-second RAM-test pause). This is NOT a
+bug and NOT a regression — it is the faithful, long, correct march. **Do NOT shrink RAM or revert
+RAM/VRAM commits to "fix" it** (RAM-shrink risks diverging from MAME's detected size/descriptors).
+
+Instrumentation added this session (`verilator/sim_main.cpp`): `--no-cpu-trace` flag (skips the
+per-instruction Musashi disasm/log that ballooned to 300MB and dominated runtime — required for
+long runs); 5M-cycle periodic PC+frame sampler; and march-progress counters that print on
+`$A46910`/`$A4694C`/`$A4A590`. Sim `monitor_id` changed `6`→`2` (`sim.v:480`) to match the FPGA
+default (`status[11:10]=0` → 512x384) AND cut video-DMA contention (~1.5x faster march). Note
+`$A4A590` and `$A46AFx` are shared routines hit in EARLY boot too — only `$A4694C` is a reliable
+march-done marker.
+
+## 9. BREAKTHROUGH — the slow march is a SYMPTOM of a garbage RAM-region descriptor (2026-06-02)
+Section 8's "faithful, long, correct march" conclusion is WRONG — corrected here.
+
+Measured MAME ground truth (Lua read-tap on maincpu program space, no debugger needed —
+`/tmp/tap910.lua`, `/tmp/tapregs.lua`): MAME hits the shared region-test check `$A46910`
+**exactly 4 times** for the whole boot (I/O, I/O, the 2MB RAM region, VRAM). **Our core hits it
+26+ and was still going** — ~6x+ the memory-test work. THAT extra work, not cache or bus, is the
+bulk of the ~60x slowdown (sim ~120s emulated vs MAME ~2s; real HW ≤30s for 10MB → ~6s for 2MB).
+
+Root cause found by dumping the TG68 register file at each `$A46910`
+(`VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile[0..15]`, D0-D7=0..7, A0-A7=8..15):
+- MAME PASS#3 (the real 2MB RAM test): `A0=00800000 A1=009FFFEC` D7=3 D0=6DB6DB6D D1=B6DB6DB6.
+- OUR PASS#1: same D0/D1/D7 (`6DB6DB6D`/`B6DB6DB6`/3) but **`A0=4E754EFA A1=350EACF0`** — ROM
+  bytes (`$350EACF0` = ROM checksum/ID, `$4E75` = rts), and **A0 > A1 (inverted)**.
+So our core reaches the right logical step with **garbage region bounds** → marches a corrupt,
+inverted range → loops nonsensically → slow AND no real RAM tested → no video. This IS the
+"`$4E754F00` gap-march" from sections 5-6.
+
+IMPORTANT distinction: the cmp.l video-bank probe fix (`42ae7a6`) DOES work — instrumented
+`$A467FE` (present) and `$A467F6` (absent) both fire correctly at F45 (present for VRAM, absent for
+a genuinely-absent bank). The garbage A0/A1 is a **SEPARATE, still-present bug** in the bank-sizing
+/ region-descriptor build — NOT the video probe.
+
+Bus-arbitration measurement (instrumented `_cpuAS`/`_cpuDTACK` taps in `sim.v` → sim_main per-clk
+classify): inner march = ~9.6 clk_sys/access, **stall ~30%** (waiting for bus slot, the
+arbitration-fixable part), xfer ~33%, idle ~36% (TG68 internal). So bus arbitration is worth only
+~1.4x — MINOR vs the 6x descriptor bug. Deprioritized.
+
+NEXT (resume here): trace where A0/A1 get loaded for the RAM region test — the code that should
+produce `$800000`/`$9FFFEC` (MAME) — and find what corrupts it to `$4E754EFA`/`$350EACF0`. That is
+the real fix for BOTH boot speed and video. Likely a corrupt region/descriptor table in low RAM or
+a wrong pointer; cross-check against MAME's path between its PASS#2 ($A46910 D7=1) and PASS#3 (D7=3).
+Sim instrumentation to reuse: `[MARCH] PASS#` regdump, `[PROBE]` present/absent, `[BUS]` stall
+profile, `--no-cpu-trace`, 5M-cycle PC sampler (all in `verilator/sim_main.cpp`); MAME taps in
+`/tmp/tapregs.lua`. Clocks are CORRECT (clk_sys 32.5MHz, CPU 16.25MHz — `pll.v` ×13/÷20); not a
+clock or "running too fast" issue.
+
 ## Key references
 - Disasm: `docs/MacLC_ROM_disasm.txt` (VMA 0x40800000; runtime `$A0xxxx` <-> disasm
   `$4080xxxx`, low 20 bits match). Probe `$A467E6-$A467F6`; RAM-sizing `$A467CC`; march

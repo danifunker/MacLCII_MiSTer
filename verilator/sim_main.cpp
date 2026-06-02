@@ -72,6 +72,7 @@ int cfg_memSize = 1;       // 0=1MB, 1=4MB
 // CPU trace
 // ---------
 bool cpu_trace_enable = false;  // Enable after ROM download
+bool cpu_trace_disabled = false; // --no-cpu-trace: skip per-instruction trace (long runs)
 bool cpu_trace_started = false;  // Wait for ROM load and reset
 FILE* cpu_trace_file = nullptr;
 const char* cpu_trace_filename = "cpu_trace.log";
@@ -224,6 +225,32 @@ int verilate() {
 			}
 			top->eval();
 			if (clk_sys.clk) { bus.AfterEval(); blockdevice.AfterEval(); }
+
+			// March progress counters — independent of cpu_trace gating.
+			// $A46910 = one full inner-march region pass completed (cmpi.w #21,d7)
+			// $A4694C = march fully done; $A4A590 = bank-scan driver reached.
+			if (VERTOPINTERN->debug_fetch_valid && !*bus.ioctl_download) {
+				static uint32_t march_last_pc = 0xFFFFFFFF;
+				static int hit_910 = 0, hit_694c = 0, hit_a590 = 0;
+				uint32_t mpc = VERTOPINTERN->debug_pc & 0xFFFFFF;
+				if (mpc != march_last_pc) {
+					march_last_pc = mpc;
+					if (mpc == 0xA46910) { hit_910++;
+						auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
+						fprintf(stderr, "[MARCH] PASS#%d F%d D0=%08X D1=%08X D2=%08X D4=%08X D6=%08X D7=%08X A0=%08X A1=%08X\n",
+							hit_910, video.count_frame,
+							(unsigned)rf[0],(unsigned)rf[1],(unsigned)rf[2],(unsigned)rf[4],
+							(unsigned)rf[6],(unsigned)rf[7],(unsigned)rf[8],(unsigned)rf[9]); }
+					else if (mpc == 0xA4694C) { hit_694c++;
+						fprintf(stderr, "[MARCH] *** DONE $A4694C hit#%d cyc=%llu F%d ***\n",
+							hit_694c, (unsigned long long)main_time, video.count_frame); }
+					else if (mpc == 0xA4A590) { hit_a590++;
+						if (hit_a590 <= 3) fprintf(stderr, "[MARCH] bank-scan $A4A590 hit#%d cyc=%llu F%d\n",
+							hit_a590, (unsigned long long)main_time, video.count_frame); }
+					else if (mpc == 0xA467FE) { static int n=0; if(++n<=8) fprintf(stderr, "[PROBE] PASS $A467FE (bank present) #%d F%d\n", n, video.count_frame); }
+					else if (mpc == 0xA467F6) { static int n=0; if(++n<=8) fprintf(stderr, "[PROBE] FAIL $A467F6 (bank absent) #%d F%d\n", n, video.count_frame); }
+				}
+			}
 
 			// CPU trace output - skip while ROM is downloading
 			// TG68 issues a bus fetch for every code-space word (opcode AND extension
@@ -427,15 +454,52 @@ int verilate() {
 
 					main_time++;
 					// Print progress every 10 million cycles (~300ms of simulated time at 32MHz)
-					if ((main_time % 10000000) == 0) {
-						fprintf(stderr, "Cycle %llu: PC=%08X Op=%04X\n",
+					if ((main_time % 5000000) == 0) {
+						fprintf(stderr, "Cycle %llu [F%d]: PC=%08X Op=%04X\n",
 							(unsigned long long)main_time,
+							video.count_frame,
 							VERTOPINTERN->debug_pc,
 							VERTOPINTERN->debug_opcode);
 					}
+
+					// --- Bus-stall measurement during the RAM-test march ---
+					// Per clk_sys: classify the CPU bus state. AS asserted (=0) with
+					// DTACK not yet acked (=1) => stalled waiting; AS asserted & DTACK
+					// acked (=0) => transfer cycle; AS negated => internal/idle.
+					{
+						static uint64_t bm_total=0, bm_stall=0, bm_xfer=0, bm_idle=0, bm_accesses=0;
+						static bool bm_as_prev=true; static int bm_last_report_frame=-1;
+						uint32_t mpc = VERTOPINTERN->debug_pc & 0xFFFFFF;
+						bool in_march = (mpc >= 0xA46880 && mpc <= 0xA46960);
+						if (in_march) {
+							bool as = VERTOPINTERN->debug_cpu_as;       // 1=negated,0=asserted
+							bool dtack = VERTOPINTERN->debug_cpu_dtack; // 1=not acked,0=acked
+							bm_total++;
+							if (!as && dtack) bm_stall++;
+							else if (!as && !dtack) bm_xfer++;
+							else bm_idle++;
+							if (bm_as_prev && !as) bm_accesses++; // AS falling edge = new access
+							bm_as_prev = as;
+							int f = video.count_frame;
+							if (f != bm_last_report_frame && (f % 40)==0 && bm_total>0) {
+								bm_last_report_frame = f;
+								fprintf(stderr, "[BUS F%d] total=%llu stall=%llu xfer=%llu idle=%llu accesses=%llu | stall=%.0f%% xfer=%.0f%% idle=%.0f%% -> %.1f clk/access\n",
+									f,
+									(unsigned long long)bm_total,
+									(unsigned long long)bm_stall,
+									(unsigned long long)bm_xfer,
+									(unsigned long long)bm_idle,
+									(unsigned long long)bm_accesses,
+									100.0*bm_stall/bm_total,
+									100.0*bm_xfer/bm_total,
+									100.0*bm_idle/bm_total,
+									bm_accesses?(double)bm_total/bm_accesses:0.0);
+							}
+						}
+					}
 					// Enable trace after download completes to see initial 68K execution
 					static bool last_download = false;
-					if (last_download && !*bus.ioctl_download && !cpu_trace_enable) {
+					if (last_download && !*bus.ioctl_download && !cpu_trace_enable && !cpu_trace_disabled) {
 						cpu_trace_enable = true;
 						fprintf(stderr, "*** Enabling CPU trace after ROM download ***\n");
 						if (!cpu_trace_file) {
@@ -550,6 +614,9 @@ int main(int argc, char** argv, char** env) {
 			stop_at_frame_enabled = true;
 			printf("Will stop at frame %d\n", stop_at_frame);
 			i++;
+		} else if (strcmp(argv[i], "--no-cpu-trace") == 0) {
+			cpu_trace_disabled = true;
+			printf("Per-instruction CPU trace disabled (cpu_trace.log will not be written)\n");
 		}
 	}
 

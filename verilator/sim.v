@@ -81,6 +81,8 @@ module emu
 	output [15:0] debug_cpuDataOut,   // Data from peripherals to CPU
 	output        debug_cpuRW,        // 1=read, 0=write
 	output        debug_cpuBusControl,
+	output        debug_cpu_as,       // _cpuAS (0 = address strobe asserted)
+	output        debug_cpu_dtack,    // _cpuDTACK (0 = acknowledged)
 
 	// Serial port (SCC Channel A)
 	output        serial_txd,       // SCC Channel A TX output (for sim-side RX)
@@ -476,8 +478,8 @@ module emu
 	// Use actual video mode from pseudovia (ROM configures this via register 0x10)
 	wire [2:0] v8_video_mode = pvia_video_config[2:0];
 
-	// Monitor ID Selection - 13" RGB
-	wire [3:0] v8_monitor_id = 4'h6;
+	// Monitor ID Selection - 12" RGB 512x384 (matches FPGA default status[11:10]=0)
+	wire [3:0] v8_monitor_id = 4'h2;
 
 	ariel_ramdac ariel(
 		.clk_sys(clk_sys),
@@ -795,5 +797,7 @@ module emu
 	assign debug_cpuDataOut = dataControllerDataOut;  // Peripherals send this to CPU
 	assign debug_cpuRW = _cpuRW;  // 1=read, 0=write
 	assign debug_cpuBusControl = cpuBusControl;
+	assign debug_cpu_as = _cpuAS;
+	assign debug_cpu_dtack = _cpuDTACK;
 
 endmodule
