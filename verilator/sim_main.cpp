@@ -226,6 +226,34 @@ int verilate() {
 			top->eval();
 			if (clk_sys.clk) { bus.AfterEval(); blockdevice.AfterEval(); }
 
+			// ROM overlay transition logger (one-shot edges)
+			if (clk_sys.clk) {
+				static int prev_ov = -1;
+				int ov = (int)VERTOPINTERN->emu__DOT__ac0__DOT__rom_overlay;
+				if (ov != prev_ov) {
+					fprintf(stderr, "[OVERLAY] rom_overlay %d->%d at F%d cyc=%llu\n",
+						prev_ov, ov, video.count_frame, (unsigned long long)main_time);
+					prev_ov = ov;
+				}
+				static int prev_pend = -1, prev_rst = -1;
+				int pend = (int)VERTOPINTERN->emu__DOT__ac0__DOT__overlay_disable_pending;
+				int rst = (int)VERTOPINTERN->emu__DOT___cpuReset;
+				if (pend != prev_pend) { fprintf(stderr, "[OVERLAY] pending %d->%d F%d cyc=%llu\n", prev_pend, pend, video.count_frame, (unsigned long long)main_time); prev_pend = pend; }
+				if (rst != prev_rst) { fprintf(stderr, "[OVERLAY] _cpuReset %d->%d F%d cyc=%llu\n", prev_rst, rst, video.count_frame, (unsigned long long)main_time); prev_rst = rst; }
+				// FC during $A0xxxx accesses (overlay-clear gate is cpuFC[1])
+				static int fc_logs = 0;
+				uint32_t ca = top->debug_cpuAddr;
+				if ((ca & 0xF00000) == 0xA00000 && fc_logs < 24) {
+					unsigned fc = VERTOPINTERN->emu__DOT__cpuFC;
+					static uint32_t last_ca = 0xFFFFFFFF; static unsigned last_fc = 0xFF;
+					if (ca != last_ca || fc != last_fc) {
+						fprintf(stderr, "[FC] $A-access addr=%06X FC=%u (fc1=%u) F%d\n",
+							ca & 0xFFFFFF, fc, (fc>>1)&1, video.count_frame);
+						fc_logs++; last_ca = ca; last_fc = fc;
+					}
+				}
+			}
+
 			// March progress counters — independent of cpu_trace gating.
 			// $A46910 = one full inner-march region pass completed (cmpi.w #21,d7)
 			// $A4694C = march fully done; $A4A590 = bank-scan driver reached.
@@ -237,10 +265,11 @@ int verilate() {
 					march_last_pc = mpc;
 					if (mpc == 0xA46910) { hit_910++;
 						auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
-						fprintf(stderr, "[MARCH] PASS#%d F%d D0=%08X D1=%08X D2=%08X D4=%08X D6=%08X D7=%08X A0=%08X A1=%08X\n",
+						fprintf(stderr, "[MARCH] PASS#%d F%d D0=%08X D1=%08X D2=%08X D4=%08X D6=%08X D7=%08X A0=%08X A1=%08X A2=%08X A3=%08X A4=%08X A5=%08X\n",
 							hit_910, video.count_frame,
 							(unsigned)rf[0],(unsigned)rf[1],(unsigned)rf[2],(unsigned)rf[4],
-							(unsigned)rf[6],(unsigned)rf[7],(unsigned)rf[8],(unsigned)rf[9]); }
+							(unsigned)rf[6],(unsigned)rf[7],(unsigned)rf[8],(unsigned)rf[9],
+							(unsigned)rf[10],(unsigned)rf[11],(unsigned)rf[12],(unsigned)rf[13]); }
 					else if (mpc == 0xA4694C) { hit_694c++;
 						fprintf(stderr, "[MARCH] *** DONE $A4694C hit#%d cyc=%llu F%d ***\n",
 							hit_694c, (unsigned long long)main_time, video.count_frame); }
@@ -249,6 +278,19 @@ int verilate() {
 							hit_a590, (unsigned long long)main_time, video.count_frame); }
 					else if (mpc == 0xA467FE) { static int n=0; if(++n<=8) fprintf(stderr, "[PROBE] PASS $A467FE (bank present) #%d F%d\n", n, video.count_frame); }
 					else if (mpc == 0xA467F6) { static int n=0; if(++n<=8) fprintf(stderr, "[PROBE] FAIL $A467F6 (bank absent) #%d F%d\n", n, video.count_frame); }
+					else if (mpc == 0xA46584) { static int n=0; if(++n<=12) { // cmpaw #-1,a0 : A0=region start loaded, A5=table base
+						auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
+						fprintf(stderr, "[TBL] $A46584 #%d F%d D7=%08X A0(start)=%08X A4=%08X A5(tbl)=%08X SP=%08X\n",
+							n, video.count_frame, (unsigned)rf[7], (unsigned)rf[8], (unsigned)rf[12], (unsigned)rf[13], (unsigned)rf[15]); } }
+					else if (mpc == 0xA4658A) { static int n=0; if(++n<=12) { // movel a4@+,d0 : D0=region length
+						auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
+						fprintf(stderr, "[TBL] $A4658A #%d F%d D0(len)=%08X A0=%08X A4=%08X\n",
+							n, video.count_frame, (unsigned)rf[0], (unsigned)rf[8], (unsigned)rf[12]); } }
+					else if (mpc == 0xA4657E) { static int n=0; if(++n<=8) { // moveal sp@,a4 : about to read table ptr from SP
+						auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
+						fprintf(stderr, "[TBL] $A4657E #%d F%d (D7=3 RAM-region entry) SP=%08X overlay=%d\n",
+							n, video.count_frame, (unsigned)rf[15],
+							(int)VERTOPINTERN->emu__DOT__ac0__DOT__rom_overlay); } }
 				}
 			}
 

@@ -250,7 +250,14 @@ module addrController_top(
 	// and the CPU wild-branches through ORI.B #0,D0. Gating on FC[1]=1
 	// (program access) holds overlay until the boot ROM does its real
 	// JMP-to-ROM, at which point overlay clears safely.
-	wire overlay_trigger = !_cpuAS && (cpuAddr[23:20] == 4'hA) && cpuFC[1];
+	// NOTE: do NOT gate on cpuFC[1]. The TG68 presents FC=000 at the clk_sys
+	// posedge where addrController samples _cpuAS low, so a cpuFC[1] gate can
+	// never fire and the overlay never clears (RAM never appears → garbage
+	// RAM descriptor, SP=0, no video). Matches MAME (v8 rom_switch_r clears on
+	// any ROM-region read). The premature-$ABC146 concern that motivated the
+	// gate was a symptom of other bugs (cmp.l flag race, sim/FPGA core split),
+	// now fixed; the first live $A access is legit program exec at $A02E3E.
+	wire overlay_trigger = !_cpuAS && (cpuAddr[23:20] == 4'hA);
 
 	always @(posedge clk) begin
 		if (!_cpuReset) begin
