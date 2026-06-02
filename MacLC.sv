@@ -838,12 +838,22 @@ module emu
 		else begin
 			cpuBusControl_d <= cpuBusControl;
 			if (_cpuAS) dtack_en <= 0;
-			if (!_cpuAS & ((!cpuBusControl_d & cpuBusControl) | (!selectROM & !selectRAM))) dtack_en <= 1;
+			// VRAM is SDRAM-backed and reads via the same cpu-slot as RAM,
+			// so it must take the slot-aligned DTACK path (cpuBusControl rising
+			// edge), NOT the immediate !ROM&!RAM peripheral path. Excluding
+			// selectVRAM here stops DTACK asserting before the SDRAM cpu-slot
+			// commits the read/write (was truncating longword writes / sampling
+			// stale data on the old VPA routing).
+			if (!_cpuAS & ((!cpuBusControl_d & cpuBusControl) | (!selectROM & !selectRAM & !selectVRAM))) dtack_en <= 1;
 		end
 	end
 
-	assign      _cpuVPA = (cpuFC == 3'b111) ? 1'b0 : ~(!_cpuAS && cpuAddr[23:21] == 3'b111);
-	assign      _cpuDTACK = ~(!_cpuAS && cpuAddr[23:21] != 3'b111) | !dtack_en;
+	// VRAM ($F40000-$FBFFFF, cpuAddr[23:21]==111) must use async DTACK like RAM,
+	// not the 6800 E-clock VPA peripheral path — the VPA path samples on a fixed
+	// E-phase that misses the SDRAM cpu-slot and returns stale data, mis-sizing
+	// the video bank and leaving the screen black.
+	assign      _cpuVPA = (cpuFC == 3'b111) ? 1'b0 : ~(!_cpuAS && cpuAddr[23:21] == 3'b111 && !selectVRAM);
+	assign      _cpuDTACK = ~(!_cpuAS && (cpuAddr[23:21] != 3'b111 || selectVRAM)) | !dtack_en;
 	wire        cpu_en_p      = clk16_en_p;
 	wire        cpu_en_n      = clk16_en_n;
 	assign      _cpuReset_o   = tg68_reset_n;
