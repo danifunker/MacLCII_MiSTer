@@ -54,6 +54,20 @@ truth alongside the Verilator sim.
   NOT VRAM-specific (reproduces on VPA and DTACK); the data path is 100% clean. Fix = give the
   `(An)` longword op the same one-cycle alignment (mirror `ld_dAn1`), or stall the Bcc on a
   pending flag commit. (VHDL is now the source of truth — see the consolidation commit.)
+- **FIX IMPLEMENTED & VERIFIED 2026-06-02 (uncommitted):** added micro_state `ld_An1`
+  (`TG68K_Pack.vhd`/`.sv`) and split the `(An)` source-decode in `TG68KdotC_Kernel.vhd` — for
+  longword plain `(An)` (`opcode(5:3)="010" AND datatype="10"`) it now does
+  `setstate<="01"; next_micro_state<=ld_An1` (one INTERNAL cycle, no code fetch — plain (An) has
+  no extension word), and `ld_An1` does the usual `get_ea_now`+`setnextpass`. `(An)+`/`-(An)` and
+  byte/word `(An)` are untouched. Regen via `convert_to_verilog.sh`. Verified with temp kernel
+  debug ports (execOPC/Z/exe_condition + bra1/ld_An1 taps, since removed): the `beq $A467F4` now
+  samples `Z=1`/`cond=1` and **branches to `$A467FE` (bank present)**; the clean build's CPU trace
+  then advances through `jmp (A6)` to the **bank-scan driver `$A4A590` (`$A4A6xx`) — the same
+  post-probe region MAME reaches.** The frame-350 screenshot is STILL black, but ONLY because the
+  correct RAM-test march (`$A468xx`, now testing real RAM at `$000000` per `2206dfb`) is long and
+  not finished by frame 350 in sim — NOT a regression (see section 7). NOTE: the "`$A467F6` count"
+  grep is a BOGUS oracle (it's the prefetch word after the beq, present on pass AND fail paths);
+  use the beq's branch target / bank-scan reach instead.
 
 ## Critical methodology note
 This sim has **clean-vs-incremental build nondeterminism**. Several "it works!" results were
@@ -205,6 +219,24 @@ overwritten `data_read`**. So `cmp.l` compares `D0` against `$00006708` (stale) 
    video_mode=2 / 4bpp).
 4. Separately confirm (or rule out) the post-fix `$4F62xxxx` gap-march as legit HMMU-truncation
    vs another decode divergence — MAME never reads that gap.
+
+## 7. The frame-350 "pattern -> black" difference is NOT a regression (2026-06-02)
+master (= merge-base `bc7019c`) shows the grey memory-test PATTERN at frame 350 (PNG ~16.6KB);
+this branch (HEAD) shows BLACK (~9KB). This is the EXPECTED consequence of the `2206dfb`
+RAM-mapping correctness fix, not a video-path regression:
+- master does NOT contain `2206dfb`, so its `$000000-$1FFFFF` returns `$FFFF` open-bus garbage.
+  The RAM-test march (`$A468xx`: `eor.l D2,(A2)` / `move.l (A2)+,D2` / `dbf %d3` @ `$A46904`)
+  reads that garbage, its checksum/compare loop exits EARLY, and it lands in `$A469xx` doing
+  garbage ops that happen to touch `$50F4xxxx` (VRAM) -> the visible "pattern."
+- HEAD has `2206dfb` -> real RAM at `$000000` -> the march runs its FULL, CORRECT, multi-pass
+  length (more RAM to test) -> still mid-march at frame 350 -> black. Confirmed HEAD PROGRESSES
+  (a frame-700 run reached the post-march caller `$A46AF8` then looped back for another pass —
+  not hung, just slow in sim; frame 700 ~= cycle 560M).
+So master's pattern was an ARTIFACT of the pre-fix RAM bug; HEAD's black is the correct
+long-march-still-running state. Scanout works (master proves the path). Seeing real video in SIM
+needs a much longer headless run (or just verify on FPGA, which runs the march in real time).
+Do NOT revert `2206dfb` or `5c3c94f`. The Row-M orange overlay difference is a separate red
+herring (a HEAD-only debug row).
 
 ## Key references
 - Disasm: `docs/MacLC_ROM_disasm.txt` (VMA 0x40800000; runtime `$A0xxxx` <-> disasm

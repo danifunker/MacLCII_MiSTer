@@ -33,7 +33,7 @@ package TG68K_Pack is
 						  cas25, cas26, cas27, cas28, chk20, chk21, chk22, chk23, chk24,
 						  trap4, trap5, trap6, movec1, movep1, movep2, movep3, movep4, movep5, rota1, bf1,
 						  mul1, mul2, mul_end1,  mul_end2, div1, div2, div3, div4, div_end1, div_end2,
-						  moves1, moves2);
+						  moves1, moves2, ld_An1);
 	
 	constant opcMOVE				: integer := 0; --
 	constant opcMOVEQ				: integer := 1; --

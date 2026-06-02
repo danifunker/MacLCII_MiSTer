@@ -1590,9 +1590,20 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 
 		IF (ea_build_now='1' AND decodeOPC='1') OR exec(ea_build)='1' THEN
 			CASE opcode(5 downto 3) IS		--source
-				WHEN "010"|"011"|"100" =>						-- -(An)+
-					set(get_ea_now) <='1';
-					setnextpass <= '1';
+				WHEN "010"|"011"|"100" =>						-- (An), (An)+, -(An)
+					-- LONGWORD plain (An): defer the operand read one internal cycle
+					-- (mirror the (d16,An)/ld_dAn1 path). The 2-cycle longword read
+					-- otherwise commits flags one cycle too late, so an immediately
+					-- following Bcc samples the stale flags of the previous compare
+					-- (Mac LC video-bank probe @ $A467F2 cmp.l (A0)). setstate "01" =
+					-- internal, NO code fetch: plain (An) has no extension word.
+					IF opcode(5 downto 3)="010" AND datatype="10" THEN
+						setstate <= "01";
+						next_micro_state <= ld_An1;
+					ELSE
+						set(get_ea_now) <='1';
+						setnextpass <= '1';
+					END IF;
 					IF opcode(3)='1' THEN	--(An)+
 						set(postadd) <= '1';
 						IF opcode(2 downto 0)="111" THEN
@@ -3273,6 +3284,10 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 				WHEN ld_dAn1 =>		-- d(An)=>, --d(PC)=>
 					set(get_ea_now) <='1';
 					setdisp <= '1';		--word
+					setnextpass <= '1';
+
+				WHEN ld_An1 =>		-- (An)=> longword, deferred one cycle (flag-commit alignment)
+					set(get_ea_now) <='1';
 					setnextpass <= '1';
 					
 				WHEN ld_AnXn1 =>		-- d(An,Xn)=>, --d(PC,Xn)=>
