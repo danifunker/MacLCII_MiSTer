@@ -78,10 +78,23 @@ module addrDecoder(
                                   (ram_config[7:6] == 2'b10) ? 24'h400000 :  // 4MB
                                                                 24'h800000;   // 8MB
 
+    // Motherboard RAM placement (match MAME v8.cpp ram_size()): the 2MB
+    // motherboard RAM is ALWAYS installed at mb_location, which sits directly
+    // after any SIMM (mb_location = SIMM size). With no SIMM (config[7:6]=00)
+    // the motherboard RAM lands at $000000-$1FFFFF. It is additionally
+    // mirrored at $800000-$9FFFFF (the always-present V8 image). Only the 8MB
+    // SIMM config (config[7:6]=11) drops the low motherboard placement.
+    wire [23:0] mb_location = simm_byte_size;          // == 0 when no SIMM
+    wire        mb_present  = (ram_config[7:6] != 2'b11);
+
     // Valid RAM ranges:
-    //   SIMM:        $000000 to simm_byte_size-1 (only if SIMM present)
-    //   Motherboard: $800000-$9FFFFF (always 2MB)
-    wire in_simm_range = (address[23:0] < simm_byte_size);
+    //   SIMM:            $000000 to simm_byte_size-1 (only if SIMM present)
+    //   Motherboard low: [mb_location, mb_location+2MB) (the soldered 2MB)
+    //   Motherboard high:$800000-$9FFFFF (always-present 2MB mirror)
+    wire in_simm_range = (ram_config[7:6] != 2'b00) && (address[23:0] < simm_byte_size);
+    wire in_motherboard_low = mb_present &&
+                              (address[23:0] >= mb_location) &&
+                              (address[23:0] <  (mb_location + 24'h200000));
     wire in_motherboard_range = (address[23:21] == 3'b100);  // $800000-$9FFFFF
 
     always @(*) begin
@@ -113,7 +126,7 @@ module addrDecoder(
                 if (memoryOverlayOn && _cpuRW) begin
                     // Overlay active: ROM appears at $000000 for READS
                     selectROM = 1;
-                end else if (in_simm_range || in_motherboard_range) begin
+                end else if (in_simm_range || in_motherboard_low || in_motherboard_range) begin
                     // Normal operation: RAM only where it physically exists
                     selectRAM = 1;
                 end else begin
