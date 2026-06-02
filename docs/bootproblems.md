@@ -1,5 +1,101 @@
 # Boot Problems Log
 
+## 2026-06-01 Session — Egret SR / overlay bug FIXED; now stuck pre-video in the RAM march
+
+**Headline:** The long-standing **Egret <-> 68020 shift-register bug** that left
+the boot stuck in the ROM overlay is **FIXED** (two `rtl/via6522.sv` commits,
+validated against MAME). The boot now completes the Egret handshake, **escapes
+the overlay**, runs real ROM, and reaches the **RAM march test at `$A468xx`** —
+the same point the old behavioral-Egret sim reached, but now via the **real
+HC05**, so it is also the FPGA fix. **Remaining problem: still no video** — the
+boot grinds in the RAM march and never reaches video init.
+
+### What was fixed (Egret shift register)
+
+The 68020 talks to the Egret over the VIA shift register; CB1 is the external
+shift clock driven by the HC05. Two bugs in `via6522.sv` external-clock SR mode,
+both fixed by matching MAME `src/devices/machine/6522via.cpp`:
+
+1. **`9b40d57` — per-CB1-edge shift+count.** The whole SR datapath ran inside
+   `if (E_falling)`, counting at most one CB1 edge per VIA E-period. The HC05
+   toggles CB1 ~5-10x faster than E, so edges coalesced -> no byte ever completed
+   -> CPU stuck polling IFR bit 2 at `$A14E5E`. Now shifts+counts on each CB1
+   edge (`shift_tick_r` in / `shift_tick_f` out), decoupled from E. (0 -> 3 of 4
+   bytes.)
+2. **`6cfde0a` — registered CB2 (the decisive fix).** `ser_cb2_o = shift_reg[7]`
+   was combinational, so CB2 advanced to bit6 the instant the falling edge
+   rotated `shift_reg`. But the HC05 reads CB2 *after* its CB1 falling+rising
+   (`$14EF BCLR4 / $14F1 BSET4 / $14F3 BRSET5`), so it sampled bit6 first -> every
+   received command byte was **rotated one bit** -> the Egret misjudged the
+   command, turned the bus around (asserted TREQ) after 3 bytes while the 68020
+   was still sending byte 4 -> the "byte-4 deadlock." Fix matches MAME
+   `shift_out`: register CB2 in `cb2_shift_out` (present MSB, hold across the
+   edge, THEN rotate; init `data_in[7]` on SR load). (-> 28 of 29 bytes complete.)
+
+Supporting: **`054fa2a`** consolidated the sim onto the **real HC05**
+(`egret_wrapper`) for both Verilator and FPGA (behavioral is opt-in
+`+define+EGRET_BEHAVIORAL`), so the sim now reproduces and validates the FPGA
+Egret path. CLAUDE.md's "ext_fall_edge_pending known-bad" note was corrected in
+`3e2e3e6` (it was stale).
+
+### Where it stalls now (no video)
+
+- Overlay clears (`overlay_trigger` / `last_rom_pc` reach `$A0xxxx`); CPU runs
+  real ROM and reaches the RAM march loop `$A468C4-$A46908` (the
+  `subi.l #$10000,D3` outer loop). Data `@addr` walks `$4F35... -> $4FBA6CAC`.
+- **Screen black: the CPU never touches the `$F40000` VRAM aperture** (where
+  video init writes), so video never initializes.
+- Impractical to run to completion on the slow Windows sim (~2.5 s/frame; still
+  in the march at frame 600). **Yellow flag:** `@addr` reaches `$BA6CAC`, *above*
+  the `$9FFFFF` top of the 2 MB motherboard RAM — the march may not be
+  terminating cleanly.
+
+### Two hypotheses (next session decides which)
+
+**(A) Legit ~2 MB RAM+HMMU test, just too slow in the sim.** The `$4x`-prefixed
+addresses are the deliberate HMMU-truncation test; on real HW it is ms. A faster
+sim / FPGA boots right through. *Leading hypothesis.*
+
+**(B) Real RAM mis-sizing / decode bug** that walks past 2 MB and never ends:
+- **RAM mirror mismatch:** `addrController_top.v` mirrors the 2 MB motherboard
+  (`mb_mirror_offset = (cpu_word - simm_words) mod 2MB`). If it does not match
+  the V8 exactly, the ROM sizes RAM wrong. Compare to MAME `v8.cpp ram_size()`.
+- **Unmapped value:** `f9fbf56` returns **`$FFFF`** for unmapped reads; **MAME
+  returns `$0000`**. The march is an XOR read-back (`movel (a2)+,d2; eorl d2,(a2)`);
+  `$FFFF` vs `$0000` can change whether a region "passes."
+  (`dataController_top.sv`, `selectUnmapped ? 16'hFFFF`.)
+
+### Next steps (GOAL: video) — MAME ground truth + faster sim
+1. Run MAME `maclc` (driver `src/mame/apple/maclc.cpp`, V8 `v8.cpp`): confirm it
+   reaches video, what RAM size it detects, and where/when video init writes the
+   framebuffer. **Diff `v8.cpp ram_size()` mirror + unmapped behavior vs our
+   `addrController_top.v`** — decisive for hypothesis (B).
+2. Run the HC05 sim longer on a faster box (3000+ frames): does the march
+   terminate (PC leaves `$A468xx`)? Does it ever write `$F40000`
+   (`grep -oE '@00F[4-9AB]' cpu_trace.log`)? Screenshots?
+3. Test (B): flip `selectUnmapped` to `16'h0000` (match MAME), rerun. Fix any
+   `addrController` mirror divergence.
+4. If it reaches video init but stays black -> framebuffer/V8 bug: verify CPU
+   writes (`$F40000-$FBFFFF`) and V8 reads both hit SDRAM word `$580000`
+   (`addrController_top.v:170-176`), and `video_mode`/`monitor_id` (default
+   512x384, 4 bpp) match what the ROM programs.
+
+### Video / VRAM map (reference)
+- No dedicated VRAM. 512 KB aperture at CPU `$F40000-$FBFFFF` -> SDRAM word
+  `$580000`. V8 read path: `maclc_v8_video.sv` (`VRAM_BASE=0`); mapped in
+  `addrController_top.v:170-189`. Default `monitor_id=2` (512x384),
+  `video_mode=2` (4 bpp) -> ~96 KB framebuffer used.
+- RAM: sim is **2 MB** (`verilator/sim.v:188 configRAMSize=8'h24`); motherboard
+  `$800000-$9FFFFF`, no SIMM.
+- Egret debug: `+define+EGRET_SRDEBUG=1` (Makefile, commented) prints HC05 PC +
+  BYTEACK/TIP/TREQ. Do NOT enable `VERBOSE_TRACE` for normal runs (floods).
+
+> **Caveat for the older entries below:** the STM / SCC "All Sent" / AppleTalk
+> diagnoses were made when the boot was stuck *much earlier* (in the overlay /
+> Egret handshake). With the Egret fix the boot now runs far past that point, so
+> re-validate any of those findings against the current (post-`6cfde0a`) boot
+> before acting on them.
+
 ## 2026-04-15 Session — Apple STM identified; SCC TX "All Sent" is the real blocker
 
 **Headline:** the outer loop at `A498EC/A49FCA` is **Apple's Self-Test Monitor
