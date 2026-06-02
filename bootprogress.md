@@ -37,13 +37,23 @@ truth alongside the Verilator sim.
 ## TL;DR — current state
 - **FIXED & committed (`2206dfb`):** address-decoder motherboard-RAM mapping. Made the RAM
   march terminate and advanced boot to the bank-scan region (the same region MAME reaches).
-- **ROOT CAUSE of no-video, CONFIRMED but NOT yet fixed:** VRAM (`$F40000-$FBFFFF`) is wrongly
-  routed onto the 6800 **VPA** synchronous-peripheral path instead of async **DTACK** —
-  present in BOTH `verilator/sim.v` AND the real FPGA top `MacLC.sv`. The boot ROM's VRAM
-  presence-probe reads back stale data, mis-sizes the video bank, corrupts the RAM-config
-  descriptor table, and never initialises video.
-- No working VRAM fix landed: attempts either failed a clean build or hit a
-  TG68-kernel-internal paradox (section 5). All experimental changes reverted; tree clean.
+- **VRAM→DTACK done (uncommitted, tree change):** VRAM (`$F40000-$FBFFFF`) was on the 6800
+  **VPA** path; now routed to async **DTACK** like RAM, in BOTH `verilator/sim.v` AND `MacLC.sv`.
+  This is architecturally correct (matches MAME and the lbmactwo NuBus-on-DTACK core) and makes
+  the VRAM data path bit-identical to RAM — but it is **NOT the lever**: screen still black,
+  probe still fails at the same point. Keep it; it's a prerequisite, not the fix.
+- **ACTUAL ROOT CAUSE (2026-06-02 — CONFIRMED via execOPC/Flags probe; corrects the earlier
+  "stale operand" wording in section 6):** a **TG68K flag-commit-vs-branch pipeline race**. The
+  bank probe does two consecutive `cmp.l` longword reads — alias `cmp.l (A0,D2)` @ `$A467EC` then
+  real `cmp.l (A0)` @ `$A467F2`. At the real cmp's `execOPC` commit BOTH ALU operands are correct
+  (`OP1=D0=5368656C`, `OP2=mem=5368656C`) so it computes EQUAL and latches `Z=1` — but ONE CYCLE
+  LATE. The following `beq $A467F4` already evaluated its condition using the stale `Z=0` from the
+  alias cmp → falls through to `$A467F6` (bank absent) → probe fails. `cmp.l (An)` uses the tight
+  `get_ea_now` immediate-read path (2-cycle longword read delays the flag commit); the working
+  `cmp.l (d16,An)` defers via `ld_dAn1`, whose extra cycle aligns the commit ahead of the branch.
+  NOT VRAM-specific (reproduces on VPA and DTACK); the data path is 100% clean. Fix = give the
+  `(An)` longword op the same one-cycle alignment (mirror `ld_dAn1`), or stall the Bcc on a
+  pending flag commit. (VHDL is now the source of truth — see the consolidation commit.)
 
 ## Critical methodology note
 This sim has **clean-vs-incremental build nondeterminism**. Several "it works!" results were
@@ -120,30 +130,81 @@ AS/DTACK/cpuAddr/busstate, plus clk16-enable sampling and the TG68 wrapper's int
    write, 2nd asserts DTACK). After these: `mem[$580001]` IS written, and the dump shows the
    TG68's OWN input register `tg68_din_r` latch `$5368` (word1) then `$656C` (word2) at state
    6/7 — i.e. the CPU input register holds exactly `$5368656C` = `D0`.
-5. **PARADOX (unresolved):** despite `tg68_din_r` = `$5368/$656C` (correct) for both words,
-   the `cmp.l` still reports unequal — `$A467F4 beq` not taken, `$A467F6` runs, the `$4E754F00`
-   march persists. The data is correct at EVERY observable point including the TG68 wrapper's
-   data register. So the remaining discrepancy is INSIDE the TG68 kernel
-   (`rtl/tg68k/TG68KdotC_Kernel.v`, generated VHDL->Verilog) — how/when it consumes `data_in`
-   to assemble the 32-bit operand and compare, or whether `D0` itself differs at the ALU. The
-   wrapper samples `din` at `s_state==6` on phi2 (`rtl/tg68k/tg68k.v:104-118`).
+5. **The old "paradox" — NOW RESOLVED (2026-06-02), see section 6.** `tg68_din_r` is correct
+   for both words yet `cmp.l` reports unequal. The discrepancy is inside the TG68 kernel, exactly
+   as suspected — a back-to-back-longword-read operand bug, NOT a VRAM/bus issue.
+
+## 6. ROOT CAUSE — TG68K back-to-back longword-read stale operand (2026-06-02)
+Method: re-ran (VRAM on DTACK) with three `ifdef SIMULATION` probes — `sim_ram` VRAM-range
+read/write log, the wrapper's `tg68_din_r` latch + per-`clkena` (`s_state`/`busstate`/`din_r`)
+log, and an in-kernel dump of `tg68_pc`/`data_in`/`data_read`/`last_data_in`/`last_data_read`/
+`memmask`/`state` (the readable net aliases exist in the generated `.v`). All probes removed
+afterward; tree holds only the DTACK change.
+
+The probe code at `$A467E6` is a write-then-read-back bank presence test:
+```
+A467E6  move.l D0,(A0)        ; D0=$5368656C -> write to $50F40000 (VRAM base)
+A467EC  cmp.l  (A0,D2.l),D0   ; D2=$40000 -> read $50F80000 (alias) = $00000000; not-equal (correct)
+A467F0  beq    $a46804        ; not taken (alias != D0, good)
+A467F2  cmp.l  (A0),D0        ; read $50F40000 = $5368656C; SHOULD be equal to D0=$5368656C
+A467F4  beq    $a467fe        ; SHOULD take, but does NOT -> bank wrongly marked absent
+```
+What the kernel dump proves — operand assembly is CORRECT for BOTH the failing and a known-good
+`cmp.l`, so the assembly is not the bug:
+```
+FAILING cmp.l (A0) @A467F2:   reads 5368 then 656c -> data_read=5368656c, last_data_in=5368656c  OK
+WORKING cmp.l ($24,A1) @A02F90: reads 5600 then 0000 -> data_read=56000000, last_data_in=56000000 OK (bne falls through = equal)
+```
+Both deliver the right 32-bit operand into `last_data_in`. The distinguishing factor: the FAILING
+`cmp.l (A0)` is the **second of two back-to-back longword reads** — preceded immediately by the
+alias `cmp.l (A0,D2)` @ `$A467EC` whose operand is `$00000000`. The working one is a lone read.
+`D0` is provably correct (`$5368656C`): the alias cmp @ `$A467EC` returned not-equal, which it
+could only do if `D0 != $00000000`. So with operand=`$5368656C` AND `D0`=`$5368656C` both correct,
+the second cmp still reporting not-equal means **the ALU received a STALE operand — the alias's
+`$00000000` carried over from `$A467EC`** instead of the freshly-read `$5368656C`. The kernel does
+not flush/advance the compare operand between two consecutive longword reads to the same base reg.
+- This is **addressing-mode / instruction-sequence general, NOT VRAM-specific.** It reproduces on
+  VPA and on DTACK; memory/sim_ram/wrapper/kernel `data_read` are all correct. The DTACK change is
+  correct but irrelevant to this bug.
+- `last_data_read` is a red herring: it tracks opcode fetches (b090/6708/08aa...), not the data
+  operand, in BOTH the working and failing cases — so it is NOT the ALU operand source.
+
+(superseded scratch note below; kept for the cycle timestamps)
+The kernel latches `last_data_read` only when `state="00" OR exec(update_ld)`
+(`TG68KdotC_Kernel.vhd:495`). For this read the assembled longword is valid at `state="10"`
+(`@760`); by the time `state="00"` comes (`@768`) an interleaved **opcode prefetch has already
+overwritten `data_read`**. So `cmp.l` compares `D0` against `$00006708` (stale) → not equal →
+`$A467F4 beq` not taken → `$A467F6` marks the bank "not present" → descriptor table corrupts →
+`$4E754F00`/`$4F..` gap-march → no video.
+- The alias probe `cmp.l (A0,D2),D0` @ `$A467EC` hits the SAME mis-capture, but its operand is
+  `$00000000`, so "not equal" is coincidentally correct → the bug is masked there.
+- **Not a kernel-version issue:** lbmactwo's NEWER kernel has the IDENTICAL capture condition
+  (`TG68KdotC_Kernel.vhd:537`) and the IDENTICAL longword-assembly process, yet boots to video.
+  So the difference is in **bus/wrapper TIMING** (when the prefetch interleaves vs the operand
+  read), not the kernel's capture logic. The MacLC `tg68k.v` wrapper differs from lbmactwo's.
+- **Not VPA/DTACK and not the data path:** memory, sim_ram, `cpu_data`, `tg68_din_r`, and the
+  kernel's own `data_read` are all correct. The previous "VPA stale data" theory is wrong;
+  the DTACK change is correct but insufficient.
 
 ## Where to go next (recommended order)
-1. **Trace the TG68 KERNEL internals** (the actual blocker). FST waveform (`--trace`) of
-   `TG68KdotC_Kernel` `data_in` / operand latches / the two `cmp` operands across `$A467F2`,
-   and compare against a WORKING RAM longword read (RAM longword reads succeed, VRAM ones
-   don't — the diff is the answer). This resolves the paradox in section 5.
-2. Once understood, fix VRAM->DTACK properly: route VRAM off VPA onto DTACK with the right
-   read-settle / write-commit timing (the `vram_slot` two-slot idea + combinational/settled
-   read got the data correct at the bus & wrapper; the kernel-consume timing is the last gap).
-   Apply the SAME change to BOTH `sim.v` and `MacLC.sv` (sim==FPGA parity).
-3. Verify any fix, in a CLEAN build: `$A467F6` count -> 0 (probe passes), `$4E754F00` gone,
-   framebuffer writes to `$F40000` appear in the trace, and the screenshot goes black ->
-   grey/Happy-Mac. Cross-check the V8 video registers the ROM programs vs `monitor_id` /
-   `video_mode` defaults (default monitor_id=2 / 512x384, video_mode=2 / 4bpp).
-4. Separately confirm (or rule out) that the post-fix march which walks `$4F62xxxx` (the masked
-   2-8MB gap) is the legit HMMU-truncation test vs another decode divergence — MAME never
-   reads that gap.
+1. **Compare the failing operand read against a WORKING longword cmp/read on RAM**, capturing
+   the kernel `state`/`data_read`/`last_data_read`/`exec(update_ld)` sequence for both. The
+   question to answer: in the working case does `exec(update_ld)` fire at `state="10"` (capturing
+   the operand before the prefetch), or does the prefetch simply not interleave there? That tells
+   you whether the fix belongs in (a) decode (`update_ld` for `cmp.l (An)`), or (b) the wrapper's
+   fetch/read sequencing (`skipFetch`/busstate handling).
+2. **Most promising fix: port the lbmactwo `tg68k.v` wrapper (and its matching kernel).** lbmactwo
+   is a working core that does longword reads from DTACK video memory with the same kernel logic;
+   its wrapper sequences fetch-vs-read differently. This needs the newer kernel's extra ports
+   (`longword`, `VBR_out`, `cpu_halted`, `berr_inhibit`, `berr_data`, `IPL_autovector=1`). Big,
+   risky change (CLAUDE.md warns on CPU edits) — do it in a worktree and gate on the frame-350
+   screenshot + the verification below. Bonus: would also bring real BERR-on-unmapped support.
+3. Verify any fix, in a CLEAN build: `$A467F6` count -> 0 (probe passes), `$4E754F00`/`$4F..`
+   march gone, framebuffer writes to `$F40000` appear, screenshot goes black -> grey/Happy-Mac.
+   Cross-check V8 video registers vs `monitor_id`/`video_mode` defaults (monitor_id=2 / 512x384,
+   video_mode=2 / 4bpp).
+4. Separately confirm (or rule out) the post-fix `$4F62xxxx` gap-march as legit HMMU-truncation
+   vs another decode divergence — MAME never reads that gap.
 
 ## Key references
 - Disasm: `docs/MacLC_ROM_disasm.txt` (VMA 0x40800000; runtime `$A0xxxx` <-> disasm
