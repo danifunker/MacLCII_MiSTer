@@ -361,7 +361,7 @@ int verilate() {
 				// config reg $01)? If it stays 0, $0 low-mem globals stay unmapped
 				// -> divergence at $A499xx (reads $19A.w/$DE0.w return garbage).
 				static int prev_rcfgd = -1;
-				int rcfgd = (int)VERTOPINTERN->emu__DOT__pvia__DOT__ram_configured;
+				int rcfgd = (int)VERTOPINTERN->emu__DOT__pvia_ram_configured;
 				if (rcfgd != prev_rcfgd) {
 					fprintf(stderr, "[RAMCFGD] ram_configured %d->%d F%d pc=%06X\n",
 						prev_rcfgd, rcfgd, video.count_frame,

@@ -55,7 +55,8 @@ module addrDecoder(
     input _cpuAS,
     input _cpuRW,
     input memoryOverlayOn,
-    input [7:0] ram_config,  // V8 RAM config: bits[7:6] = SIMM size
+    input [7:0] ram_config,       // V8 RAM config WRITTEN by ROM: bits[7:6] gate mb mirror
+    input [7:0] ram_config_phys,  // PHYSICAL RAM config — real installed SIMM size
     input ram_configured,    // 1 once ROM programs V8 config; enables $0 mb mirror
 
     output reg selectRAM,
@@ -73,11 +74,14 @@ module addrDecoder(
     output reg selectUnmapped
 );
 
-    // Decode SIMM byte size from ram_config[7:6]
-    wire [23:0] simm_byte_size = (ram_config[7:6] == 2'b00) ? 24'h000000 :  // 0MB
-                                  (ram_config[7:6] == 2'b01) ? 24'h200000 :  // 2MB
-                                  (ram_config[7:6] == 2'b10) ? 24'h400000 :  // 4MB
-                                                                24'h800000;   // 8MB
+    // Decode SIMM byte size from the PHYSICAL config (real installed SIMM), NOT the
+    // ROM-written register. MAME sizes the SIMM from m_ram_size; the writable config
+    // only gates placement. For a 2MB machine (no SIMM) this keeps $0 a true $800000
+    // mirror instead of a phantom separate SIMM bank. See addrController_top.v.
+    wire [23:0] simm_byte_size = (ram_config_phys[7:6] == 2'b00) ? 24'h000000 :  // 0MB
+                                  (ram_config_phys[7:6] == 2'b01) ? 24'h200000 :  // 2MB
+                                  (ram_config_phys[7:6] == 2'b10) ? 24'h400000 :  // 4MB
+                                                                    24'h800000;   // 8MB
 
     // Motherboard RAM placement (match MAME v8.cpp ram_size()): the 2MB
     // motherboard RAM is ALWAYS installed at mb_location, which sits directly
@@ -92,7 +96,7 @@ module addrDecoder(
     //   SIMM:            $000000 to simm_byte_size-1 (only if SIMM present)
     //   Motherboard low: [mb_location, mb_location+2MB) (the soldered 2MB)
     //   Motherboard high:$800000-$9FFFFF (always-present 2MB mirror)
-    wire in_simm_range = (ram_config[7:6] != 2'b00) && (address[23:0] < simm_byte_size);
+    wire in_simm_range = (ram_config_phys[7:6] != 2'b00) && (address[23:0] < simm_byte_size);
     // The motherboard-low mirror (e.g. $0-$1FFFFF when no SIMM) is gated on
     // ram_configured. MAME installs it only after the ROM programs the V8 config
     // (ram_size(data)); during the boot RAM-bank probe the map is ram_size(0xc0)

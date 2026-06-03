@@ -189,6 +189,7 @@ module emu
 	// Mac LC memory configuration
 	wire [7:0] configRAMSize = 8'h24; // 2MB: no SIMM, 2MB board only
 	wire [7:0] pvia_ram_config_out;   // Active RAM config from pseudovia
+	wire       pvia_ram_configured;   // ROM has programmed V8 config ($0 mirror enable)
 
 	// Serial Ports - connect SCC Channel A to sim via serial_txd/serial_rxd ports
 	wire serialOut;              // SCC Channel A TX (driven by SCC)
@@ -450,6 +451,8 @@ module emu
 		._cpuRW(_cpuRW),
 		._cpuAS(_cpuAS),
 		.ram_config(pvia_ram_config_out),
+		.ram_config_phys(configRAMSize),
+		.ram_configured(pvia_ram_configured),
 		.memoryAddr(memoryAddr),
 		.memoryLatch(memoryLatch),
 		._memoryUDS(_memoryUDS),
@@ -538,7 +541,8 @@ module emu
 		.ram_config(configRAMSize),
 		.monitor_id(v8_monitor_id),
 		.video_config(pvia_video_config),
-		.ram_config_out(pvia_ram_config_out)
+		.ram_config_out(pvia_ram_config_out),
+		.ram_configured(pvia_ram_configured)
 	);
 
 	// ASC sample outputs (Commit C will route to AUDIO_L/R)

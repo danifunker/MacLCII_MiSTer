@@ -8,7 +8,9 @@ module addrController_top(
 	output clk16_en_n,
 
 	// system config:
-	input [7:0] ram_config,  // V8 RAM config byte from pseudovia
+	input [7:0] ram_config,       // V8 RAM config byte WRITTEN by ROM (pseudovia reg $01)
+	input [7:0] ram_config_phys,  // PHYSICAL hardware RAM config (configRAMSize) — never
+	                              // changes; gives the real installed SIMM size.
 	input       ram_configured,  // 1 once ROM programs V8 config (enables $0 mirror)
 
 	// 68000 CPU memory interface:
@@ -141,11 +143,19 @@ module addrController_top(
 	//   $700000-$7FFFFF  Floppy disk image 2 (2MB)
 	// ============================================================
 
-	// Decode SIMM size from ram_config[7:6] (byte size)
-	wire [22:0] simm_byte_size = (ram_config[7:6] == 2'b00) ? 23'h000000 :  // 0MB
-	                              (ram_config[7:6] == 2'b01) ? 23'h200000 :  // 2MB
-	                              (ram_config[7:6] == 2'b10) ? 23'h400000 :  // 4MB
-	                                                           23'h800000;   // 8MB
+	// Decode SIMM size from the PHYSICAL config, NOT the ROM-written register.
+	// MAME sizes the SIMM from m_ram_size (physical), and only the install ENABLE
+	// / motherboard placement use the writable config register. For a 2MB machine
+	// (configRAMSize=$24, bits[7:6]=00) there is NO SIMM, so $0 must never route to
+	// the SIMM SDRAM region — it stays a true mirror of $800000. Using the written
+	// register here (which transiently becomes $C4 during the ROM's RAM probe)
+	// fabricated a phantom 8MB SIMM at $0, turning $0 into a SEPARATE bank instead
+	// of a $800000 mirror; the boot's bank scan then recorded a phantom $0 entry and
+	// the march clobbered the descriptor table at $9FFFEC.
+	wire [22:0] simm_byte_size = (ram_config_phys[7:6] == 2'b00) ? 23'h000000 :  // 0MB
+	                              (ram_config_phys[7:6] == 2'b01) ? 23'h200000 :  // 2MB
+	                              (ram_config_phys[7:6] == 2'b10) ? 23'h400000 :  // 4MB
+	                                                                23'h800000;   // 8MB
 	wire [21:0] simm_word_size = simm_byte_size[22:1];
 
 	// CPU address classification for RAM
@@ -212,6 +222,7 @@ module addrController_top(
 		._cpuRW(_cpuRW),
 		.memoryOverlayOn(memoryOverlayOn),
 		.ram_config(ram_config),
+		.ram_config_phys(ram_config_phys),
 		.ram_configured(ram_configured),
 		.selectRAM(selectRAM),
 		.selectROM(selectROM),
