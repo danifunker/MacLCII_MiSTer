@@ -719,11 +719,19 @@ module emu
 
 	// Mac LC memory configuration
 	// V8 RAM config byte (MAME encoding):
-	//   Bits 7:6 = SIMM size (00=0MB, 01=2MB, 10=4MB, 11=8MB)
-	//   Bit 5 = Motherboard (0=4MB, 1=2MB)
+	//   Bits 7:6 = SIMM bank A size (00=0MB, 01=2MB, 10=4MB, 11=8MB)
+	//   Bit 5 = Motherboard bank B (0=4MB, 1=2MB)
 	//   Bit 2 = Always set on read (handled in pseudovia)
-	// Mac LC (2MB soldered): 2MB=$24, 4MB=$64, 6MB=$A4, 10MB=$E4
-	wire [7:0] configRAMSize = status[4] ? 8'hE4 : 8'h24; // 1=10MB (8MB SIMM+2MB board), 0=2MB (board only)
+	// The Mac LC has 2MB soldered (bank B, bit5=1) plus TWO 30-pin SIMM sockets
+	// (bank A). The V8 reports bank A as a single linear size; "8MB" bank A is
+	// physically two 4MB SIMMs. Populated configs:
+	//   2MB  = $24  (2MB board, no SIMMs)
+	//   4MB  = $64  (2MB board + 2MB SIMM bank A)
+	//   6MB  = $A4  (2MB board + 4MB SIMM bank A)
+	//   10MB = $E4  (2MB board + 4MB + 4MB SIMMs => 8MB bank A)
+	// NOTE: currently only the 2MB config is validated against MAME (-ramsize 2M).
+	// The 10MB path is not yet verified — see docs and addrController_top.v.
+	wire [7:0] configRAMSize = status[4] ? 8'hE4 : 8'h24; // 1=10MB (2MB board + 4MB+4MB SIMM), 0=2MB (board only)
 	wire [7:0] pvia_ram_config_out;   // Active RAM config from pseudovia
 	wire       pvia_ram_configured;   // ROM has programmed V8 RAM config ($0 mirror enable)
 				  
