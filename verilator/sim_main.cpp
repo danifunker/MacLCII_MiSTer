@@ -315,6 +315,33 @@ int verilate() {
 						VERTOPINTERN->debug_pc & 0xFFFFFF, (rc>>7)&1, (rc>>6)&1);
 					prev_ramcfg = rc;
 				}
+				// Decisive: did the ram_configured latch ever trip (ROM wrote
+				// config reg $01)? If it stays 0, $0 low-mem globals stay unmapped
+				// -> divergence at $A499xx (reads $19A.w/$DE0.w return garbage).
+				static int prev_rcfgd = -1;
+				int rcfgd = (int)VERTOPINTERN->emu__DOT__pvia__DOT__ram_configured;
+				if (rcfgd != prev_rcfgd) {
+					fprintf(stderr, "[RAMCFGD] ram_configured %d->%d F%d pc=%06X\n",
+						prev_rcfgd, rcfgd, video.count_frame,
+						VERTOPINTERN->debug_pc & 0xFFFFFF);
+					prev_rcfgd = rcfgd;
+				}
+				// Log unmapped low-mem accesses ($0-$1FFFFF): our core reads back
+				// $FFFF here, MAME reads $0. If the ROM reads a low-mem global
+				// before $0 is installed and branches on it, the $FFFF-vs-$0
+				// mismatch can diverge the boot toward $A499xx.
+				static int unmap_logs = 0;
+				if (VERTOPINTERN->emu__DOT__selectUnmapped &&
+				    (top->debug_cpuAddr & 0xFFFFFF) < 0x200000 &&
+				    unmap_logs < 60) {
+					static uint32_t last_ua = 0xFFFFFFFF;
+					uint32_t ua = top->debug_cpuAddr & 0xFFFFFF;
+					if (ua != last_ua) {
+						fprintf(stderr, "[UNMAP_LO] addr=%06X F%d pc=%06X\n",
+							ua, video.count_frame, VERTOPINTERN->debug_pc & 0xFFFFFF);
+						last_ua = ua; unmap_logs++;
+					}
+				}
 			}
 
 			// CPU trace output - skip while ROM is downloading
