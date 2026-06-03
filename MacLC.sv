@@ -725,6 +725,7 @@ module emu
 	// Mac LC (2MB soldered): 2MB=$24, 4MB=$64, 6MB=$A4, 10MB=$E4
 	wire [7:0] configRAMSize = status[4] ? 8'hE4 : 8'h24; // 1=10MB (8MB SIMM+2MB board), 0=2MB (board only)
 	wire [7:0] pvia_ram_config_out;   // Active RAM config from pseudovia
+	wire       pvia_ram_configured;   // ROM has programmed V8 RAM config ($0 mirror enable)
 				  
 	// Serial Ports
 	wire serialOut;
@@ -950,6 +951,7 @@ module emu
 		._cpuAS(_cpuAS),
 		.cpuFC(cpuFC),
 		.ram_config(pvia_ram_config_out),
+		.ram_configured(pvia_ram_configured),
 		.memoryAddr(memoryAddr),
 		.memoryLatch(memoryLatch),
 		._memoryUDS(_memoryUDS),
@@ -1044,7 +1046,8 @@ module emu
 		.ram_config(configRAMSize),
 		.monitor_id(v8_monitor_id),
 		.video_config(pvia_video_config),
-		.ram_config_out(pvia_ram_config_out)
+		.ram_config_out(pvia_ram_config_out),
+		.ram_configured(pvia_ram_configured)
 	);
 
 	wire [31:0] v8_dbg_latch_count;

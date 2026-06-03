@@ -290,7 +290,30 @@ int verilate() {
 						auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
 						fprintf(stderr, "[TBL] $A4657E #%d F%d (D7=3 RAM-region entry) SP=%08X overlay=%d\n",
 							n, video.count_frame, (unsigned)rf[15],
-							(int)VERTOPINTERN->emu__DOT__ac0__DOT__rom_overlay); } }
+							(int)VERTOPINTERN->emu__DOT__ac0__DOT__rom_overlay);
+						// READ-ONLY dump of built descriptor table memory before the march
+						// writes it. CPU $9FFFE0..$9FFFFF -> SDRAM words $0FFFF0..$0FFFFF
+						// (motherboard_high: word = {3'b000, cpuAddr[20:1]}). 68k longwords
+						// are big-endian word pairs in the 16-bit mem[] array.
+						auto &M = VERTOPINTERN->emu__DOT__ram__DOT__mem;
+						fprintf(stderr, "[TBLMEM] #%d F%d CPU$9FFFE0:", n, video.count_frame);
+						for (uint32_t w = 0xFFFF0; w <= 0xFFFFE; w += 2)
+							fprintf(stderr, " %08X", ((unsigned)M[w] << 16) | (unsigned)M[w+1]);
+						fprintf(stderr, "\n"); } }
+				}
+			}
+
+			// --- Candidate-B gating verification: track pseudovia V8 RAM-config
+			// register (ram_cfg) changes vs the F45 enumeration / table build.
+			// Logs reset-init + every ROM write, with frame, PC and bits[7:6].
+			{
+				static int prev_ramcfg = -1;
+				int rc = (int)VERTOPINTERN->emu__DOT__pvia__DOT__ram_cfg;
+				if (rc != prev_ramcfg) {
+					fprintf(stderr, "[RAMCFG] %02X->%02X F%d pc=%06X bits76=%d%d\n",
+						prev_ramcfg & 0xFF, rc & 0xFF, video.count_frame,
+						VERTOPINTERN->debug_pc & 0xFFFFFF, (rc>>7)&1, (rc>>6)&1);
+					prev_ramcfg = rc;
 				}
 			}
 

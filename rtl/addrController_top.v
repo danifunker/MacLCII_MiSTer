@@ -9,6 +9,7 @@ module addrController_top(
 
 	// system config:
 	input [7:0] ram_config,  // V8 RAM config byte from pseudovia
+	input       ram_configured,  // 1 once ROM programs V8 config (enables $0 mirror)
 
 	// 68000 CPU memory interface:
 	input _cpuReset,
@@ -211,6 +212,7 @@ module addrController_top(
 		._cpuRW(_cpuRW),
 		.memoryOverlayOn(memoryOverlayOn),
 		.ram_config(ram_config),
+		.ram_configured(ram_configured),
 		.selectRAM(selectRAM),
 		.selectROM(selectROM),
 		.selectSCSI(selectSCSI),

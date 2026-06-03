@@ -39,7 +39,14 @@ module pseudovia(
     output reg [7:0] video_config,
 
     // RAM config output (active value, writable by ROM)
-    output [7:0] ram_config_out
+    output [7:0] ram_config_out,
+
+    // Candidate B: set on the ROM's first write to the V8 RAM-config register.
+    // Mirrors MAME v8.cpp: the $0 motherboard-low mirror is installed only once
+    // the ROM programs the config (via2_config_w -> ram_size(data)). Before that,
+    // the overlay-clear map is ram_size(0xc0) == only $800000-$9FFFFF, so the
+    // boot RAM-bank probe never finds a (phantom) bank at $0.
+    output reg ram_configured
 );
 
 // RAM config output: expose current value for address controller
@@ -91,6 +98,7 @@ always @(posedge clk_sys) begin
     if (reset) begin
         port_b <= 8'h00;
         ram_cfg <= ram_config;  // Init from hardware config (MAME: ram_size(0xC0))
+        ram_configured <= 1'b0; // $0 mirror disabled until ROM programs config
         ifr <= 8'h00;
         slot_ier <= 8'h00;
         ier <= 8'h00;
@@ -145,6 +153,7 @@ always @(posedge clk_sys) begin
 
                         3'b001: begin  // $01: RAM Config (writable per MAME)
                             ram_cfg <= data_in;
+                            ram_configured <= 1'b1;  // enables $0 motherboard mirror
                             `ifdef VERBOSE_TRACE
                             $display("PVIA: WRITE RAM Config = %02x @%0t", data_in, $time);
                             `endif

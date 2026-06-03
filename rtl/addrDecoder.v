@@ -56,6 +56,7 @@ module addrDecoder(
     input _cpuRW,
     input memoryOverlayOn,
     input [7:0] ram_config,  // V8 RAM config: bits[7:6] = SIMM size
+    input ram_configured,    // 1 once ROM programs V8 config; enables $0 mb mirror
 
     output reg selectRAM,
     output reg selectROM,
@@ -92,7 +93,14 @@ module addrDecoder(
     //   Motherboard low: [mb_location, mb_location+2MB) (the soldered 2MB)
     //   Motherboard high:$800000-$9FFFFF (always-present 2MB mirror)
     wire in_simm_range = (ram_config[7:6] != 2'b00) && (address[23:0] < simm_byte_size);
-    wire in_motherboard_low = mb_present &&
+    // The motherboard-low mirror (e.g. $0-$1FFFFF when no SIMM) is gated on
+    // ram_configured. MAME installs it only after the ROM programs the V8 config
+    // (ram_size(data)); during the boot RAM-bank probe the map is ram_size(0xc0)
+    // == $800000-$9FFFFF only. Without this gate the probe finds a phantom 2MB
+    // bank at $0, whose march then clobbers the $9FFFEC descriptor table through
+    // the $0<->$800000 SDRAM mirror, hanging the boot. (in_simm_range is NOT
+    // gated: for SIMM configs MAME maps the real SIMM at $0 during enumeration.)
+    wire in_motherboard_low = ram_configured && mb_present &&
                               (address[23:0] >= mb_location) &&
                               (address[23:0] <  (mb_location + 24'h200000));
     wire in_motherboard_range = (address[23:21] == 3'b100);  // $800000-$9FFFFF
