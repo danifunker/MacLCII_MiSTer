@@ -109,6 +109,9 @@ See [sdram-layout.md](sdram-layout.md) for details.
 ## SWIM upper-byte fix — BOOT REACHES DESKTOP (2026-06-03)
 - [swim-upper-byte-fix](swim-upper-byte-fix.md) — SWIM/IWM is on the UPPER byte (`_cpuUDS`, even addresses) on the LC V8, not `_cpuLDS` like Mac Plus. Wrong strobe+lane made the `$A009CE` IWM-status poll spin forever (read returned `$BE` upper byte, bit5 stuck). Fix `973824b`: gate on `_cpuUDS`, return byte on D15-D8. Boot now runs past the floppy boot-disk wait loop to QuickDraw/cursor/**grey desktop** (frame ~1490). Frame 350 pattern unchanged. 3 fidelity checks (Egret/chime, V8 bank-sizing, 24/32-bit A31 gap) folded into `docs/post_diagnostics_and_irq_levels.md`.
 
+## Desktop-stage open issues (2026-06-03)
+- [desktop-stage-open-issues](desktop-stage-open-issues.md) — At the grey desktop: (1) no floppy "?" icon (boot parked in early drive-poll loop, not the give-up/blink stage; SWIM no-disk sense fidelity); (2) doubled mouse cursor (video line/field-doubling or cursor erase bug in `maclc_v8_video.sv`); (3) ADB not wired to the Egret (`dataController_top.sv:684-686` `.adb_data_in(1'b1)`) → kbd/mouse dead. CORRECTION: real HC05 already used in sim AND FPGA (`USE_EGRET_CPU=1`); not behavioral.
+
 ## VIA Timer-1 POST test FIXED (2026-06-03) — pseudovia level-2 preemption
 - [pseudovia-irq-ier-fix](pseudovia_irq_ier_fix.md) — pseudovia (L2) spurious ASC IRQ preempted L1 VIA1 timer; gate IRQ by main IER ($13), ASC is IFR bit4 not slot source (commit `bb47b54`). Timer test passes, ISR $A472CC runs, no STM, boot to F360. **Corrects the $0/VBR theory** (68020 uses VBR; $0 irrelevant). "STM" $A498xx = POST failure reporter, NOT PA0 diag mode (PA0=1 normal). See `docs/post_diagnostics_and_irq_levels.md`.
 
@@ -212,6 +215,50 @@ Changes made to verilator simulation debug infrastructure on 2026-03-22:
 **Why:** These changes support diagnosing boot hangs by cross-referencing CPU activity with frame numbers and peripheral addresses.
 
 **How to apply:** Remember to re-comment VERBOSE_TRACE in Makefile after Egret debugging, and remove the TIP_LATCH debug display.
+
+---
+
+## FILE: desktop-stage-open-issues.md
+
+---
+name: desktop-stage-open-issues
+description: "After SWIM fix the LC boots to the grey desktop but has 3 open issues — no floppy \"?\" icon, doubled cursor, and ADB not wired to the Egret (mouse/kbd dead)"
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: affbdb30-c69a-41aa-9390-35b3acdaa9f1
+---
+
+State after [[swim-upper-byte-fix]] (2026-06-03): boot reaches the grey 50%
+desktop pattern (~frame 634+, screenshots at 800 & 1490). Three open issues:
+
+1. **No floppy "?" icon.** Boot drew the desktop and parked in the early
+   drive-poll/wait loop (`$A01484`/`$A014CA` + disk-driver A-traps
+   `$A07D/$A084/$A07F`). It has NOT advanced to the "give up → draw blinking
+   floppy ?" stage. No disk image mounted, and our SWIM/IWM probably doesn't
+   report the exact "drive present, no disk, ready" sense sequence a real drive
+   gives, so the ROM keeps retrying. NEXT: trace the disk driver's IWM
+   data/handshake-register reads vs MAME's no-disk sense.
+
+2. **Doubled mouse cursor.** Two offset arrow cursors top-left — a rendering
+   artifact (input isn't connected, so not jitter). Suspect video line/field
+   doubling or a cursor save/erase bug in `rtl/maclc_v8_video.sv`. Also a flat
+   grey band at the bottom of the frame → check active-video geometry vs the LC
+   mode (512x384 / 640x480).
+
+3. **ADB (mouse/keyboard) not functional.** CORRECTION to earlier notes: the
+   **real HC05** Egret is already used in BOTH sim and FPGA (`USE_EGRET_CPU=1`
+   in `verilator/Makefile` + `MacLC.qsf`; `dataController_top.sv` instantiates
+   `egret_wrapper`, not behavioral). On the LC the Egret IS the ADB controller,
+   but its ADB bus is STUBBED: `dataController_top.sv:684-686` ties
+   `.adb_data_in(1'b1)` and leaves `.adb_data_out()` open ("ADB not implemented
+   yet"). The separate `adb adb(...)` (line 921, ps2_mouse/ps2_key) is the
+   Mac-Plus VIA-ADB transceiver and does NOT apply to the LC (those VIA pins are
+   repurposed for Egret comms PB3/4/5 = TREQ/BYTEACK/TIP). Proper fix: wire ADB
+   into the Egret HC05. Until then kbd/mouse are dead and the cursor can't move.
+
+See `docs/post_diagnostics_and_irq_levels.md` and
+`docs/resume_060326_desktop_reached.md`.
 
 ---
 

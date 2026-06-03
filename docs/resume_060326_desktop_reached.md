@@ -34,9 +34,13 @@ it correctly sits at the boot-volume wait (CLAUDE.md: "desktop won't fully load"
 without a drive).
 
 ## Three fidelity checks (answered; full text in post_diagnostics doc)
-1. **Egret/chime** — present; ASC programmed; desktop reached with behavioral
-   Egret (sim default). TODO: verify real-HC05 build (`USE_EGRET_CPU`) boots the
-   same. Respect the `via6522.sv` SR caveat in CLAUDE.md.
+1. **Egret/chime/ADB** — present; ASC programmed; desktop reached. CORRECTION:
+   the **real HC05** is already used in BOTH sim and FPGA (`USE_EGRET_CPU=1` in
+   verilator/Makefile + MacLC.qsf; `egret_wrapper`, not behavioral). **GAP: ADB
+   not wired to the Egret** (`dataController_top.sv:684-686` ties
+   `.adb_data_in(1'b1)`) → mouse/keyboard non-functional, cursor can't move. The
+   LC routes ADB THROUGH the Egret; the separate Mac-Plus `adb.sv` (VIA-ADB)
+   doesn't apply. Respect the `via6522.sv` SR caveat in CLAUDE.md.
 2. **V8 bank-sizing** — still good: single-entry descriptor table at `$9FFFEC`
    (writes at `$9FFFEA/EE`), march completes, no clobber. 10MB still unvalidated.
 3. **24/32-bit / A31** — gap characterized, not a current blocker. MAME uses
@@ -44,6 +48,26 @@ without a drive).
    `address[23:0]` (always 24-bit). LC ships 24-bit and boots to desktop, so OK.
    Future risk: if MODE32/32-bit-clean code drives A31=1, our decode aliases it.
    Watch the sim `cpuAddrFullHi`/`HIGH_ADDR` probe.
+
+## OPEN ISSUES observed at the desktop (screenshots frame 800 & 1490)
+- **No floppy "?" icon.** Boot drew the grey desktop and parked in the early
+  drive-poll/wait loop (`$A01484`/`$A014CA` + disk-driver A-traps `$A07D/$A084/
+  $A07F`); it has NOT advanced to the "give up → draw blinking floppy ?" stage.
+  No disk image is mounted, and our SWIM/IWM likely doesn't report the exact
+  "drive present, no disk, ready" sense sequence a real drive gives, so the ROM
+  keeps retrying instead of drawing the icon. Next: trace the disk driver's
+  status reads (IWM data/handshake regs) and compare to MAME's no-disk sense.
+- **Doubled mouse cursor.** Two offset arrow cursors top-left (a rendering
+  artifact, NOT input jitter — input isn't connected). Suspect video
+  line/field-doubling or a cursor save/erase issue in `maclc_v8_video.sv`.
+  Also a flat grey band at the bottom of the frame — check active-video
+  geometry vs the LC mode (512x384 / 640x480).
+- **ADB (mouse/keyboard) not functional.** The Egret (real HC05, already built)
+  IS the LC's ADB controller, but its ADB bus is stubbed:
+  `dataController_top.sv:684-686` ties `.adb_data_in(1'b1)`, `.adb_data_out()`
+  open. The separate `adb adb(...)` (line 921, ps2_mouse/ps2_key) is the
+  Mac-Plus VIA-ADB path and does NOT drive the LC. Proper fix: connect ADB into
+  the Egret HC05 (it runs real ADB firmware). Until then the cursor can't move.
 
 ## NEXT STEPS (pick up here)
 1. **Boot a real volume.** The sim has no drive. Options:

@@ -172,12 +172,21 @@ headless `maclc` build here; only the `dump` command and `trace` file work, and
 
 ## Three hardware-fidelity checks (2026-06-03)
 
-1. **Egret (68HC05) / chime.** Present (`rtl/egret/`, behavioral default in sim).
+1. **Egret (68HC05) / chime / ADB.** Present and active. CORRECTION: the **real
+   HC05** is used in BOTH sim and FPGA — `USE_EGRET_CPU=1` is set in
+   `verilator/Makefile` AND `MacLC.qsf`, and `dataController_top.sv` instantiates
+   `egret_wrapper` (real 68HC05 + firmware) unless `EGRET_BEHAVIORAL` is defined
+   (it is not). The behavioral SM (`rtl/egret_behavioral.sv`) is only a fallback.
    The ASC is actively programmed during boot (`$F14800`/`$F14804` thousands of
    accesses) and the boot reaches the desktop, so the startup/sound path runs.
-   Still TODO: verify the real-HC05 build (`USE_EGRET_CPU`) boots equivalently
-   (the sim default is behavioral). Watch the `via6522.sv` SR caveat in
-   `CLAUDE.md` for any SR change.
+   **GAP: ADB is not wired to the Egret.** `dataController_top.sv:684-686` ties
+   `.adb_data_in(1'b1)` and leaves `.adb_data_out()` open ("ADB not implemented
+   yet"). On the LC the Egret IS the ADB (keyboard+mouse) controller, so with a
+   dead ADB bus no device data reaches the CPU → mouse/keyboard non-functional,
+   cursor cannot move. The separate `adb adb(...)` module (line 921, fed by
+   `ps2_mouse`/`ps2_key`) is the Mac-Plus VIA-ADB transceiver and does NOT apply
+   to the LC (those VIA pins are repurposed for Egret comms). Wiring ADB into the
+   Egret is the proper fix. Watch the `via6522.sv` SR caveat in `CLAUDE.md`.
 
 2. **V8 bank-sizing.** Confirmed still good on the current build: the SIMM is
    sized from the physical config (`ram_config_phys`, addrDecoder.v:81-99), the
