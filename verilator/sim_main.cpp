@@ -1,4 +1,5 @@
 #include <verilated.h>
+#include <set>
 #include "Vemu.h"
 #include "Vemu__Syms.h"
 
@@ -270,6 +271,17 @@ int verilate() {
 						if (in_stm && !prev_stm && stm_logs < 12) {
 							fprintf(stderr, "[STM_ENTRY] -> %06X from %06X F%d\n", mpc, march_last_pc, video.count_frame);
 							stm_logs++;
+						}
+					}
+					{   // fatal-error / diagnostic handler entry ($A48CD0/$A48CDA sets
+						// SP=$2600 + magic $87654321). Capture which error-check branch
+						// fired (march_last_pc) and the registers, to find the failed test.
+						static int en=0;
+						if ((mpc==0xA48CD0 || mpc==0xA48CDA || mpc==0xA4638C || mpc==0xA46200) && en<12) {
+							auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
+							fprintf(stderr, "[ERR] ->%06X from %06X F%d D0=%08X D1=%08X D2=%08X D6=%08X D7=%08X\n",
+								mpc, march_last_pc, video.count_frame,
+								(unsigned)rf[0],(unsigned)rf[1],(unsigned)rf[2],(unsigned)rf[6],(unsigned)rf[7]); fprintf(stderr,"      D4(testmask)=%08X D3=%08X A0=%08X A1=%08X\n",(unsigned)rf[4],(unsigned)rf[3],(unsigned)rf[8],(unsigned)rf[9]); en++;
 						}
 					}
 					{   // boot state-machine: log entry into each of MAME's 11 handlers
