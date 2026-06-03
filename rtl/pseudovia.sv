@@ -61,24 +61,29 @@ reg [7:0] ifr;          // Interrupt flag register
 reg [7:0] slot_ier;     // Slot interrupt enable register
 reg [7:0] ier;          // IER (shared between native $13 and compat reg 14, per MAME RBV)
 
-// Slot interrupt status - active LOW
+// Slot interrupt status - active LOW (matches MAME m_pseudovia_regs[2]).
 // Bit 6: VBlank (active low = VBlank is happening)
 // Bit 5: Slot IRQ
-// Bit 4: ASC IRQ
-// Bits 3: Slot 0 IRQ
-wire [7:0] slot_status = {1'b0, ~vblank_irq, ~slot_irq, ~asc_irq, 3'b111, 1'b1};
+// Bits 4,3: other slot sources (unused here, held inactive = 1)
+// NOTE: ASC is NOT a slot source. In MAME the ASC interrupt is IFR bit 4
+// (set by asc_irq_w), gated by the main IER ($13) — NOT by the slot IER ($12).
+// Folding asc into slot_status[4] here made it fire a spurious level-2 IRQ
+// (gated only by slot_ier=$7f) that preempted the level-1 VIA1 timer the
+// boot POST's interrupt-timing self-test relies on.
+wire [7:0] slot_status = {1'b0, ~vblank_irq, ~slot_irq, 1'b1, 3'b111, 1'b1};
 
-// IRQ recalculation
+// Slot/VBL summary, gated by the slot IER ($12) -> IFR bit 1 (any slot).
 wire [7:0] slot_irqs = (~slot_status) & 8'h78;  // Check bits 3-6 (slots + vblank)
 wire [7:0] slot_irqs_masked = slot_irqs & (slot_ier & 8'h78);
 wire any_slot_irq = |slot_irqs_masked;
 
-// Per MAME pseudovia.cpp: non-AIV3 uses m_pseudovia_ier for IRQ masking.
-// However, the Mac LC ROM only writes to slot_ier (native $12) and never
-// sets the compat IER. Use any_slot_irq directly — slot_ier already gates
-// individual slot/VBL sources, so this is equivalent for our use case.
-wire [7:0] active_ifr = ifr & 8'h1B;
-wire irq_pending = any_slot_irq;
+// Live IFR source bits, mirroring MAME pseudovia_recalc_irqs():
+//   bit4 = ASC, bit3 = slot, bit1 = any-slot summary; others keep stored value.
+wire [7:0] ifr_live = { ifr[7], ifr[6], ifr[5], asc_irq, slot_irq, ifr[2], any_slot_irq, ifr[0] };
+
+// MAME: IRQ asserts when (IFR & IER[$13] & 0x1B) != 0. The main IER ($13)
+// gates the final interrupt; the slot IER ($12) only gates the slot summary.
+wire irq_pending = |(ifr_live & ier & 8'h1B);
 
 // Debug counter
 integer pvia_reg10_reads = 0;
