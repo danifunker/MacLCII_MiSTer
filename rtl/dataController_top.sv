@@ -839,7 +839,7 @@ module dataController_top(
 		._reset(_cpuReset),
 		.selectSWIM(selectIWM),
 		._cpuRW(_cpuRW),
-		._cpuLDS(_cpuLDS),
+		._cpuUDS(_cpuUDS),  // LC V8: SWIM is on the upper byte (even addresses)
 		.dataIn(cpuDataIn),
 		.cpuAddrRegHi(cpuAddrRegHi),
 		.SEL(SEL),

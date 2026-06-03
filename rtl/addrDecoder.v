@@ -36,8 +36,10 @@
         Not yet implemented
 
     ($F16000 - $F17FFF) SWIM
-        Floppy controller
-        Register = (offset >> 8) & 0xF
+        Floppy controller. On the LC (V8) the SWIM is on the UPPER data byte
+        (even-addressed byte accesses, _UDS), like the VIA/SCC — not the lower
+        byte/_LDS as on the Mac Plus.
+        Register = (offset >> 9) & 0xF  (A12-A9, $200 stride)
 
     ($F24000 - $F25FFF) Ariel RAMDAC
         Video palette/DAC
