@@ -4032,7 +4032,15 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					-- brief(15): 0=data reg, 1=address reg
 					-- brief(14:12): register number
 					set(briefext) <= '1';
-					set_exec(moves_fc) <= '1';  -- Tell FC logic to use SFC/DFC
+					-- Use set() (not set_exec): set_exec only propagates into exec when
+					-- setexecOPC='1', which is NOT asserted during the MOVES data beat (moves2).
+					-- set() always copies into exec next cycle, so exec(moves_fc) is asserted
+					-- during moves2 (the actual SFC/DFC bus cycle). Setting it here in moves1
+					-- (the cycle before the data beat) and NOT in moves2 gives exactly one
+					-- FC-override cycle, so the following instruction fetch does not inherit
+					-- SFC/DFC. This is what lets the boot ROM's CPU-space probe
+					-- (moves.w $22000,D1 with SFC=7) present FC=7 and bus-error as intended.
+					set(moves_fc) <= '1';  -- Tell FC logic to use SFC/DFC during moves2
 					IF brief(11)='0' THEN
 						-- EA to register (read from memory with FC=SFC)
 						setstate <= "10";  -- Memory read
@@ -4045,8 +4053,9 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					next_micro_state <= moves2;
 
 				WHEN moves2 =>
-					-- Complete the transfer
-					set_exec(moves_fc) <= '1';  -- Keep FC override active
+					-- Complete the transfer. Do NOT re-assert moves_fc here: exec(moves_fc)
+					-- is already active this cycle (set() in moves1), and re-setting it would
+					-- extend the FC override one cycle past the data beat into the next fetch.
 					IF exe_opcode(7 downto 6)="10" THEN  -- Long
 						set(longaktion) <= '1';
 					END IF;

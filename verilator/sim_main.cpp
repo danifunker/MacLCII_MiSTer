@@ -284,6 +284,15 @@ int verilate() {
 								(unsigned)rf[0],(unsigned)rf[1],(unsigned)rf[2],(unsigned)rf[6],(unsigned)rf[7]); fprintf(stderr,"      D4(testmask)=%08X D3=%08X A0=%08X A1=%08X\n",(unsigned)rf[4],(unsigned)rf[3],(unsigned)rf[8],(unsigned)rf[9]); en++;
 						}
 					}
+					{   // MOVES-BERR fix verification: machine-config word D2 (and D5
+						// jump index) at the dispatch $A00AB0. MAME: D2=$CC000D07.
+						static int n=0;
+						if (mpc==0xA00AB0 && n<8) {
+							auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
+							fprintf(stderr, "[D2PROBE] $A00AB0 #%d F%d D2=%08X D5=%08X\n",
+								n, video.count_frame, (unsigned)rf[2], (unsigned)rf[5]); n++;
+						}
+					}
 					{   // boot state-machine: log entry into each of MAME's 11 handlers
 						// (+ the STM-subsystem $A48Cxx) to find where our sequence diverges.
 						static const uint32_t H[] = {0xA48468,0xA483FC,0xA47C30,0xA47942,

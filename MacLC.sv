@@ -853,8 +853,22 @@ module emu
 	// not the 6800 E-clock VPA peripheral path — the VPA path samples on a fixed
 	// E-phase that misses the SDRAM cpu-slot and returns stale data, mis-sizing
 	// the video bank and leaving the screen black.
-	assign      _cpuVPA = (cpuFC == 3'b111) ? 1'b0 : ~(!_cpuAS && cpuAddr[23:21] == 3'b111 && !selectVRAM);
-	assign      _cpuDTACK = ~(!_cpuAS && (cpuAddr[23:21] != 3'b111 || selectVRAM)) | !dtack_en;
+	// FC=7 is the 68k CPU space. cpuAddr[19:16] is the CPU-space cycle-type field:
+	//   $F = interrupt acknowledge  -> autovector via VPA (Mac autovectored IRQs)
+	//   else ($0 breakpoint, $2 coprocessor, ...) = no responder -> bus error.
+	// The boot ROM probes for hardware with `moves.w $22000,D1` (SFC=7), an
+	// access that MUST bus-error; asserting VPA there wrongly completes the probe
+	// and corrupts the machine-config word, routing the boot into the STM
+	// serial diagnostic instead of the desktop. See memory: stm-root-cause-moves-berr.
+	wire        fc7_iack = (cpuFC == 3'b111) && (cpuAddr[19:16] == 4'hF);
+	// FC=7 non-IACK = CPU space with no responder (breakpoint/coprocessor/probe).
+	// It MUST bus-error: suppress BOTH VPA and DTACK so no responder completes the
+	// cycle, regardless of the (possibly garbage) address the EA computed. The boot
+	// ROM's `moves.w $22000,D1` (SFC=7) relies on this fault; if VPA/DTACK answer it
+	// the probe completes inline and boot diverts into the STM serial diagnostic.
+	wire        fc7_berr = (cpuFC == 3'b111) && !fc7_iack;
+	assign      _cpuVPA = fc7_iack ? 1'b0 : (fc7_berr ? 1'b1 : ~(!_cpuAS && cpuAddr[23:21] == 3'b111 && !selectVRAM));
+	assign      _cpuDTACK = fc7_berr ? 1'b1 : (~(!_cpuAS && (cpuAddr[23:21] != 3'b111 || selectVRAM)) | !dtack_en);
 	wire        cpu_en_p      = clk16_en_p;
 	wire        cpu_en_n      = clk16_en_n;
 	assign      _cpuReset_o   = tg68_reset_n;
@@ -889,7 +903,11 @@ module emu
 	// docs/plan_040526.md: enabling it regresses boot because the CPU
 	// emits high-bit addresses ($50xxxxxx etc.) early in ROM execution.
 	// Diagnostic $display below stays enabled so we can study the pattern.
-	wire cpu_berr = (cpuFC == 3'b111);
+	// Bus-error CPU-space (FC=7) accesses that are NOT interrupt acknowledges:
+	// these are the boot ROM's hardware-presence probes (`moves` to CPU space),
+	// which a real 68030 faults because nothing decodes the cycle. Without this
+	// the probe completes via VPA and the boot mis-detects hardware -> STM.
+	wire cpu_berr = fc7_berr && !_cpuAS;
 `ifdef SIMULATION
 	reg _cpuAS_d;
 	always @(posedge clk_sys) _cpuAS_d <= _cpuAS;

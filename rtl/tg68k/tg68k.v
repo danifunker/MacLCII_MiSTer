@@ -206,6 +206,23 @@ always @(posedge clk) begin
 	end
 end
 
+	// Hold BERR across the bus cycle. The external berr (e.g. FC=7 CPU-space probe)
+	// is gated on AS being asserted, but AS deasserts at s_state 6 while the kernel
+	// only samples berr at s_state 7 (when tg68_clkena pulses). Without holding it,
+	// the kernel sees berr=0 at the sample point and never latches make_berr, so the
+	// bus-error exception is missed. Latch berr for the duration of the cycle and
+	// clear it at the next cycle boundary (s_state 0).
+	reg berr_hold;
+	always @(posedge clk) begin
+		if (reset)
+			berr_hold <= 1'b0;
+		else if (phi1 && s_state == 0)
+			berr_hold <= 1'b0;
+		else if (berr)
+			berr_hold <= 1'b1;
+	end
+	wire berr_held = berr | berr_hold;
+
 	TG68KdotC_Kernel tg68k (
 		.clk            ( clk           ),
 		.nReset         ( ~reset        ),
@@ -213,7 +230,7 @@ end
 		.data_in        ( tg68_din_r    ),
 		.IPL            ( ipl           ),
 		.IPL_autovector ( 1'b0          ),
-		.berr           ( berr          ),
+		.berr           ( berr_held     ),
 		.clr_berr       ( /*tg68_clr_berr*/ ),
 		.CPU            ( cpu           ), // 00->68000  01->68010  11->68020(only some parts - yet)
 		.addr_out       ( tg68_addr     ),
