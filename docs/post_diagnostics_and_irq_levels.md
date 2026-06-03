@@ -122,3 +122,78 @@ the test passes via `$A471C6`, and no `$A462xx`/`$A498xx` STM is reached.
   pseudovia internals (`pvia.slot_ier`, `pvia.ifr`) within a frame window.
   A level-2 IACK shows as `addr=fffffff4` (addr[3:1]=010); level-1 is
   `addr=fffffff2` (addr[3:1]=001).
+
+## SWIM byte-lane bug → IWM status poll spun forever (FIXED 2026-06-03)
+
+After the VIA Timer-1 IRQ fix the boot ran to ~frame 1454, then hung in an
+infinite loop at **`$A009CE`**:
+```
+A009C0: btst  #$5, $dd3.w
+A009C8: movea.l $1e0.w, A0        ; A0 = low-mem IWM (= SWIM base)
+A009CE: move.b #$be, ($c00,A0)    ; IWM register strobes ($200 stride)
+A009DA: tst.b ($1c00,A0)          ; reg14 q7L
+A009DE: tst.b ($1000,A0)          ; reg8  ENABLE-off
+A009E2: tst.b ($1a00,A0)          ; reg13 q6H  (Q6=1,Q7=0 -> status reg)
+A009E6: move.b ($1c00,A0), D2     ; D2 = IWM status
+A009EA: btst  #$5, D2
+A009EE: bne   $a009ce             ; spin while status bit5 set
+```
+`$01E0` is the **IWM** low-memory global (not a VIA): A0 = `$50F16000`, the V8
+SWIM. (The earlier resume mis-read the data address `@50F17C00` as `($c00,A0)`
+giving A0=`$50F17000`; it is actually `($1c00,A0)` → A0=`$50F16000`, which
+matches MAME — confirmed by `grep -c "^00A009CE:" /tmp/mame_pc.tr` = 1, MAME
+falls through on the first read.)
+
+Root cause: `rtl/swim.v` gated every access on `_cpuLDS==0` and returned the
+read byte on the **lower** lane (`{8'hBE, dataOutLo}`). But on the LC the V8
+peripherals (VIA, SCC, **SWIM**) sit on the **upper** data byte and are reached
+with even-addressed byte accesses (`_UDS`), exactly like `viaDataOut[15:8]`
+(lower byte `8'hEF`). Consequences:
+- `_cpuLDS` was never asserted for SWIM accesses → the IWM bit registers
+  (q6/q7/diskEnable/ca/lstrb) never updated → `{q7,q6}` stuck at `00` → the read
+  mux always returned the **data latch** (`$FF`, no disk) instead of the status
+  register.
+- Even so, the CPU latched the **upper** byte, which was the hardwired `8'hBE`
+  (`bit5 = 1`) → `bne $a009ce` looped forever.
+
+Fix (`973824b`): gate the SWIM on `_cpuUDS` and present the read byte on
+D15-D8 (`{dataOutLo, 8'hBE}`). Writes already use `dataIn[7:0]` (TG68K puts
+byte write data on the low lane — see the SCC `wdata` comment), so unchanged.
+After the fix `$A009CE` is hit 7× (falls through), the boot reaches the floppy
+boot-disk wait loop, QuickDraw init, the cursor, and the **grey desktop
+pattern** (screenshot frame ~1490). Frame-350 test pattern unchanged.
+
+Debugging method that worked here: a SIMULATION `$display` in `swim.v` on
+`cen && selectSWIM` printing `_cpuRW/_cpuLDS/cpuAddrRegHi/{q7,q6}/enable/dataOutLo`
+showed `lds=1` on every access and `dataOutLo=ff` — the smoking gun. (MAME
+debugscript `tracelog`/breakpoint/watchpoint **actions do not fire** in the
+headless `maclc` build here; only the `dump` command and `trace` file work, and
+68020 opcode-PC breakpoints are defeated by prefetch.)
+
+## Three hardware-fidelity checks (2026-06-03)
+
+1. **Egret (68HC05) / chime.** Present (`rtl/egret/`, behavioral default in sim).
+   The ASC is actively programmed during boot (`$F14800`/`$F14804` thousands of
+   accesses) and the boot reaches the desktop, so the startup/sound path runs.
+   Still TODO: verify the real-HC05 build (`USE_EGRET_CPU`) boots equivalently
+   (the sim default is behavioral). Watch the `via6522.sv` SR caveat in
+   `CLAUDE.md` for any SR change.
+
+2. **V8 bank-sizing.** Confirmed still good on the current build: the SIMM is
+   sized from the physical config (`ram_config_phys`, addrDecoder.v:81-99), the
+   `$0` motherboard mirror is gated by `ram_configured`, the descriptor table at
+   `$9FFFEC` stays single-entry (writes seen at `$9FFFEA`/`$9FFFEE`), and the
+   march completes with no clobber (boot reaches the desktop). 10MB (`$E4`)
+   still unvalidated — check `mame -ramsize 10M` + `v8.cpp ram_size()` before
+   trusting `ram_config_phys` there.
+
+3. **24/32-bit switch (A31).** Gap characterized. MAME uses `M68020HMMU` with
+   `map.global_mask(0x80ffffff)` (`maclc.cpp:181/195`): only bit 31 and bits
+   23-0 decode; bits 30-24 are ignored. Our `addrDecoder.v` looks only at
+   `address[23:0]` and ignores bit 31 entirely, i.e. the core is **always
+   24-bit**. The LC ships 24-bit by default and the boot reaches the desktop in
+   that mode, so this is sufficient for booting. It remains a future gap: if
+   System software (MODE32) or a 32-bit-clean path drives A31=1 expecting the
+   32-bit window, our decode aliases it into the 24-bit map. The sim's
+   `cpuAddrFullHi`/`HIGH_ADDR` probe should never fire during a healthy 24-bit
+   boot — re-check if a future hang appears past the disk-wait loop.
