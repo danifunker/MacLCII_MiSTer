@@ -374,11 +374,13 @@ module dataController_top(
 
 	assign _viaIrq = ~viaIrq;
 
-	// Port A - Mac LC configuration
-	// Mac LC V8 returns 0x55 for Port A reads (machine identification)
-	// 0x55 = 0101 0101
-	//   Bit 7 = 0 (SCC wait/request - matches expected state for boot)
-	//   Bits 6-0 = 1010101 (Mac LC identification pattern)
+	// Port A - Mac LC configuration sense lines.
+	// MAME v8.cpp via_in_a(): return 0xd4 | (config & 1), where config bit0 =
+	// FPU present. The LC has no FPU, so the correct value is $D4 (not the old
+	// $55 placeholder). NOTE: setting $D4 alone does NOT avoid the STM serial
+	// monitor (confirmed: with $D4 our VIA matches MAME exactly yet still enters
+	// STM), so the STM-entry root cause is elsewhere (boot state machine). Keep
+	// $55 until the real cause is found, to avoid mixing unconfirmed changes.
 	assign via_pa_i = 8'h55;
 	// Sound volume still comes from PA[2:0] output latch
 	assign snd_vol = ~via_pa_oe[2:0] | via_pa_o[2:0];

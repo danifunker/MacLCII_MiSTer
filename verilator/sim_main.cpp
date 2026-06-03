@@ -262,6 +262,27 @@ int verilate() {
 				static int hit_910 = 0, hit_694c = 0, hit_a590 = 0;
 				uint32_t mpc = VERTOPINTERN->debug_pc & 0xFFFFFF;
 				if (mpc != march_last_pc) {
+					{   // STM-entry detector: first jump INTO the serial-monitor
+						// region ($A49800-$A49FFF) from outside, with source PC.
+						static int stm_logs = 0;
+						bool in_stm   = (mpc >= 0xA49800 && mpc <= 0xA499FF);
+						bool prev_stm = (march_last_pc >= 0xA49800 && march_last_pc <= 0xA499FF);
+						if (in_stm && !prev_stm && stm_logs < 12) {
+							fprintf(stderr, "[STM_ENTRY] -> %06X from %06X F%d\n", mpc, march_last_pc, video.count_frame);
+							stm_logs++;
+						}
+					}
+					{   // boot state-machine: log entry into each of MAME's 11 handlers
+						// (+ the STM-subsystem $A48Cxx) to find where our sequence diverges.
+						static const uint32_t H[] = {0xA48468,0xA483FC,0xA47C30,0xA47942,
+							0xA477D2,0xA473F4,0xA4730C,0xA4713E,0xA4703E,0xA46F5A,0xA46EC8};
+						static uint32_t last_h=0; static int st=0;
+						bool ish=false; for (unsigned i=0;i<11;i++) if (mpc==H[i]) ish=true;
+						
+						if (ish && mpc!=last_h && st<300) {
+							fprintf(stderr, "[STATE] handler %06X F%d\n", mpc, video.count_frame); st++; last_h=mpc;
+						}
+					}
 					march_last_pc = mpc;
 					if (mpc == 0xA46910) { hit_910++;
 						auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
@@ -325,22 +346,6 @@ int verilate() {
 						prev_rcfgd, rcfgd, video.count_frame,
 						VERTOPINTERN->debug_pc & 0xFFFFFF);
 					prev_rcfgd = rcfgd;
-				}
-				// Log unmapped low-mem accesses ($0-$1FFFFF): our core reads back
-				// $FFFF here, MAME reads $0. If the ROM reads a low-mem global
-				// before $0 is installed and branches on it, the $FFFF-vs-$0
-				// mismatch can diverge the boot toward $A499xx.
-				static int unmap_logs = 0;
-				if (VERTOPINTERN->emu__DOT__selectUnmapped &&
-				    (top->debug_cpuAddr & 0xFFFFFF) < 0x200000 &&
-				    unmap_logs < 60) {
-					static uint32_t last_ua = 0xFFFFFFFF;
-					uint32_t ua = top->debug_cpuAddr & 0xFFFFFF;
-					if (ua != last_ua) {
-						fprintf(stderr, "[UNMAP_LO] addr=%06X F%d pc=%06X\n",
-							ua, video.count_frame, VERTOPINTERN->debug_pc & 0xFFFFFF);
-						last_ua = ua; unmap_logs++;
-					}
 				}
 			}
 
