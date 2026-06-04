@@ -499,8 +499,8 @@ module emu
 	// Use actual video mode from pseudovia (ROM configures this via register 0x10)
 	wire [2:0] v8_video_mode = pvia_video_config[2:0];
 
-	// Monitor ID Selection - 640x480 VGA (13" RGB), matches MAME's V8 default
-	// raster set_raw(25175000,800,0,640,525,0,480) and the FPGA default.
+	// Monitor ID Selection - 640x480 VGA (default, matches MacLC.sv default and
+	// MAME's V8 screen). 512x384 is OSD-selectable on FPGA; sim uses the default.
 	wire [3:0] v8_monitor_id = 4'h6;
 
 	ariel_ramdac ariel(

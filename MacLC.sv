@@ -195,7 +195,7 @@ module emu
 		"-;",
 		"O78,Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 		"OCD,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
-		"OAB,Monitor,640x480 VGA,512x384 12in RGB,Portrait;",
+		"OA,Monitor,640x480 VGA,512x384 12in RGB;",
 		"-;",
 		"O4,Memory,2MB,10MB;",
 		"-;",
@@ -640,12 +640,11 @@ module emu
 							   status[17] ? 3'd4 : 3'd2;       // 16bpp override
 	*/
 
-	// Monitor ID Selection — OSD-driven via status[11:10] instead of V8
-	// SENSE0/SENSE2 pins.  This is intentional for emulation: real hardware
-	// reads the monitor sense lines on the DB-15 connector.
-	wire [3:0] v8_monitor_id = status[11:10] == 2'b00 ? 4'h6 : // 640x480 VGA (default, matches MAME)
-							   status[11:10] == 2'b01 ? 4'h2 : // 512x384 12" RGB
-							   4'h1;                           // Portrait
+	// Monitor ID Selection — OSD-selectable between 640x480 VGA (default,
+	// MAME-faithful) and 512x384 12" RGB. Portrait is not supported. This is
+	// the sense ID the ROM reads to pick V8 timing.
+	wire [3:0] v8_monitor_id = status[10] ? 4'h2 :  // 512x384 12" RGB
+	                                         4'h6;   // 640x480 VGA (default)
 
 	ariel_ramdac ariel(
 		.clk_sys(clk_sys),
