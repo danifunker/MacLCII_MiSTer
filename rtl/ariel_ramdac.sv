@@ -58,9 +58,34 @@ reg [23:0] palette_latch;
 reg        init_active;
 reg [8:0]  init_addr;  // 9-bit to count to 256
 
-// Compute initial grayscale value for current init address
-wire [7:0] init_shade = (init_addr[7:0] < 8'd128) ? 8'hFF :
-                        (8'd255 - init_addr[7:0]) << 1;
+// Compute an initial *colorful* palette so any pixel_index produces a
+// distinguishable color at boot — much easier to recognize on screen than
+// the old all-grey ramp. The pattern groups indices into 8 hue bins of 32
+// entries each (idx[7:5] = hue), with brightness ramping inside each bin
+// (idx[4:0] -> shade 0..255 in 8-step increments).
+//   bin 0 = red, 1 = green, 2 = blue, 3 = yellow,
+//   bin 4 = cyan, 5 = magenta, 6 = white-grey, 7 = orange
+wire [7:0] init_bri = {init_addr[4:0], 3'b000};   // 0..248 brightness ramp
+wire [7:0] init_r =
+    (init_addr[7:5] == 3'd0) ? init_bri :              // red
+    (init_addr[7:5] == 3'd3) ? init_bri :              // yellow
+    (init_addr[7:5] == 3'd5) ? init_bri :              // magenta
+    (init_addr[7:5] == 3'd6) ? init_bri :              // white/grey
+    (init_addr[7:5] == 3'd7) ? init_bri :              // orange (full red)
+                               8'h00;
+wire [7:0] init_g =
+    (init_addr[7:5] == 3'd1) ? init_bri :              // green
+    (init_addr[7:5] == 3'd3) ? init_bri :              // yellow
+    (init_addr[7:5] == 3'd4) ? init_bri :              // cyan
+    (init_addr[7:5] == 3'd6) ? init_bri :              // white/grey
+    (init_addr[7:5] == 3'd7) ? {1'b0, init_bri[7:1]} : // orange (half green)
+                               8'h00;
+wire [7:0] init_b =
+    (init_addr[7:5] == 3'd2) ? init_bri :              // blue
+    (init_addr[7:5] == 3'd4) ? init_bri :              // cyan
+    (init_addr[7:5] == 3'd5) ? init_bri :              // magenta
+    (init_addr[7:5] == 3'd6) ? init_bri :              // white/grey
+                               8'h00;
 
 // Video lookup (port B) - synchronous read for block RAM inference
 always @(posedge clk_sys) begin
@@ -80,8 +105,10 @@ always @(posedge clk_sys) begin
         init_active <= 1'b1;
         init_addr <= 9'd0;
     end else if (init_active) begin
-        // Initialize palette from reset counter (one entry per clock)
-        palette[init_addr[7:0]] <= {init_shade, init_shade, init_shade};
+        // Initialize palette from reset counter (one entry per clock).
+        // Rainbow init replaces old greyscale ramp — every pixel_index value
+        // now maps to a visually distinct color.
+        palette[init_addr[7:0]] <= {init_r, init_g, init_b};
         if (init_addr == 9'd255)
             init_active <= 1'b0;
         init_addr <= init_addr + 9'd1;

@@ -5,19 +5,23 @@ module maclc_v8_video(
     input clk_sys,
     input clk8_en_p,
     input reset,
-    
+
     output [21:0] video_addr,
     input [15:0] video_data_in,
     input video_latch,
-    
+
     input [2:0] video_mode,
     input [3:0] monitor_id,
-    
+
+    // Test/diagnostic controls
+    input        test_bypass_vram,  // 1 = ignore VRAM, generate synthetic pattern
+    input [1:0]  test_pattern_sel,  // 0=hbar, 1=vbar, 2=checker, 3=h^v xor
+
     output reg hsync,
     output reg vsync,
     output reg hblank,
     output reg vblank,
- 
+
     output reg [7:0] vga_r,
     output reg [7:0] vga_g,
     output reg [7:0] vga_b,
@@ -25,7 +29,13 @@ module maclc_v8_video(
     output reg ce_pix,
 
     output [7:0] palette_addr,
-    input [23:0] palette_data
+    input [23:0] palette_data,
+
+    // Debug telemetry (live)
+    output reg [31:0] dbg_latch_count,    // total VRAM latches since reset
+    output reg [15:0] dbg_last_data,      // most recent word fetched
+    output reg [21:0] dbg_last_addr,      // address that produced it
+    output reg [15:0] dbg_nonzero_count   // count of fetches where data != 0 and != FFFF
 );
 
 localparam [21:0] VRAM_BASE = 22'h0;  // Outputs byte offset; SDRAM base added in addrController
@@ -142,29 +152,20 @@ end
 // For 640-wide modes, strides are multiples of 80 (80..1280).
 // We accumulate row_start each scanline to avoid a large multiply.
 
+// MAME v8.cpp screen_update uses a FIXED stride of 1024 bytes/scanline for
+// modes 0-3 (1/2/4/8 bpp) regardless of horizontal resolution. Only 16 bpp
+// uses (hres * 2). This matters because the ROM lays out the framebuffer at
+// 1024 bytes/scanline — fetching at a smaller stride would skew rows.
 reg [10:0] row_bytes;
 always @(*) begin
-    case (monitor_id)
-        4'h2: begin // 512x384
-            case (video_mode)
-                3'd0: row_bytes = 11'd64;    // 1bpp: 512/8
-                3'd1: row_bytes = 11'd128;   // 2bpp
-                3'd2: row_bytes = 11'd256;   // 4bpp
-                3'd3: row_bytes = 11'd512;   // 8bpp
-                3'd4: row_bytes = 11'd1024;  // 16bpp
-                default: row_bytes = 11'd256;
+    case (video_mode)
+        3'd4: begin // 16bpp: stride = hres * 2 bytes
+            case (monitor_id)
+                4'h2: row_bytes = 11'd1024; // 512x384: 512*2 = 1024
+                default: row_bytes = 11'd1280; // 640x480 (or 640x870 portrait): 640*2 = 1280
             endcase
         end
-        default: begin // 640x480 (and portrait)
-            case (video_mode)
-                3'd0: row_bytes = 11'd80;    // 1bpp: 640/8
-                3'd1: row_bytes = 11'd160;   // 2bpp
-                3'd2: row_bytes = 11'd320;   // 4bpp
-                3'd3: row_bytes = 11'd640;   // 8bpp
-                3'd4: row_bytes = 11'd1280;  // 16bpp
-                default: row_bytes = 11'd320;
-            endcase
-        end
+        default: row_bytes = 11'd1024; // 1/2/4/8 bpp: fixed 1024 (MAME v8.cpp:528,552,573,592)
     endcase
 end
 
@@ -191,11 +192,24 @@ reg [3:0]  shift_count;
 reg video_latch_pending;
 reg [15:0] video_latch_data;
 
+// The bus grants one video fetch per 16 clk_sys (= one word per 8 pix_en).
+// That cadence only matches 2 bpp. At 1 bpp a word holds 16 pixels and
+// video_addr only advances every 16 pixels, so the SAME word address is
+// fetched twice per word — reloading pixel_shift mid-word made pixels 0-7
+// render twice (the doubled cursor / striped dither) and 8-15 never show.
+// Ignore a redundant re-fetch of the same address so the shift register runs
+// through all 16 bits. No-op for >=2 bpp (every fetch is a new address).
+// Reset the dedup tracker each blank so the first word of every line loads.
+reg [21:0] last_fetch_addr;
 always @(posedge clk_sys) begin
-    if (video_latch && !hblank && !vblank) begin
+    if (hblank || vblank) begin
+        last_fetch_addr <= 22'h3FFFFF;  // sentinel: force first fetch of next line to load
+        video_latch_pending <= 1'b0;
+    end else if (video_latch && video_addr != last_fetch_addr) begin
         video_data <= video_data_in;
         video_latch_data <= video_data_in;
         video_latch_pending <= 1'b1;
+        last_fetch_addr <= video_addr;
     end
     // Clear pending flag when consumed by shift register on pix_en
     if (pix_en && video_latch_pending && !hblank && !vblank)
@@ -203,52 +217,99 @@ always @(posedge clk_sys) begin
 end
 
 // --- Shift Register Logic ---
-// Shift register operates at pixel clock rate (pix_en)
-// We need to output 16/bits_per_pixel pixels per word
+// One VRAM word arrives every ~8 pix_en cycles (videoBusControl provides
+// memoryLatch at 1 fetch / 16 clk_sys; pix_div=2). Distribute the shifts
+// across that 8-cycle window so every pixel in the word becomes visible
+// instead of repeating only the top bits.
+//
+//   16bpp: 1 px/word — never shift (direct color from video_data)
+//    8bpp: 2 px/word — shift once at count==3 → 4:4 cycle split
+//    4bpp: 4 px/word — shift on odd counts (1,3,5,7) → 2:2:2:2 split
+//    2bpp: 8 px/word — shift every cycle → 1:1:1:1:1:1:1:1
+//    1bpp: 16 px/word, only 8 cycles → shift every cycle, renders 8 of 16
+//          pixels (every-other-pixel resolution; correct fix would require
+//          increasing fetch rate beyond what current bus arbitration allows).
 always @(posedge clk_sys) begin
     if (pix_en) begin
         if (hblank || vblank) begin
-            pixel_shift <= 16'hFFFF;  // Initialize to "black" pattern for Mac
+            pixel_shift <= 16'h0000;
             shift_count <= 0;
         end else if (video_latch_pending) begin
             // Load new data when latch is pending
             pixel_shift <= video_latch_data;
-            shift_count <= 1; // Start at 1 so first pixel displays on this clock
+            shift_count <= 1; // First pixel displays on this cycle
         end else begin
             shift_count <= shift_count + 1;
 
-            // Shift at the start of each new pixel period
             case (bits_per_pixel)
-                5'd1:  pixel_shift <= {pixel_shift[14:0], 1'b0}; // every pixel
-                5'd2:  if (shift_count[0] == 0) pixel_shift <= {pixel_shift[13:0], 2'b0};
-                5'd4:  if (shift_count[1:0] == 0) pixel_shift <= {pixel_shift[11:0], 4'b0};
-                5'd8:  if (shift_count[2:0] == 0) pixel_shift <= {pixel_shift[7:0],  8'b0};
-                5'd16: ; // No shift needed, direct color from video_data
+                5'd1:  pixel_shift <= {pixel_shift[14:0], 1'b0};
+                5'd2:  pixel_shift <= {pixel_shift[13:0], 2'b0};
+                5'd4:  if (shift_count[0])      pixel_shift <= {pixel_shift[11:0], 4'b0};
+                5'd8:  if (shift_count == 4'd3) pixel_shift <= {pixel_shift[7:0],  8'b0};
+                5'd16: ;
             endcase
         end
     end
 end
 
-reg [7:0] pixel_index;
+reg [7:0] pixel_index_real;
+reg [7:0] pixel_index_test;
+wire [7:0] pixel_index;
 
 // --- Pixel Extraction ---
 // We extract from the MSB (Big Endian Mac format)
-// MAME uses specific palette index patterns:
+// MAME uses specific palette index patterns (see v8.cpp:530, 554, 575, 593):
 // 1bpp: 0x7F | (bit ? 0x80 : 0) → 0x7F (white) or 0xFF (black)
 // 2bpp: 0x3F | (2-bit << 6) → 0x3F, 0x7F, 0xBF, 0xFF
 // 4bpp: 0x0F | (4-bit << 4) → 0x0F, 0x1F, 0x2F, ..., 0xFF
 // 8bpp: direct 0x00-0xFF
 always @(*) begin
     case (video_mode)
-        3'd0: pixel_index = {pixel_shift[15], 7'b1111111};            // 1bpp: 0x7F or 0xFF
-        3'd1: pixel_index = {pixel_shift[15:14], 6'b111111};          // 2bpp: 0x3F, 0x7F, 0xBF, 0xFF
-        3'd2: pixel_index = {pixel_shift[15:12], 4'b1111};            // 4bpp: 0x0F-0xFF
-        3'd3: pixel_index = pixel_shift[15:8];                        // 8bpp: direct
-        default: pixel_index = 8'd0;
+        3'd0: pixel_index_real = {pixel_shift[15], 7'b1111111};            // 1bpp: 0x7F or 0xFF
+        3'd1: pixel_index_real = {pixel_shift[15:14], 6'b111111};          // 2bpp: 0x3F, 0x7F, 0xBF, 0xFF
+        3'd2: pixel_index_real = {pixel_shift[15:12], 4'b1111};            // 4bpp: 0x0F-0xFF
+        3'd3: pixel_index_real = pixel_shift[15:8];                        // 8bpp: direct
+        default: pixel_index_real = 8'd0;
     endcase
 end
 
+// Synthetic test patterns (don't need VRAM data to render):
+//   0 = horizontal color bars  (vertical stripes shown by h_count[8:1])
+//   1 = vertical color bars    (horizontal stripes shown by v_count[7:0])
+//   2 = 8x8 checker            (h_count[3] XOR v_count[3] selects two extreme indices)
+//   3 = h XOR v gradient       (classic XOR pattern, exercises all 256 entries)
+always @(*) begin
+    case (test_pattern_sel)
+        2'd0: pixel_index_test = h_count[8:1];
+        2'd1: pixel_index_test = v_count[7:0];
+        2'd2: pixel_index_test = (h_count[3] ^ v_count[3]) ? 8'h00 : 8'hFF;
+        2'd3: pixel_index_test = h_count[7:0] ^ v_count[7:0];
+        default: pixel_index_test = 8'd0;
+    endcase
+end
+
+assign pixel_index = test_bypass_vram ? pixel_index_test : pixel_index_real;
 assign palette_addr = pixel_index;
+
+// --- Debug telemetry ---
+// Counts every VRAM latch into the V8 video module, records the most recent
+// fetched word + address, and tallies fetches that returned a "non-trivial"
+// value (not 0x0000 and not 0xFFFF) — handy for confirming the CPU has
+// started writing real pixel data.
+always @(posedge clk_sys) begin
+    if (reset) begin
+        dbg_latch_count   <= 32'd0;
+        dbg_nonzero_count <= 16'd0;
+        dbg_last_data     <= 16'd0;
+        dbg_last_addr     <= 22'd0;
+    end else if (video_latch && !hblank && !vblank) begin
+        dbg_latch_count <= dbg_latch_count + 32'd1;
+        dbg_last_data   <= video_data_in;
+        dbg_last_addr   <= video_addr;
+        if (video_data_in != 16'h0000 && video_data_in != 16'hFFFF)
+            dbg_nonzero_count <= dbg_nonzero_count + 16'd1;
+    end
+end
 
 // Pipeline delay: palette RAM read is synchronous (1-cycle latency),
 // so delay de, video_mode, and video_data to align with palette_data output.

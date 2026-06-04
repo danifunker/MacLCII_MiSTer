@@ -36,8 +36,10 @@
         Not yet implemented
 
     ($F16000 - $F17FFF) SWIM
-        Floppy controller
-        Register = (offset >> 8) & 0xF
+        Floppy controller. On the LC (V8) the SWIM is on the UPPER data byte
+        (even-addressed byte accesses, _UDS), like the VIA/SCC — not the lower
+        byte/_LDS as on the Mac Plus.
+        Register = (offset >> 9) & 0xF  (A12-A9, $200 stride)
 
     ($F24000 - $F25FFF) Ariel RAMDAC
         Video palette/DAC
@@ -55,7 +57,9 @@ module addrDecoder(
     input _cpuAS,
     input _cpuRW,
     input memoryOverlayOn,
-    input [7:0] ram_config,  // V8 RAM config: bits[7:6] = SIMM size
+    input [7:0] ram_config,       // V8 RAM config WRITTEN by ROM: bits[7:6] gate mb mirror
+    input [7:0] ram_config_phys,  // PHYSICAL RAM config — real installed SIMM size
+    input ram_configured,    // 1 once ROM programs V8 config; enables $0 mb mirror
 
     output reg selectRAM,
     output reg selectROM,
@@ -72,16 +76,39 @@ module addrDecoder(
     output reg selectUnmapped
 );
 
-    // Decode SIMM byte size from ram_config[7:6]
-    wire [23:0] simm_byte_size = (ram_config[7:6] == 2'b00) ? 24'h000000 :  // 0MB
-                                  (ram_config[7:6] == 2'b01) ? 24'h200000 :  // 2MB
-                                  (ram_config[7:6] == 2'b10) ? 24'h400000 :  // 4MB
-                                                                24'h800000;   // 8MB
+    // Decode SIMM byte size from the PHYSICAL config (real installed SIMM), NOT the
+    // ROM-written register. MAME sizes the SIMM from m_ram_size; the writable config
+    // only gates placement. For a 2MB machine (no SIMM) this keeps $0 a true $800000
+    // mirror instead of a phantom separate SIMM bank. See addrController_top.v.
+    wire [23:0] simm_byte_size = (ram_config_phys[7:6] == 2'b00) ? 24'h000000 :  // 0MB
+                                  (ram_config_phys[7:6] == 2'b01) ? 24'h200000 :  // 2MB
+                                  (ram_config_phys[7:6] == 2'b10) ? 24'h400000 :  // 4MB
+                                                                    24'h800000;   // 8MB
+
+    // Motherboard RAM placement (match MAME v8.cpp ram_size()): the 2MB
+    // motherboard RAM is ALWAYS installed at mb_location, which sits directly
+    // after any SIMM (mb_location = SIMM size). With no SIMM (config[7:6]=00)
+    // the motherboard RAM lands at $000000-$1FFFFF. It is additionally
+    // mirrored at $800000-$9FFFFF (the always-present V8 image). Only the 8MB
+    // SIMM config (config[7:6]=11) drops the low motherboard placement.
+    wire [23:0] mb_location = simm_byte_size;          // == 0 when no SIMM
+    wire        mb_present  = (ram_config[7:6] != 2'b11);
 
     // Valid RAM ranges:
-    //   SIMM:        $000000 to simm_byte_size-1 (only if SIMM present)
-    //   Motherboard: $800000-$9FFFFF (always 2MB)
-    wire in_simm_range = (address[23:0] < simm_byte_size);
+    //   SIMM:            $000000 to simm_byte_size-1 (only if SIMM present)
+    //   Motherboard low: [mb_location, mb_location+2MB) (the soldered 2MB)
+    //   Motherboard high:$800000-$9FFFFF (always-present 2MB mirror)
+    wire in_simm_range = (ram_config_phys[7:6] != 2'b00) && (address[23:0] < simm_byte_size);
+    // The motherboard-low mirror (e.g. $0-$1FFFFF when no SIMM) is gated on
+    // ram_configured. MAME installs it only after the ROM programs the V8 config
+    // (ram_size(data)); during the boot RAM-bank probe the map is ram_size(0xc0)
+    // == $800000-$9FFFFF only. Without this gate the probe finds a phantom 2MB
+    // bank at $0, whose march then clobbers the $9FFFEC descriptor table through
+    // the $0<->$800000 SDRAM mirror, hanging the boot. (in_simm_range is NOT
+    // gated: for SIMM configs MAME maps the real SIMM at $0 during enumeration.)
+    wire in_motherboard_low = ram_configured && mb_present &&
+                              (address[23:0] >= mb_location) &&
+                              (address[23:0] <  (mb_location + 24'h200000));
     wire in_motherboard_range = (address[23:21] == 3'b100);  // $800000-$9FFFFF
 
     always @(*) begin
@@ -113,7 +140,7 @@ module addrDecoder(
                 if (memoryOverlayOn && _cpuRW) begin
                     // Overlay active: ROM appears at $000000 for READS
                     selectROM = 1;
-                end else if (in_simm_range || in_motherboard_range) begin
+                end else if (in_simm_range || in_motherboard_low || in_motherboard_range) begin
                     // Normal operation: RAM only where it physically exists
                     selectRAM = 1;
                 end else begin

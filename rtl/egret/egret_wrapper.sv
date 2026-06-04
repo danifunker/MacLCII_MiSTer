@@ -265,6 +265,20 @@ always @(*) begin
     adb_data_out = pa_out[7];
 end
 
+`ifdef SIMULATION
+// Log ADB line drive edges with timestamps so we can derive the HC05's wire-level
+// ADB cell timing (attention/sync/data cells) when designing the ADB device.
+reg adb_out_prev;
+always @(posedge clk) begin
+    if (cen) begin
+        if (adb_data_out !== adb_out_prev) begin
+            $display("ADBLINE[%0d]: out=%b (line=%b) PA7=%b", cycle_count, adb_data_out, ~adb_data_out, pa_out[7]);
+            adb_out_prev <= adb_data_out;
+        end
+    end
+end
+`endif
+
 // ============================================================================
 // Port B - VIA interface (this is the key interface)
 // ============================================================================
@@ -699,8 +713,13 @@ always @(posedge clk) begin
     if (pc_bit3_prev && !pc_out[3] && !pram_loaded && cen) begin
         // Copy PRAM to internal RAM: PRAM[0-255] -> CPU 0x100-0x1FF
         // Offset 0x70 = (0x100 - 0x90) to convert CPU address to intram index
+        // NOTE: blocking `=` (not `<=`) inside the for-loop is required for
+        // the sim build's BLKLOOPINIT lint (BLKLOOPINIT — non-delayed array-write-in-loop is ok,
+        // delayed is not). Quartus accepts both; the effective behavior is
+        // the same here because every iteration writes a DIFFERENT index
+        // and there's no read-modify-write within the loop.
         for (pram_idx = 0; pram_idx < 256; pram_idx = pram_idx + 1) begin
-            intram[pram_idx + 16'h70] <= pram[pram_idx];
+            intram[pram_idx + 16'h70] = pram[pram_idx];
         end
         // Initialize RTC time (use timestamp input)
         // RTC seconds at CPU addresses 0xAB-0xAE -> intram[0x1B-0x1E]
@@ -979,6 +998,15 @@ always @(posedge clk) begin
         // Track program counter
         if (rom_cs && cpu_wr) begin  // cpu_wr=1 means read
             last_pc <= cpu_addr;
+`ifdef EGRET_SRDEBUG
+            // Focused stuck-loop finder for the byte-4 BYTEACK/TREQ turnaround.
+            // Samples the HC05 PC + handshake inputs every ~32k fetches, so a hung
+            // loop prints its PC repeatedly (a few dozen lines/run, no flood).
+            // Enable with +define+EGRET_SRDEBUG; grep "EGRET_SRDBG" in the output.
+            if (cycle_count[14:0] == 15'd0)
+                $display("EGRET_SRDBG[%0d]: PC=0x%04x BYTEACK=%b TIP=%b TREQ_out=%b CB1out=%b",
+                         cycle_count, addr13, via_byteack_in_stable, via_tip_stable, pb_out[1], pb_out[4]);
+`endif
 `ifdef SIMULATION
             // Track key init milestones
             if (addr13 == 13'h0FAF)

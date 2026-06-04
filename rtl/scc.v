@@ -77,6 +77,20 @@ module scc
 	reg scc_state_a;  // 0 = READY (next write to WR0), 1 = REGISTER (next write to selected reg)
 	reg scc_state_b;
 
+	/* Pending-cleanup flags for the WR0-pointer-vs-read race.
+	 * Background: per the MAME baseline (z80scc.cpp:1716-1736), the SCC's
+	 * register pointer is consumed by the *completed* ctl access. Previously
+	 * we reset rindex_a/scc_state_a on the first cen-cycle inside the CS
+	 * window; combined with the combinational rdata_mux that reads rindex_a
+	 * directly, this caused rdata_mux to flip from RR1 to RR0 mid-CS,
+	 * before the 68020 sampled. Now: when the cleanup condition triggers,
+	 * we only SET pending_cleanup_X. The actual rindex/scc_state reset is
+	 * deferred to the cen-cycle where CS goes low. This holds rindex_a
+	 * stable for the entire CS window so the CPU sees a consistent RR1
+	 * read for the Apple STM "All Sent" poll at $A49F08. */
+	reg pending_cleanup_a;
+	reg pending_cleanup_b;
+
 	/* Resets via WR9, one clk pulses */
 	wire		reset_a;
 	wire		reset_b;
@@ -279,6 +293,8 @@ module scc
 			rindex_b <= 0;
 			scc_state_a <= 0;  // READY state
 			scc_state_b <= 0;
+			pending_cleanup_a <= 0;
+			pending_cleanup_b <= 0;
 			//data_a <= 0;
 			tx_data_a<=0;
 			tx_data_b<=0;
@@ -298,30 +314,51 @@ module scc
 		end else begin
 			// Track CS edges - only process one access per CS assertion
 			if (cen) begin
-				if (!cs) cs_access_done <= 0;  // Reset when CS deasserts
+				if (!cs) begin
+					cs_access_done <= 0;  // Reset when CS deasserts
+					// Deferred WR0-pointer cleanup: now that the CPU has
+					// completed its bus access and sampled rdata, it's
+					// safe to reset rindex_a/scc_state_a. Previously this
+					// reset fired inside the CS window, causing rdata_mux
+					// to flip from RR1 to RR0 before the CPU's data latch.
+					// MAME consumes m_wr0_ptrbits at the END of the
+					// accessor; we mirror that by deferring to CS deassert.
+					if (pending_cleanup_a) begin
+						rindex_a <= 0;
+						scc_state_a <= 0;
+						pending_cleanup_a <= 0;
+					end
+					if (pending_cleanup_b) begin
+						rindex_b <= 0;
+						scc_state_b <= 0;
+						pending_cleanup_b <= 0;
+					end
+				end
 			end
 			if (cen && cs && !cs_access_done) begin
 				cs_access_done <= 1;  // Mark as processed for this CS assertion
             if (!rs[1]) begin
-                /* Reset register pointer after completing access to the selected register */
-                /* - Writes: when state==REGISTER, the write targets the selected register; reset afterward */
-                /* - Reads:  when state==REGISTER, the read targets the selected register; reset afterward */
-                /* Note: Use non-blocking <= so the current access uses the OLD pointer/state */
+                /* Defer the register-pointer reset to CS deassert (see
+                 * pending_cleanup_a/b declaration). The rdata_mux remains
+                 * combinational off rindex_a, so we MUST keep rindex_a
+                 * stable for the entire CS window — otherwise the CPU
+                 * samples rdata_mux after rindex_a has already flipped to
+                 * 0 and reads RR0 instead of the intended RR1.
+                 * - Writes: targeted-register write fires elsewhere via
+                 *   wreg_X & rindex_latch == N; flag cleanup for CS-low.
+                 * - Reads:  rdata_mux returns the correct RRx for the
+                 *   entire CS window; flag cleanup for CS-low. */
                 if (we) begin
                     if (rs[0] && scc_state_a == 1) begin
-                        rindex_a <= 0;
-                        scc_state_a <= 0;
+                        pending_cleanup_a <= 1;
                     end else if (!rs[0] && scc_state_b == 1) begin
-                        rindex_b <= 0;
-                        scc_state_b <= 0;
+                        pending_cleanup_b <= 1;
                     end
                 end else begin
                     if (rs[0] && scc_state_a == 1) begin
-                        rindex_a <= 0;
-                        scc_state_a <= 0;
+                        pending_cleanup_a <= 1;
                     end else if (!rs[0] && scc_state_b == 1) begin
-                        rindex_b <= 0;
-                        scc_state_b <= 0;
+                        pending_cleanup_b <= 1;
                     end
                 end
 
@@ -334,11 +371,16 @@ module scc
 							/* State READY: This write is to WR0 - set register pointer */
 							rindex_a[2:0] <= wdata[2:0];
 							rindex_a[3] <= (wdata[5:3] == 3'b001);  // Point high
-							scc_state_a <= 1;  // Transition to REGISTER state
+							// Only transition to REGISTER state if the new pointer will be non-zero.
+							// If new pointer is 0, stay in READY so subsequent WR0 writes are still
+							// treated as commands (matches real SCC: writes to WR0 are always commands).
+							if (wdata[2:0] != 3'b000 || wdata[5:3] == 3'b001)
+								scc_state_a <= 1;  // Transition to REGISTER state
 `ifdef DEBUG_SCC
-							$display("SCC_WR0_WRITE: ch=A wdata=%02x rindex_new=%x point_high=%b state=READY->REGISTER",
+							$display("SCC_WR0_WRITE: ch=A wdata=%02x rindex_new=%x point_high=%b next_state=%s",
 								wdata, {((wdata[5:3] == 3'b001) ? 1'b1 : 1'b0), wdata[2:0]},
-								(wdata[5:3] == 3'b001));
+								(wdata[5:3] == 3'b001),
+								((wdata[2:0] != 3'b000 || wdata[5:3] == 3'b001) ? "REGISTER" : "READY"));
 `endif
 							/* enable int on next rx char */
 							if (wdata[5:3] == 3'b100)
@@ -357,11 +399,16 @@ module scc
 							/* State READY: This write is to WR0 - set register pointer */
 							rindex_b[2:0] <= wdata[2:0];
 							rindex_b[3] <= (wdata[5:3] == 3'b001);  // Point high
-							scc_state_b <= 1;  // Transition to REGISTER state
+							// Only transition to REGISTER state if the new pointer will be non-zero.
+							// If new pointer is 0, stay in READY so subsequent WR0 writes are still
+							// treated as commands (matches real SCC: writes to WR0 are always commands).
+							if (wdata[2:0] != 3'b000 || wdata[5:3] == 3'b001)
+								scc_state_b <= 1;  // Transition to REGISTER state
 `ifdef DEBUG_SCC
-							$display("SCC_WR0_WRITE: ch=B wdata=%02x rindex_new=%x point_high=%b state=READY->REGISTER",
+							$display("SCC_WR0_WRITE: ch=B wdata=%02x rindex_new=%x point_high=%b next_state=%s",
 								wdata, {((wdata[5:3] == 3'b001) ? 1'b1 : 1'b0), wdata[2:0]},
-								(wdata[5:3] == 3'b001));
+								(wdata[5:3] == 3'b001),
+								((wdata[2:0] != 3'b000 || wdata[5:3] == 3'b001) ? "REGISTER" : "READY"));
 `endif
 							/* enable int on next rx char */
 							if (wdata[5:3] == 3'b100)
@@ -480,7 +527,9 @@ module scc
 	// Reset channel B on: WR9 with bits 7:6 = 01 (channel B reset) OR 11 (hardware reset)
 	assign reset_b = ((wreg_a | wreg_b) & (rindex_latch == 9) & ((wdata[7:6] == 2'b01) | (wdata[7:6] == 2'b11))) | reset;
 
-	// Debug: Show resets
+	// Debug: Show resets (fires every cen cycle while reset held -> stdout flood;
+	// gated behind VERBOSE_TRACE, same as the BERR/RAM_WR diagnostics)
+`ifdef VERBOSE_TRACE
 	always @(posedge clk) begin
 		if (cen) begin
 			if (reset) $display("SCC_RESET: Hardware reset triggered");
@@ -488,6 +537,7 @@ module scc
 			if (reset_b) $display("SCC_RESET: Channel B reset triggered");
 		end
 	end
+`endif
 
 	/* WR1
 	 * Reset: bit 5 and 2 unchanged */
@@ -823,15 +873,27 @@ module scc
 	wire tx_empty_gated_a = post_loopback_a ? 1'b0 : tx_empty_latch_a;
 	wire tx_empty_gated_b = post_loopback_b ? 1'b0 : tx_empty_latch_b;
 
-	/* RR0 */
-	assign rr0_a = { post_loopback_a, /* Break/Abort - 1 after loopback cleared (no cable) */
-			 eom_latch_a, /* Tx Underrun/EOM */
-			 rr0_cts_a, /* CTS - forced 1 in loopback, 0 otherwise (no cable) */
-			 post_loopback_a, /* Sync/Hunt - 1 after loopback cleared (permanently hunting) */
-			 rr0_dcd_a, /* DCD - forced 1 in loopback, 0 otherwise (no cable) */
-			 tx_empty_gated_a, /* Tx Empty - blocked after loopback cleared (no cable) */
-			 1'b0, /* Zero Count */
-			 post_loopback_a ? 1'b0 : (rx_queue_pos_a > 0)  /* Rx Available */
+	/* RR0
+	 * Bit 7 (Break/Abort) and bit 4 (Sync/Hunt) MUST be 0 in async mode per
+	 * the Z8530 datasheet — these are SDLC/sync-only status bits and a real
+	 * Z8530 in async mode reports them as 0. Previously we aliased both to
+	 * post_loopback_a, producing the impossible RR0=0x54 pattern Agent 2's
+	 * MAME-CSV review flagged (bits 7 and 4 set simultaneously in async).
+	 * If the boot ROM's SCC ISR interprets RR0[7] as "BREAK detected", a
+	 * false set sends it down the break-handling branch every time loopback
+	 * clears.
+	 * NOTE: bit 0 (RxAvail) and bit 2 (TxEmpty) keep the post_loopback gate
+	 * — that's the documented intentional "no cable" behavior from
+	 * commit a89c671 (docs/bootproblems.md:138-156).
+	 */
+	assign rr0_a = { 1'b0,           /* Break/Abort — async: always 0 */
+			 eom_latch_a,           /* Tx Underrun/EOM */
+			 rr0_cts_a,             /* CTS */
+			 1'b0,                  /* Sync/Hunt — async: always 0 */
+			 rr0_dcd_a,             /* DCD */
+			 tx_empty_gated_a,      /* Tx Empty (post_loopback gated) */
+			 1'b0,                  /* Zero Count */
+			 post_loopback_a ? 1'b0 : (rx_queue_pos_a > 0)  /* Rx Available (post_loopback gated) */
 			 };
 
 	// Debug: Show RR0 composition when reading from control register
@@ -842,14 +904,14 @@ module scc
 			         rr0_cts_a, rr0_dcd_a, local_loopback_a, post_loopback_a, rx_queue_pos_a);
 		end
 	end
-	assign rr0_b = { post_loopback_b, /* Break/Abort */
-			 eom_latch_b, /* Tx Underrun/EOM */
-			 rr0_cts_b, /* CTS - forced 1 in loopback, 0 otherwise */
-			 post_loopback_b, /* Sync/Hunt */
-			 rr0_dcd_b, /* DCD - forced 1 in loopback, 0 otherwise */
-			 tx_empty_gated_b, /* Tx Empty - blocked after loopback cleared */
-			 1'b0, /* Zero Count */
-			 post_loopback_b ? 1'b0 : (rx_queue_pos_b > 0)  /* Rx Available */
+	assign rr0_b = { 1'b0,           /* Break/Abort — async: always 0 (see rr0_a) */
+			 eom_latch_b,           /* Tx Underrun/EOM */
+			 rr0_cts_b,             /* CTS */
+			 1'b0,                  /* Sync/Hunt — async: always 0 (see rr0_a) */
+			 rr0_dcd_b,             /* DCD */
+			 tx_empty_gated_b,      /* Tx Empty (post_loopback gated) */
+			 1'b0,                  /* Zero Count */
+			 post_loopback_b ? 1'b0 : (rx_queue_pos_b > 0)  /* Rx Available (post_loopback gated) */
 			 };
 
 	/* RR1 */
@@ -1246,10 +1308,14 @@ end
 	always@(posedge clk or posedge reset) begin
 		if (reset) begin
 			tx_empty_latch_a <= 1'b1;  // Reset: transmitter is empty
+`ifdef VERBOSE_TRACE
 			$display("SCC_LATCH: tx_empty_latch_a <= 1 (hardware reset)");
+`endif
 		end else if (reset_a) begin
 			tx_empty_latch_a <= 1'b1;  // Channel reset: transmitter is empty
+`ifdef VERBOSE_TRACE
 			$display("SCC_LATCH: tx_empty_latch_a <= 1 (channel reset)");
+`endif
     end else begin
         // Combinational detect of ADATA write (channel A data port)
         // Clear TXEMPTY immediately on ADATA write

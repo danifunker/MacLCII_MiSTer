@@ -1,5 +1,277 @@
 # Boot Problems Log
 
+## 2026-06-01 Session — Egret SR / overlay bug FIXED; now stuck pre-video in the RAM march
+
+**Headline:** The long-standing **Egret <-> 68020 shift-register bug** that left
+the boot stuck in the ROM overlay is **FIXED** (two `rtl/via6522.sv` commits,
+validated against MAME). The boot now completes the Egret handshake, **escapes
+the overlay**, runs real ROM, and reaches the **RAM march test at `$A468xx`** —
+the same point the old behavioral-Egret sim reached, but now via the **real
+HC05**, so it is also the FPGA fix. **Remaining problem: still no video** — the
+boot grinds in the RAM march and never reaches video init.
+
+### What was fixed (Egret shift register)
+
+The 68020 talks to the Egret over the VIA shift register; CB1 is the external
+shift clock driven by the HC05. Two bugs in `via6522.sv` external-clock SR mode,
+both fixed by matching MAME `src/devices/machine/6522via.cpp`:
+
+1. **`9b40d57` — per-CB1-edge shift+count.** The whole SR datapath ran inside
+   `if (E_falling)`, counting at most one CB1 edge per VIA E-period. The HC05
+   toggles CB1 ~5-10x faster than E, so edges coalesced -> no byte ever completed
+   -> CPU stuck polling IFR bit 2 at `$A14E5E`. Now shifts+counts on each CB1
+   edge (`shift_tick_r` in / `shift_tick_f` out), decoupled from E. (0 -> 3 of 4
+   bytes.)
+2. **`6cfde0a` — registered CB2 (the decisive fix).** `ser_cb2_o = shift_reg[7]`
+   was combinational, so CB2 advanced to bit6 the instant the falling edge
+   rotated `shift_reg`. But the HC05 reads CB2 *after* its CB1 falling+rising
+   (`$14EF BCLR4 / $14F1 BSET4 / $14F3 BRSET5`), so it sampled bit6 first -> every
+   received command byte was **rotated one bit** -> the Egret misjudged the
+   command, turned the bus around (asserted TREQ) after 3 bytes while the 68020
+   was still sending byte 4 -> the "byte-4 deadlock." Fix matches MAME
+   `shift_out`: register CB2 in `cb2_shift_out` (present MSB, hold across the
+   edge, THEN rotate; init `data_in[7]` on SR load). (-> 28 of 29 bytes complete.)
+
+Supporting: **`054fa2a`** consolidated the sim onto the **real HC05**
+(`egret_wrapper`) for both Verilator and FPGA (behavioral is opt-in
+`+define+EGRET_BEHAVIORAL`), so the sim now reproduces and validates the FPGA
+Egret path. CLAUDE.md's "ext_fall_edge_pending known-bad" note was corrected in
+`3e2e3e6` (it was stale).
+
+### Where it stalls now (no video)
+
+- Overlay clears (`overlay_trigger` / `last_rom_pc` reach `$A0xxxx`); CPU runs
+  real ROM and reaches the RAM march loop `$A468C4-$A46908` (the
+  `subi.l #$10000,D3` outer loop). Data `@addr` walks `$4F35... -> $4FBA6CAC`.
+- **Screen black: the CPU never touches the `$F40000` VRAM aperture** (where
+  video init writes), so video never initializes.
+- Impractical to run to completion on the slow Windows sim (~2.5 s/frame; still
+  in the march at frame 600). **Yellow flag:** `@addr` reaches `$BA6CAC`, *above*
+  the `$9FFFFF` top of the 2 MB motherboard RAM — the march may not be
+  terminating cleanly.
+
+### Two hypotheses (next session decides which)
+
+**(A) Legit ~2 MB RAM+HMMU test, just too slow in the sim.** The `$4x`-prefixed
+addresses are the deliberate HMMU-truncation test; on real HW it is ms. A faster
+sim / FPGA boots right through. *Leading hypothesis.*
+
+**(B) Real RAM mis-sizing / decode bug** that walks past 2 MB and never ends:
+- **RAM mirror mismatch:** `addrController_top.v` mirrors the 2 MB motherboard
+  (`mb_mirror_offset = (cpu_word - simm_words) mod 2MB`). If it does not match
+  the V8 exactly, the ROM sizes RAM wrong. Compare to MAME `v8.cpp ram_size()`.
+- **Unmapped value:** `f9fbf56` returns **`$FFFF`** for unmapped reads; **MAME
+  returns `$0000`**. The march is an XOR read-back (`movel (a2)+,d2; eorl d2,(a2)`);
+  `$FFFF` vs `$0000` can change whether a region "passes."
+  (`dataController_top.sv`, `selectUnmapped ? 16'hFFFF`.)
+
+### Next steps (GOAL: video) — MAME ground truth + faster sim
+1. Run MAME `maclc` (driver `src/mame/apple/maclc.cpp`, V8 `v8.cpp`): confirm it
+   reaches video, what RAM size it detects, and where/when video init writes the
+   framebuffer. **Diff `v8.cpp ram_size()` mirror + unmapped behavior vs our
+   `addrController_top.v`** — decisive for hypothesis (B).
+2. Run the HC05 sim longer on a faster box (3000+ frames): does the march
+   terminate (PC leaves `$A468xx`)? Does it ever write `$F40000`
+   (`grep -oE '@00F[4-9AB]' cpu_trace.log`)? Screenshots?
+3. Test (B): flip `selectUnmapped` to `16'h0000` (match MAME), rerun. Fix any
+   `addrController` mirror divergence.
+4. If it reaches video init but stays black -> framebuffer/V8 bug: verify CPU
+   writes (`$F40000-$FBFFFF`) and V8 reads both hit SDRAM word `$580000`
+   (`addrController_top.v:170-176`), and `video_mode`/`monitor_id` (default
+   512x384, 4 bpp) match what the ROM programs.
+
+### Video / VRAM map (reference)
+- No dedicated VRAM. 512 KB aperture at CPU `$F40000-$FBFFFF` -> SDRAM word
+  `$580000`. V8 read path: `maclc_v8_video.sv` (`VRAM_BASE=0`); mapped in
+  `addrController_top.v:170-189`. Default `monitor_id=2` (512x384),
+  `video_mode=2` (4 bpp) -> ~96 KB framebuffer used.
+- RAM: sim is **2 MB** (`verilator/sim.v:188 configRAMSize=8'h24`); motherboard
+  `$800000-$9FFFFF`, no SIMM.
+- Egret debug: `+define+EGRET_SRDEBUG=1` (Makefile, commented) prints HC05 PC +
+  BYTEACK/TIP/TREQ. Do NOT enable `VERBOSE_TRACE` for normal runs (floods).
+
+> **Caveat for the older entries below:** the STM / SCC "All Sent" / AppleTalk
+> diagnoses were made when the boot was stuck *much earlier* (in the overlay /
+> Egret handshake). With the Egret fix the boot now runs far past that point, so
+> re-validate any of those findings against the current (post-`6cfde0a`) boot
+> before acting on them.
+
+## 2026-04-15 Session — Apple STM identified; SCC TX "All Sent" is the real blocker
+
+**Headline:** the outer loop at `A498EC/A49FCA` is **Apple's Self-Test Monitor
+(STM) serial debug console** (Scott Smyers, "STM Version 2.0"), not a
+LocalTalk/LLAP driver as previously thought. It is entered *unconditionally*
+on every boot via `A48D5C: braw 0xa498a0`. The inner hang at `A49F0E` is an
+SCC channel-A "All Sent" (RR1 bit 0) poll that never reads 1 — the same bug
+fires whether we reach STM fast (bit-0 cleared) or slow (via the full POST
+path).
+
+### STM entry map
+
+Three `braw 0xa498a0` entries exist:
+
+| Source | Gate | Notes |
+|--------|------|-------|
+| `A48D04` | `btst #26,d7` at A48CEC — fall-through when bit26 clear | "RAM-test STM" path |
+| `A48D5C` | **unconditional** | Reached via normal boot chain at A48D3C→A49F78→(return)→A48D44 |
+| `A48D92` | `btst #26,d7` at A48D76 — taken when bit26 set | Alternate path |
+
+The "normal-boot-enters-STM" fact (A48D5C) was the surprise: on a real Mac LC,
+STM is always entered briefly during POST. It exits via one of:
+- An explicit `'S'` serial command (handler at `A49A72` clears d7 bits 16/22)
+- The `0xAAAA5555` magic startup vector at `(A0@(4))+0..3` at `A48D1E`
+- Never — STM otherwise polls forever
+
+There is **no timeout counter** to hunt. `A49F9E` (previously suspected as a
+timeout) is actually a VIA1-timer2-driven *prompt rate limiter* keyed off
+`btst #5, a2@(0x1A00)` (IFR bit 5).
+
+### STM command table (decoded from `A49948`)
+
+Entries are `[word1:flags+char][word2:offset]`; handler = `A49948 + slot + 2 + offset`:
+
+| Char | Handler | Likely meaning |
+|------|---------|----------------|
+| 'S' 0x53 | A49A72 | Stop — clears d7[16] and d7[22] |
+| 'L' 0x4C | A49A82 | Load |
+| 'B' 0x42 | A49AA2 | Branch/word load |
+| 'D' 0x44 | A49AC0 | Display/deposit |
+| 'C' 0x43 | A49AE4 | Checksum |
+| 'G' 0x47 | A49B0A | Go (execute) |
+| '0'-'7'  | A49B24+ | Register set (A0, A1, CACR etc) |
+| 'A','H','R','M','E','I','P','T','N','V','Z' | … | Various |
+
+### Why changing VIA1 PA bit 0 doesn't help
+
+`ROM A46452: btst #0, a2@(0x1E00)` reads VIA1 ORA-no-handshake bit 0.
+- Bit 0 = **1** (our `via_pa_i = 0x55`) → branch past `bset #26,d7` → d7[26] stays
+  clear → `A48CEC bnes` falls through → STM entered via `A48D04`.
+- Bit 0 = **0** → `bset #26,d7` runs → d7[26] set → `A48CEC` branches to A48D08
+  (normal POST path) → POST runs → ... → **`A48D5C` unconditionally enters STM
+  anyway**.
+
+Both paths land in STM and hit the same `A49F0E` hang. Bit 0 only changes
+*how quickly* we arrive. We reverted `via_pa_i` to `0x55` to preserve the
+longer POST path.
+
+### The real blocker at A49F0E
+
+```
+a49ef6: moveb #48, a3@(2,d3:l)   ; WR0 = 0x30 (error reset cmd)
+a49efc: moveb d0, a3@(6,d3:l)    ; write byte to SCC ch A data
+a49f00: movew #1, d0
+a49f04: moveb d0, a3@(2,d3:l)    ; WR0 = 0x01 (point to RR1)
+a49f08: btst #0, a3@(2)           ; read RR1 bit 0 = All Sent
+a49f0e: beqs a49f00                ; loop until drain
+a49f10: jmp fp@
+```
+
+The byte *does* transmit (external SERIAL_RX sees it) yet `~tx_busy_a` is
+never observed as 1 by the CPU's poll. Possible causes to investigate next:
+1. `tx_busy_a` actually stays high (txuart bug, clock gating, wrong baud)
+2. `rindex_a` reset races the read so ctl read returns `rr0_a` instead of
+   `rr1_a` (rr0_a bit 0 = rx-available, which stays 0 in async-out mode)
+3. `tx_buffer_full_a` sticks high, causing perpetual re-arm of TX
+
+### Next-session starting points
+
+- Enable `SCC_TX_DEBUG` in `verilator/Makefile` and rerun — the
+  `SCC_TX_BUSY: ch=A 1->0` transitions will show whether `tx_busy_a` is
+  clearing at all.
+- Instrument `rindex_latch` at the `A49F08` ctl read to confirm we return
+  `rr1_a` and not `rr0_a`. The existing `SCC_CTRL_READ` trace line does
+  this but it's not enabled without `DEBUG_SCC`.
+- If `tx_busy_a` does drop to 0, check the time between it dropping and
+  the CPU's next `btst` — the CPU runs ~every ~50ns, TX takes ~1ms at
+  9600 baud, so the CPU should observe at least one 0 reading per byte.
+
+---
+
+## 2026-04-14 Session — SCC WR0 State-Machine Fix
+
+Goal: continue investigating the `0xA49F0E` hang. Prior session had narrowed
+it down to a question of whether the `beq` was being taken or whether A6 had
+been corrupted.
+
+### Root cause found: SCC WR0 pointer writes clobbered register state
+
+In `rtl/scc.v`, the WR0 dispatch had a bug: whenever state was `READY` and a
+write came in (interpreted as a pointer-set), the state machine
+**unconditionally** transitioned to `REGISTER`, even when the new pointer
+was 0. On a real Z8530, writes to WR0 are *always* commands — the pointer
+"persisting" at 0 is meaningless because WR0 accesses never consume the
+pointer.
+
+The symptom: the ROM's SCC init issues sequences like `$30` (a WR0 command
+with data[2:0]=0) followed by `$01` (select RR1 / WR1). Our state machine
+treated `$30` as "set pointer to 0, enter REGISTER state", then treated the
+subsequent `$01` as a **WR0 data write** instead of another WR0 command.
+The RR1 pointer was never selected, so polling RR1 bit 0 ("All Sent") always
+read `rr0_a` instead of `rr1_a`, and the driver never saw TX completion.
+
+### Fix
+
+Only transition to `REGISTER` state when the newly-written pointer would be
+non-zero (`wdata[2:0] != 0 || wdata[5:3] == 3'b001`). If the pointer stays at
+0, remain in `READY` so the next WR0 access is still interpreted as a
+command. Applied to both channel A (lines ~333-350) and channel B
+(lines ~359-378).
+
+### Boot progress after fix
+
+Previously: CPU stuck at `0xA49F00` from frame 356 with no forward progress.
+
+Now, per `verilator/sim_err.log` over ~340M cycles:
+
+- CPU runs productive code across `A46xxx`, `A470xx`, `A471xx`, `A4A4xx`
+  ROM regions.
+- Loopback self-test **passes**: `SCC_LOOPBACK` ENABLED @131M ns, DISABLED
+  @303M ns (driver accepts the result and moves on).
+- SCC channel A transmits two bytes externally: `SERIAL_RX: 0xE0` then
+  `'*' (0x2A)`. These are real bytes flowing out of the Mac's SCC ch A TX
+  pin — the AppleTalk sync byte `$2A` among them.
+- Cycle 310M onwards: CPU returns to `A49F00`/`A49F0E` (`67F0 = beq -16`).
+
+### The new hang: same PC, different context
+
+The `A49F00` loop is the same ROM code, but this invocation is *after*
+loopback has been turned off. Commit `a89c671` ("Fix pseudovia A0 routing,
+unify IER, re-enable SCC loopback") deliberately suppresses RX after
+loopback-off via `post_loopback_a`, modelling an unplugged LocalTalk bus:
+
+```verilog
+if (rx_wr_a && !post_loopback_a) begin   // rtl/scc.v:241
+...
+post_loopback_a ? 1'b0 : (rx_queue_pos_a > 0)  // RR0 bit 0 — rtl/scc.v:844
+```
+
+So the driver writes `$01` to SCC TX, polls RR0 bit 0 for RX Char Available,
+sees 0 forever, and loops. This is the correct "no cable" behaviour of the
+RTL — the bug is that whatever retry/backoff timer the driver uses in the
+*outer* LLAP state machine isn't advancing within the ~30-frame observation
+window.
+
+### Status: partial progress, commit the fix
+
+The WR0 state-machine fix is strictly an improvement — boot went from
+"stuck at `A49F00` forever" to "completes loopback self-test, transmits
+serial bytes, then stalls waiting for a response that will never come". The
+remaining hang is a higher-level LocalTalk/LLAP issue that two deferred
+plans already cover:
+
+1. **Find the loop's memory-based timeout counter.** Per prior session
+   notes (line 266-268 below), the outer `A498EC`/`A49FCA` state machine
+   likely decrements an A2/A6-relative counter that we haven't identified.
+   Lower blast radius.
+2. **Implement SDLC + DPLL** (`docs/plan_040726.md`). Architecturally
+   correct — with real SDLC framing the driver's higher-level retry logic
+   would fire. Larger commitment; defer until #1 is ruled out.
+
+The SCC fix is committed ahead of both of these so future sessions start
+from a cleaner baseline.
+
+---
+
 ## 2026-04-08 Session — ROM Patch Experiments
 
 Goal: force-disable the LocalTalk/atlk path at the ROM level since

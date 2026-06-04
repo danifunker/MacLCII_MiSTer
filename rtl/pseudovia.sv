@@ -39,7 +39,14 @@ module pseudovia(
     output reg [7:0] video_config,
 
     // RAM config output (active value, writable by ROM)
-    output [7:0] ram_config_out
+    output [7:0] ram_config_out,
+
+    // Candidate B: set on the ROM's first write to the V8 RAM-config register.
+    // Mirrors MAME v8.cpp: the $0 motherboard-low mirror is installed only once
+    // the ROM programs the config (via2_config_w -> ram_size(data)). Before that,
+    // the overlay-clear map is ram_size(0xc0) == only $800000-$9FFFFF, so the
+    // boot RAM-bank probe never finds a (phantom) bank at $0.
+    output reg ram_configured
 );
 
 // RAM config output: expose current value for address controller
@@ -54,24 +61,29 @@ reg [7:0] ifr;          // Interrupt flag register
 reg [7:0] slot_ier;     // Slot interrupt enable register
 reg [7:0] ier;          // IER (shared between native $13 and compat reg 14, per MAME RBV)
 
-// Slot interrupt status - active LOW
+// Slot interrupt status - active LOW (matches MAME m_pseudovia_regs[2]).
 // Bit 6: VBlank (active low = VBlank is happening)
 // Bit 5: Slot IRQ
-// Bit 4: ASC IRQ
-// Bits 3: Slot 0 IRQ
-wire [7:0] slot_status = {1'b0, ~vblank_irq, ~slot_irq, ~asc_irq, 3'b111, 1'b1};
+// Bits 4,3: other slot sources (unused here, held inactive = 1)
+// NOTE: ASC is NOT a slot source. In MAME the ASC interrupt is IFR bit 4
+// (set by asc_irq_w), gated by the main IER ($13) — NOT by the slot IER ($12).
+// Folding asc into slot_status[4] here made it fire a spurious level-2 IRQ
+// (gated only by slot_ier=$7f) that preempted the level-1 VIA1 timer the
+// boot POST's interrupt-timing self-test relies on.
+wire [7:0] slot_status = {1'b0, ~vblank_irq, ~slot_irq, 1'b1, 3'b111, 1'b1};
 
-// IRQ recalculation
+// Slot/VBL summary, gated by the slot IER ($12) -> IFR bit 1 (any slot).
 wire [7:0] slot_irqs = (~slot_status) & 8'h78;  // Check bits 3-6 (slots + vblank)
 wire [7:0] slot_irqs_masked = slot_irqs & (slot_ier & 8'h78);
 wire any_slot_irq = |slot_irqs_masked;
 
-// Per MAME pseudovia.cpp: non-AIV3 uses m_pseudovia_ier for IRQ masking.
-// However, the Mac LC ROM only writes to slot_ier (native $12) and never
-// sets the compat IER. Use any_slot_irq directly — slot_ier already gates
-// individual slot/VBL sources, so this is equivalent for our use case.
-wire [7:0] active_ifr = ifr & 8'h1B;
-wire irq_pending = any_slot_irq;
+// Live IFR source bits, mirroring MAME pseudovia_recalc_irqs():
+//   bit4 = ASC, bit3 = slot, bit1 = any-slot summary; others keep stored value.
+wire [7:0] ifr_live = { ifr[7], ifr[6], ifr[5], asc_irq, slot_irq, ifr[2], any_slot_irq, ifr[0] };
+
+// MAME: IRQ asserts when (IFR & IER[$13] & 0x1B) != 0. The main IER ($13)
+// gates the final interrupt; the slot IER ($12) only gates the slot summary.
+wire irq_pending = |(ifr_live & ier & 8'h1B);
 
 // Debug counter
 integer pvia_reg10_reads = 0;
@@ -91,6 +103,7 @@ always @(posedge clk_sys) begin
     if (reset) begin
         port_b <= 8'h00;
         ram_cfg <= ram_config;  // Init from hardware config (MAME: ram_size(0xC0))
+        ram_configured <= 1'b0; // $0 mirror disabled until ROM programs config
         ifr <= 8'h00;
         slot_ier <= 8'h00;
         ier <= 8'h00;
@@ -102,6 +115,25 @@ always @(posedge clk_sys) begin
             ifr[1] <= 1'b1;
         else
             ifr[1] <= 1'b0;
+
+        // Per-source IFR bits — match MAME pseudovia.cpp asc_irq_w / slot_irq_w
+        // pattern (set when source asserts, clear when source deasserts).
+        // MAME's recalc reads `regs[3] & regs[0x13] & 0x1B` — mask 0x1B
+        // includes bit 4 (ASC), bit 3 (slot), bit 1 (any slot), bit 0. So
+        // these per-source bits matter for the boot ROM's IRQ-source decode.
+        // Previously only bit 1 (summary) was set; the ROM could see "an
+        // IRQ fired" but couldn't tell WHICH source, and any handler that
+        // dispatched off IFR[4] / IFR[3] saw 0 and fell through to a wrong
+        // path.
+        if (asc_irq)
+            ifr[4] <= 1'b1;
+        else
+            ifr[4] <= 1'b0;
+
+        if (slot_irq)
+            ifr[3] <= 1'b1;
+        else
+            ifr[3] <= 1'b0;
 
         // Update IRQ output
         if (irq_pending) begin
@@ -126,6 +158,7 @@ always @(posedge clk_sys) begin
 
                         3'b001: begin  // $01: RAM Config (writable per MAME)
                             ram_cfg <= data_in;
+                            ram_configured <= 1'b1;  // enables $0 motherboard mirror
                             `ifdef VERBOSE_TRACE
                             $display("PVIA: WRITE RAM Config = %02x @%0t", data_in, $time);
                             `endif
@@ -138,13 +171,16 @@ always @(posedge clk_sys) begin
                             `endif
                         end
 
-                        3'b011: begin  // $03: IFR
-                            if (data_in[7])
-                                ifr <= ifr | (data_in & 8'h7F);
-                            else
-                                ifr <= ifr & ~(data_in & 8'h7F);
+                        3'b011: begin  // $03: IFR - write-1-to-clear (per MAME pseudovia.cpp:269)
+                            // MAME does unconditional `regs[3] &= ~(data & 0x7F)` — i.e.
+                            // writing 1 to a bit ACKs/clears that bit, writing 0 leaves it.
+                            // Our previous code conditioned on data_in[7]: writing $82 was
+                            // SETTING bit 1 instead of clearing it, so any ROM ack with the
+                            // 6522-style "1 bits clear" convention would re-arm the IRQ on
+                            // every write and the CPU would loop in the ISR.
+                            ifr <= ifr & ~(data_in & 8'h7F);
                             `ifdef VERBOSE_TRACE
-                            $display("PVIA: WRITE IFR = %02x @%0t", data_in, $time);
+                            $display("PVIA: WRITE IFR ACK %02x (clearing bits) @%0t", data_in & 8'h7F, $time);
                             `endif
                         end
 
@@ -247,9 +283,15 @@ always @(posedge clk_sys) begin
                 // Per MAME: only registers 13 (IFR) and 14 (IER) are meaningful
                 if (we) begin
                     case (compat_reg)
-                        4'd13: begin  // IFR (write just triggers recalc, per MAME)
+                        4'd13: begin  // IFR - write-1-to-clear (per MAME pseudovia.cpp:269)
+                            // Compat IFR write must mirror native IFR write semantics: the
+                            // 6522-aliased path is the SAME register inside MAME, so the ACK
+                            // behavior is identical. Previous code dropped the write entirely
+                            // (just $display) which meant the ROM's compat-mode IRQ ack was
+                            // a no-op and the IFR bit stayed set.
+                            ifr <= ifr & ~(data_in & 8'h7F);
                             `ifdef VERBOSE_TRACE
-                            $display("PVIA COMPAT: WRITE IFR = %02x @%0t", data_in, $time);
+                            $display("PVIA COMPAT: WRITE IFR ACK %02x @%0t", data_in & 8'h7F, $time);
                             `endif
                         end
                         4'd14: begin  // IER (standard VIA set/clear behavior)

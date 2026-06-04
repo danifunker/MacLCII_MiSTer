@@ -81,6 +81,8 @@ module emu
 	output [15:0] debug_cpuDataOut,   // Data from peripherals to CPU
 	output        debug_cpuRW,        // 1=read, 0=write
 	output        debug_cpuBusControl,
+	output        debug_cpu_as,       // _cpuAS (0 = address strobe asserted)
+	output        debug_cpu_dtack,    // _cpuDTACK (0 = acknowledged)
 
 	// Serial port (SCC Channel A)
 	output        serial_txd,       // SCC Channel A TX output (for sim-side RX)
@@ -159,7 +161,8 @@ module emu
 
 	///////////////////////////////////////////////////
 
-	assign CE_PIXEL  = 1;
+	wire v8_ce_pix;
+	assign CE_PIXEL  = v8_ce_pix;  // real pixel-clock enable (was hardwired 1 -> doubled every pixel)
 
 	// Video Output - Mac LC V8 video system
 	assign VGA_R  = v8_vga_r;
@@ -187,6 +190,7 @@ module emu
 	// Mac LC memory configuration
 	wire [7:0] configRAMSize = 8'h24; // 2MB: no SIMM, 2MB board only
 	wire [7:0] pvia_ram_config_out;   // Active RAM config from pseudovia
+	wire       pvia_ram_configured;   // ROM has programmed V8 config ($0 mirror enable)
 
 	// Serial Ports - connect SCC Channel A to sim via serial_txd/serial_rxd ports
 	wire serialOut;              // SCC Channel A TX (driven by SCC)
@@ -255,12 +259,36 @@ module emu
 		else begin
 			cpuBusControl_d <= cpuBusControl;
 			if (_cpuAS) dtack_en <= 0;
-			if (!_cpuAS & ((!cpuBusControl_d & cpuBusControl) | (!selectROM & !selectRAM))) dtack_en <= 1;
+			// VRAM is SDRAM-backed and reads via the same cpu-slot as RAM,
+			// so it must take the slot-aligned DTACK path (cpuBusControl rising
+			// edge), NOT the immediate !ROM&!RAM peripheral path. Excluding
+			// selectVRAM here stops DTACK asserting before the SDRAM cpu-slot
+			// commits the read/write (was truncating longword writes / sampling
+			// stale data on the old VPA routing).
+			if (!_cpuAS & ((!cpuBusControl_d & cpuBusControl) | (!selectROM & !selectRAM & !selectVRAM))) dtack_en <= 1;
 		end
 	end
 
-	assign      _cpuVPA = (cpuFC == 3'b111) ? 1'b0 : ~(!_cpuAS && cpuAddr[23:21] == 3'b111);
-	assign      _cpuDTACK = ~(!_cpuAS && cpuAddr[23:21] != 3'b111) | !dtack_en;
+	// VRAM ($F40000-$FBFFFF, cpuAddr[23:21]==111) must use async DTACK like RAM,
+	// not the 6800 E-clock VPA peripheral path — the VPA path samples on a fixed
+	// E-phase that misses the SDRAM cpu-slot and returns stale data, mis-sizing
+	// the video bank and leaving the screen black.
+	// FC=7 is the 68k CPU space. cpuAddr[19:16] is the CPU-space cycle-type field:
+	//   $F = interrupt acknowledge  -> autovector via VPA (Mac autovectored IRQs)
+	//   else ($0 breakpoint, $2 coprocessor, ...) = no responder -> bus error.
+	// The boot ROM probes for hardware with `moves.w $22000,D1` (SFC=7), an access
+	// that MUST bus-error; asserting VPA there wrongly completes the probe and
+	// corrupts the machine-config word, routing boot into the STM serial
+	// diagnostic instead of the desktop. See memory: stm-root-cause-moves-berr.
+	wire        fc7_iack = (cpuFC == 3'b111) && (cpuAddr[19:16] == 4'hF);
+	// FC=7 non-IACK = CPU space with no responder (breakpoint/coprocessor/probe).
+	// It MUST bus-error: suppress BOTH VPA and DTACK so no responder completes the
+	// cycle, regardless of the (possibly garbage) address the EA computed. The boot
+	// ROM's `moves.w $22000,D1` (SFC=7) relies on this fault; if VPA/DTACK answer it
+	// the probe completes inline and boot diverts into the STM serial diagnostic.
+	wire        fc7_berr = (cpuFC == 3'b111) && !fc7_iack;
+	assign      _cpuVPA = fc7_iack ? 1'b0 : (fc7_berr ? 1'b1 : ~(!_cpuAS && cpuAddr[23:21] == 3'b111 && !selectVRAM));
+	assign      _cpuDTACK = fc7_berr ? 1'b1 : (~(!_cpuAS && (cpuAddr[23:21] != 3'b111 || selectVRAM)) | !dtack_en);
 	wire        cpu_en_p      = clk16_en_p;
 	wire        cpu_en_n      = clk16_en_n;
 	assign      _cpuReset_o   = tg68_reset_n;
@@ -295,14 +323,17 @@ module emu
 	// BERR: autovector path only for now. Unmapped-BERR disabled — see
 	// docs/plan_040526.md: enabling it regresses boot because the CPU
 	// emits high-bit addresses ($50xxxxxx etc.) early in ROM execution.
-	wire cpu_berr = (cpuFC == 3'b111);
+	// Bus-error CPU-space (FC=7) accesses that are NOT interrupt acknowledges:
+	// the boot ROM's hardware-presence probes (`moves` to CPU space) which a real
+	// 68030 faults because nothing decodes the cycle.
+	wire cpu_berr = fc7_berr && !_cpuAS;
 `ifdef SIMULATION
 	reg _cpuAS_d;
 	always @(posedge clk_sys) _cpuAS_d <= _cpuAS;
 	always @(posedge clk_sys) begin
+`ifdef VERBOSE_TRACE
 		if (_cpuAS_d && !_cpuAS && cpuBusControl && selectUnmapped)
 			$display("[F%0d] BERR_UNMAPPED: addr=%h fc=%b rw=%b", sim_frame_count, cpuAddr, cpuFC, _cpuRW);
-`ifdef VERBOSE_TRACE
 		if (_cpuAS_d && !_cpuAS && |cpuAddrFullHi)
 			$display("[F%0d] HIGH_ADDR: hi=%h addr=%h fc=%b rw=%b", sim_frame_count, cpuAddrFullHi, cpuAddr, cpuFC, _cpuRW);
 `endif
@@ -336,7 +367,7 @@ module emu
 		.bgack_n    ( 1'b1 ),
 
 		.ipl        ( _cpuIPL ),
-		.berr       ( 1'b0 ),
+		.berr       ( cpu_berr ),
 		.din        ( dataControllerDataOut ),
 		.dout       ( tg68_dout ),
 		.addr       ( tg68_a ),
@@ -421,6 +452,8 @@ module emu
 		._cpuRW(_cpuRW),
 		._cpuAS(_cpuAS),
 		.ram_config(pvia_ram_config_out),
+		.ram_config_phys(configRAMSize),
+		.ram_configured(pvia_ram_configured),
 		.memoryAddr(memoryAddr),
 		.memoryLatch(memoryLatch),
 		._memoryUDS(_memoryUDS),
@@ -466,7 +499,8 @@ module emu
 	// Use actual video mode from pseudovia (ROM configures this via register 0x10)
 	wire [2:0] v8_video_mode = pvia_video_config[2:0];
 
-	// Monitor ID Selection - 13" RGB
+	// Monitor ID Selection - 640x480 VGA (default, matches MacLC.sv default and
+	// MAME's V8 screen). 512x384 is OSD-selectable on FPGA; sim uses the default.
 	wire [3:0] v8_monitor_id = 4'h6;
 
 	ariel_ramdac ariel(
@@ -487,10 +521,17 @@ module emu
 
 	// Debug: disabled for now
 
+	// Pseudovia register select is byte-granular and needs A0, which the 16-bit bus
+	// drops (cpuAddr[0] is forced 0). Use the real A0 from the CPU (tg68_a[0]) for the
+	// register LSB, matching MacLC.sv. Without it, odd registers alias to the even one
+	// below — notably the V8 RAM-config reg $01 (which enables the $0 motherboard
+	// mirror) aliases to reg $00 (port_b), so ram_configured never sets and the boot's
+	// relocation trampoline reads a non-mirrored $0 stack -> garbage. (sim-only bug;
+	// MacLC.sv already used tg68_a[0] here.)
 	pseudovia pvia(
 		.clk_sys(clk_sys),
 		.reset(~n_reset),
-		.addr(cpuAddr[12:0]),
+		.addr({cpuAddr[12:1], tg68_a[0]}),
 		.data_in(cpuDataOut[7:0]),
 		.data_out(pseudovia_dout),
 		.we(selectPseudoVIA && !_cpuRW && cpuBusControl),
@@ -502,7 +543,8 @@ module emu
 		.ram_config(configRAMSize),
 		.monitor_id(v8_monitor_id),
 		.video_config(pvia_video_config),
-		.ram_config_out(pvia_ram_config_out)
+		.ram_config_out(pvia_ram_config_out),
+		.ram_configured(pvia_ram_configured)
 	);
 
 	// ASC sample outputs (Commit C will route to AUDIO_L/R)
@@ -544,7 +586,7 @@ module emu
 		.vga_g(v8_vga_g),
 		.vga_b(v8_vga_b),
 		.de(v8_de),
-		.ce_pix(),  // Not used in sim
+		.ce_pix(v8_ce_pix),  // drives CE_PIXEL so the sim samples one pixel per real pixel-clock
 
 		.palette_addr(ariel_pixel_addr),
 		.palette_data(ariel_palette_data)
@@ -785,5 +827,7 @@ module emu
 	assign debug_cpuDataOut = dataControllerDataOut;  // Peripherals send this to CPU
 	assign debug_cpuRW = _cpuRW;  // 1=read, 0=write
 	assign debug_cpuBusControl = cpuBusControl;
+	assign debug_cpu_as = _cpuAS;
+	assign debug_cpu_dtack = _cpuDTACK;
 
 endmodule

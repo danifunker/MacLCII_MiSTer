@@ -63,7 +63,7 @@ module swim
 	input _reset,
 	input selectSWIM,
 	input _cpuRW,
-	input _cpuLDS,
+	input _cpuUDS,  // LC V8 maps the SWIM on the UPPER byte (even addresses), not LDS like Mac Plus
 	input [15:0] dataIn,
 	input [3:0] cpuAddrRegHi,
 	input SEL, // from VIA
@@ -86,7 +86,8 @@ module swim
 
 	wire [7:0] dataInLo = dataIn[7:0];
 	reg [7:0] dataOutLo;
-	assign dataOut = { 8'hBE, dataOutLo };
+	// LC V8 reads the SWIM on the upper byte (D15-D8); lower byte is don't-care.
+	assign dataOut = { dataOutLo, 8'hBE };
 
 	// ================================================================
 	// ISM mode state
@@ -228,7 +229,7 @@ module swim
 		q6Next <= q6;
 		q7Next <= q7;
 
-		if (!ism_mode && selectSWIM == 1'b1 && _cpuLDS == 1'b0) begin
+		if (!ism_mode && selectSWIM == 1'b1 && _cpuUDS == 1'b0) begin
 			case (cpuAddrRegHi[3:1])
 				3'h0: // ca0
 					ca0Next <= cpuAddrRegHi[0];
@@ -357,7 +358,7 @@ module swim
 			q6 <= q6Next;
 			q7 <= q7Next;
 
-			if (_cpuRW == 0 && selectSWIM == 1'b1 && _cpuLDS == 1'b0) begin
+			if (_cpuRW == 0 && selectSWIM == 1'b1 && _cpuUDS == 1'b0) begin
 				if (ism_mode) begin
 					// ============================================
 					// ISM mode writes
@@ -480,7 +481,7 @@ module swim
 			end
 
 			// ISM mode: clear error register on read
-			if (ism_mode && _cpuRW == 1 && selectSWIM == 1'b1 && _cpuLDS == 1'b0) begin
+			if (ism_mode && _cpuRW == 1 && selectSWIM == 1'b1 && _cpuUDS == 1'b0) begin
 				if (ism_reg_addr == 3'h2) begin
 					ism_error <= 0;
 				end
@@ -503,7 +504,7 @@ module swim
 	// ================================================================
 	// IWM read data latch (unchanged from original)
 	// ================================================================
-	wire iwmRead = (_cpuRW == 1'b1 && selectSWIM == 1'b1 && _cpuLDS == 1'b0 && !ism_mode);
+	wire iwmRead = (_cpuRW == 1'b1 && selectSWIM == 1'b1 && _cpuUDS == 1'b0 && !ism_mode);
 	reg [3:0] readLatchClearTimer;
 	always @(posedge clk or negedge _reset) begin
 		if (_reset == 1'b0) begin

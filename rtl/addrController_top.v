@@ -8,7 +8,10 @@ module addrController_top(
 	output clk16_en_n,
 
 	// system config:
-	input [7:0] ram_config,  // V8 RAM config byte from pseudovia
+	input [7:0] ram_config,       // V8 RAM config byte WRITTEN by ROM (pseudovia reg $01)
+	input [7:0] ram_config_phys,  // PHYSICAL hardware RAM config (configRAMSize) — never
+	                              // changes; gives the real installed SIMM size.
+	input       ram_configured,  // 1 once ROM programs V8 config (enables $0 mirror)
 
 	// 68000 CPU memory interface:
 	input _cpuReset,
@@ -17,6 +20,17 @@ module addrController_top(
 	input _cpuLDS,
 	input _cpuRW,
 	input _cpuAS,
+	// Function code: FC[1]=1 distinguishes program access (FC=2/6) from
+	// data access (FC=1/5). We gate overlay-disable on it so an incidental
+	// data read of $A0xxxxx (e.g. TG68-driven access to $ABC146 before the
+	// boot ROM is ready to leave the overlay mirror) doesn't prematurely
+	// clear overlay and crash the CPU through zero-RAM.
+	// Note: this is STRICTER than MAME (which clears on any non-debugger
+	// read), but MAME's behavior caused us to wild-execute through RAM=0
+	// (build 20260601_073828 confirmed: overlay-trigger=$ABC146 → opcode
+	// $0000 wild branch). The FC[1] gate is the empirically-correct fit
+	// for our TG68 + SDRAM stack even though it diverges from MAME.
+	input [2:0] cpuFC,
 
 	// RAM/ROM:
 	output [22:0] memoryAddr,  // 23-bit SDRAM word address
@@ -129,12 +143,22 @@ module addrController_top(
 	//   $700000-$7FFFFF  Floppy disk image 2 (2MB)
 	// ============================================================
 
-	// Decode SIMM size from ram_config[7:6] (byte size)
-	wire [22:0] simm_byte_size = (ram_config[7:6] == 2'b00) ? 23'h000000 :  // 0MB
-	                              (ram_config[7:6] == 2'b01) ? 23'h200000 :  // 2MB
-	                              (ram_config[7:6] == 2'b10) ? 23'h400000 :  // 4MB
-	                                                           23'h800000;   // 8MB
-	wire [21:0] simm_word_size = simm_byte_size[22:1];
+	// Decode SIMM size from the PHYSICAL config, NOT the ROM-written register.
+	// MAME sizes the SIMM from m_ram_size (physical), and only the install ENABLE
+	// / motherboard placement use the writable config register. For a 2MB machine
+	// (configRAMSize=$24, bits[7:6]=00) there is NO SIMM, so $0 must never route to
+	// the SIMM SDRAM region — it stays a true mirror of $800000. Using the written
+	// register here (which transiently becomes $C4 during the ROM's RAM probe)
+	// fabricated a phantom 8MB SIMM at $0, turning $0 into a SEPARATE bank instead
+	// of a $800000 mirror; the boot's bank scan then recorded a phantom $0 entry and
+	// the march clobbered the descriptor table at $9FFFEC.
+	// NOTE: 8MB = $800000 needs bit 23, so this field MUST be 24 bits wide.
+	// A 23-bit field silently truncated $800000 to 0, killing the 8MB/10MB config.
+	wire [23:0] simm_byte_size = (ram_config_phys[7:6] == 2'b00) ? 24'h000000 :  // 0MB
+	                              (ram_config_phys[7:6] == 2'b01) ? 24'h200000 :  // 2MB
+	                              (ram_config_phys[7:6] == 2'b10) ? 24'h400000 :  // 4MB
+	                                                                24'h800000;   // 8MB
+	wire [22:0] simm_word_size = simm_byte_size[23:1];
 
 	// CPU address classification for RAM
 	wire motherboard_high = (cpuAddr[23:21] == 3'b100);  // $800000-$9FFFFF
@@ -144,7 +168,8 @@ module addrController_top(
 	wire [21:0] cpu_word = cpuAddr[22:1];
 
 	// Motherboard mirror offset: (cpu_word - simm_words) mod 2MB
-	wire [21:0] mb_mirror_offset_raw = cpu_word - simm_word_size;
+	// (dead when the SIMM fills the whole lower bank, e.g. 8MB, but kept width-clean)
+	wire [22:0] mb_mirror_offset_raw = {1'b0, cpu_word} - simm_word_size;
 	wire [19:0] mb_mirror_offset = mb_mirror_offset_raw[19:0];  // Wrap to 2MB (1M words)
 
 	// V8 RAM translation to SDRAM word address
@@ -200,6 +225,8 @@ module addrController_top(
 		._cpuRW(_cpuRW),
 		.memoryOverlayOn(memoryOverlayOn),
 		.ram_config(ram_config),
+		.ram_config_phys(ram_config_phys),
+		.ram_configured(ram_configured),
 		.selectRAM(selectRAM),
 		.selectROM(selectROM),
 		.selectSCSI(selectSCSI),
@@ -231,6 +258,21 @@ module addrController_top(
 	assign memoryOverlayOn = rom_overlay;
 	assign overlay_trigger_addr = overlay_trigger_addr_r;
 
+	// Overlay disables on first INSTRUCTION FETCH in $A00000-$AFFFFF.
+	// MAME clears overlay on any read (v8.cpp:rom_switch_r), but in our
+	// TG68 + SDRAM stack the boot ROM's data read of $ABC146 happens
+	// while PC is still in the $0xxxxx overlay mirror; if that data
+	// read clears overlay, the next code fetch at $0xxxxx returns RAM=0
+	// and the CPU wild-branches through ORI.B #0,D0. Gating on FC[1]=1
+	// (program access) holds overlay until the boot ROM does its real
+	// JMP-to-ROM, at which point overlay clears safely.
+	// NOTE: do NOT gate on cpuFC[1]. The TG68 presents FC=000 at the clk_sys
+	// posedge where addrController samples _cpuAS low, so a cpuFC[1] gate can
+	// never fire and the overlay never clears (RAM never appears → garbage
+	// RAM descriptor, SP=0, no video). Matches MAME (v8 rom_switch_r clears on
+	// any ROM-region read). The premature-$ABC146 concern that motivated the
+	// gate was a symptom of other bugs (cmp.l flag race, sim/FPGA core split),
+	// now fixed; the first live $A access is legit program exec at $A02E3E.
 	wire overlay_trigger = !_cpuAS && (cpuAddr[23:20] == 4'hA);
 
 	always @(posedge clk) begin

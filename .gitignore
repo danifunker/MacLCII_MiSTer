@@ -43,3 +43,9 @@ cpu_trace.log
 ram_debug.log
 verilator/obj_dir
 verilator/*.png
+
+# analysis scratchpad (Track A/C diffs, sim summaries, screenshots)
+scratch/
+verilator/*.out
+verilator/*.err
+verilator/build*.log

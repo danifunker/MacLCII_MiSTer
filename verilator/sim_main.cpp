@@ -1,4 +1,5 @@
 #include <verilated.h>
+#include <set>
 #include "Vemu.h"
 #include "Vemu__Syms.h"
 
@@ -69,9 +70,15 @@ int multi_step_amount = 1024;
 int cfg_cpuType = 2;       // 68020 mode via TG68K
 int cfg_memSize = 1;       // 0=1MB, 1=4MB
 
+// Verbose bring-up diagnostics (overlay/FC/march/STM/RAMCFG/bus/CPU-trace
+// console spam). Off by default for a quiet console; enable with --verbose/-v.
+bool verbose_diag = false;
+#define DLOG(...) do { if (verbose_diag) fprintf(stderr, __VA_ARGS__); } while (0)
+
 // CPU trace
 // ---------
 bool cpu_trace_enable = false;  // Enable after ROM download
+bool cpu_trace_disabled = false; // --no-cpu-trace: skip per-instruction trace (long runs)
 bool cpu_trace_started = false;  // Wait for ROM load and reset
 FILE* cpu_trace_file = nullptr;
 const char* cpu_trace_filename = "cpu_trace.log";
@@ -166,7 +173,10 @@ const int input_menu = 12;
 #define VGA_SCALE_X vga_scale
 #define VGA_SCALE_Y vga_scale
 SimVideo video(VGA_WIDTH, VGA_HEIGHT, VGA_ROTATE);
-float vga_scale = 1.5;
+// Default 1:1 so the full 640x480 frame fits the video window on a typical
+// display (at 1.5x the 960x720 image + panels overran many screens, clipping
+// the bottom/right edges). Use the Zoom slider to scale up.
+float vga_scale = 1.0;
 
 // Verilog module
 // --------------
@@ -224,6 +234,149 @@ int verilate() {
 			}
 			top->eval();
 			if (clk_sys.clk) { bus.AfterEval(); blockdevice.AfterEval(); }
+
+			// ROM overlay transition logger (one-shot edges)
+			if (clk_sys.clk) {
+				static int prev_ov = -1;
+				int ov = (int)VERTOPINTERN->emu__DOT__ac0__DOT__rom_overlay;
+				if (ov != prev_ov) {
+					DLOG( "[OVERLAY] rom_overlay %d->%d at F%d cyc=%llu\n",
+						prev_ov, ov, video.count_frame, (unsigned long long)main_time);
+					prev_ov = ov;
+				}
+				static int prev_pend = -1, prev_rst = -1;
+				int pend = (int)VERTOPINTERN->emu__DOT__ac0__DOT__overlay_disable_pending;
+				int rst = (int)VERTOPINTERN->emu__DOT___cpuReset;
+				if (pend != prev_pend) { DLOG( "[OVERLAY] pending %d->%d F%d cyc=%llu\n", prev_pend, pend, video.count_frame, (unsigned long long)main_time); prev_pend = pend; }
+				if (rst != prev_rst) { DLOG( "[OVERLAY] _cpuReset %d->%d F%d cyc=%llu\n", prev_rst, rst, video.count_frame, (unsigned long long)main_time); prev_rst = rst; }
+				// FC during $A0xxxx accesses (overlay-clear gate is cpuFC[1])
+				static int fc_logs = 0;
+				uint32_t ca = top->debug_cpuAddr;
+				if ((ca & 0xF00000) == 0xA00000 && fc_logs < 24) {
+					unsigned fc = VERTOPINTERN->emu__DOT__cpuFC;
+					static uint32_t last_ca = 0xFFFFFFFF; static unsigned last_fc = 0xFF;
+					if (ca != last_ca || fc != last_fc) {
+						DLOG( "[FC] $A-access addr=%06X FC=%u (fc1=%u) F%d\n",
+							ca & 0xFFFFFF, fc, (fc>>1)&1, video.count_frame);
+						fc_logs++; last_ca = ca; last_fc = fc;
+					}
+				}
+			}
+
+			// March progress counters — independent of cpu_trace gating.
+			// $A46910 = one full inner-march region pass completed (cmpi.w #21,d7)
+			// $A4694C = march fully done; $A4A590 = bank-scan driver reached.
+			if (VERTOPINTERN->debug_fetch_valid && !*bus.ioctl_download) {
+				static uint32_t march_last_pc = 0xFFFFFFFF;
+				static int hit_910 = 0, hit_694c = 0, hit_a590 = 0;
+				uint32_t mpc = VERTOPINTERN->debug_pc & 0xFFFFFF;
+				if (mpc != march_last_pc) {
+					{   // STM-entry detector: first jump INTO the serial-monitor
+						// region ($A49800-$A49FFF) from outside, with source PC.
+						static int stm_logs = 0;
+						bool in_stm   = (mpc >= 0xA49800 && mpc <= 0xA499FF);
+						bool prev_stm = (march_last_pc >= 0xA49800 && march_last_pc <= 0xA499FF);
+						if (in_stm && !prev_stm && stm_logs < 12) {
+							DLOG( "[STM_ENTRY] -> %06X from %06X F%d\n", mpc, march_last_pc, video.count_frame);
+							stm_logs++;
+						}
+					}
+					{   // fatal-error / diagnostic handler entry ($A48CD0/$A48CDA sets
+						// SP=$2600 + magic $87654321). Capture which error-check branch
+						// fired (march_last_pc) and the registers, to find the failed test.
+						static int en=0;
+						if ((mpc==0xA48CD0 || mpc==0xA48CDA || mpc==0xA4638C || mpc==0xA46200) && en<12) {
+							auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
+							DLOG( "[ERR] ->%06X from %06X F%d D0=%08X D1=%08X D2=%08X D6=%08X D7=%08X\n",
+								mpc, march_last_pc, video.count_frame,
+								(unsigned)rf[0],(unsigned)rf[1],(unsigned)rf[2],(unsigned)rf[6],(unsigned)rf[7]); DLOG("      D4(testmask)=%08X D3=%08X A0=%08X A1=%08X\n",(unsigned)rf[4],(unsigned)rf[3],(unsigned)rf[8],(unsigned)rf[9]); en++;
+						}
+					}
+					{   // MOVES-BERR fix verification: machine-config word D2 (and D5
+						// jump index) at the dispatch $A00AB0. MAME: D2=$CC000D07.
+						static int n=0;
+						if (mpc==0xA00AB0 && n<8) {
+							auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
+							DLOG( "[D2PROBE] $A00AB0 #%d F%d D2=%08X D5=%08X\n",
+								n, video.count_frame, (unsigned)rf[2], (unsigned)rf[5]); n++;
+						}
+					}
+					{   // boot state-machine: log entry into each of MAME's 11 handlers
+						// (+ the STM-subsystem $A48Cxx) to find where our sequence diverges.
+						static const uint32_t H[] = {0xA48468,0xA483FC,0xA47C30,0xA47942,
+							0xA477D2,0xA473F4,0xA4730C,0xA4713E,0xA4703E,0xA46F5A,0xA46EC8};
+						static uint32_t last_h=0; static int st=0;
+						bool ish=false; for (unsigned i=0;i<11;i++) if (mpc==H[i]) ish=true;
+						
+						if (ish && mpc!=last_h && st<300) {
+							DLOG( "[STATE] handler %06X F%d\n", mpc, video.count_frame); st++; last_h=mpc;
+						}
+					}
+					march_last_pc = mpc;
+					if (mpc == 0xA46910) { hit_910++;
+						auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
+						DLOG( "[MARCH] PASS#%d F%d D0=%08X D1=%08X D2=%08X D4=%08X D6=%08X D7=%08X A0=%08X A1=%08X A2=%08X A3=%08X A4=%08X A5=%08X\n",
+							hit_910, video.count_frame,
+							(unsigned)rf[0],(unsigned)rf[1],(unsigned)rf[2],(unsigned)rf[4],
+							(unsigned)rf[6],(unsigned)rf[7],(unsigned)rf[8],(unsigned)rf[9],
+							(unsigned)rf[10],(unsigned)rf[11],(unsigned)rf[12],(unsigned)rf[13]); }
+					else if (mpc == 0xA4694C) { hit_694c++;
+						DLOG( "[MARCH] *** DONE $A4694C hit#%d cyc=%llu F%d ***\n",
+							hit_694c, (unsigned long long)main_time, video.count_frame); }
+					else if (mpc == 0xA4A590) { hit_a590++;
+						if (hit_a590 <= 3) DLOG( "[MARCH] bank-scan $A4A590 hit#%d cyc=%llu F%d\n",
+							hit_a590, (unsigned long long)main_time, video.count_frame); }
+					else if (mpc == 0xA467FE) { static int n=0; if(++n<=8) DLOG( "[PROBE] PASS $A467FE (bank present) #%d F%d\n", n, video.count_frame); }
+					else if (mpc == 0xA467F6) { static int n=0; if(++n<=8) DLOG( "[PROBE] FAIL $A467F6 (bank absent) #%d F%d\n", n, video.count_frame); }
+					else if (mpc == 0xA46584) { static int n=0; if(++n<=12) { // cmpaw #-1,a0 : A0=region start loaded, A5=table base
+						auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
+						DLOG( "[TBL] $A46584 #%d F%d D7=%08X A0(start)=%08X A4=%08X A5(tbl)=%08X SP=%08X\n",
+							n, video.count_frame, (unsigned)rf[7], (unsigned)rf[8], (unsigned)rf[12], (unsigned)rf[13], (unsigned)rf[15]); } }
+					else if (mpc == 0xA4658A) { static int n=0; if(++n<=12) { // movel a4@+,d0 : D0=region length
+						auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
+						DLOG( "[TBL] $A4658A #%d F%d D0(len)=%08X A0=%08X A4=%08X\n",
+							n, video.count_frame, (unsigned)rf[0], (unsigned)rf[8], (unsigned)rf[12]); } }
+					else if (mpc == 0xA4657E) { static int n=0; if(++n<=8) { // moveal sp@,a4 : about to read table ptr from SP
+						auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
+						DLOG( "[TBL] $A4657E #%d F%d (D7=3 RAM-region entry) SP=%08X overlay=%d\n",
+							n, video.count_frame, (unsigned)rf[15],
+							(int)VERTOPINTERN->emu__DOT__ac0__DOT__rom_overlay);
+						// READ-ONLY dump of built descriptor table memory before the march
+						// writes it. CPU $9FFFE0..$9FFFFF -> SDRAM words $0FFFF0..$0FFFFF
+						// (motherboard_high: word = {3'b000, cpuAddr[20:1]}). 68k longwords
+						// are big-endian word pairs in the 16-bit mem[] array.
+						auto &M = VERTOPINTERN->emu__DOT__ram__DOT__mem;
+						DLOG( "[TBLMEM] #%d F%d CPU$9FFFE0:", n, video.count_frame);
+						for (uint32_t w = 0xFFFF0; w <= 0xFFFFE; w += 2)
+							DLOG( " %08X", ((unsigned)M[w] << 16) | (unsigned)M[w+1]);
+						DLOG( "\n"); } }
+				}
+			}
+
+			// --- Candidate-B gating verification: track pseudovia V8 RAM-config
+			// register (ram_cfg) changes vs the F45 enumeration / table build.
+			// Logs reset-init + every ROM write, with frame, PC and bits[7:6].
+			{
+				static int prev_ramcfg = -1;
+				int rc = (int)VERTOPINTERN->emu__DOT__pvia__DOT__ram_cfg;
+				if (rc != prev_ramcfg) {
+					DLOG( "[RAMCFG] %02X->%02X F%d pc=%06X bits76=%d%d\n",
+						prev_ramcfg & 0xFF, rc & 0xFF, video.count_frame,
+						VERTOPINTERN->debug_pc & 0xFFFFFF, (rc>>7)&1, (rc>>6)&1);
+					prev_ramcfg = rc;
+				}
+				// Decisive: did the ram_configured latch ever trip (ROM wrote
+				// config reg $01)? If it stays 0, $0 low-mem globals stay unmapped
+				// -> divergence at $A499xx (reads $19A.w/$DE0.w return garbage).
+				static int prev_rcfgd = -1;
+				int rcfgd = (int)VERTOPINTERN->emu__DOT__pvia_ram_configured;
+				if (rcfgd != prev_rcfgd) {
+					DLOG( "[RAMCFGD] ram_configured %d->%d F%d pc=%06X\n",
+						prev_rcfgd, rcfgd, video.count_frame,
+						VERTOPINTERN->debug_pc & 0xFFFFFF);
+					prev_rcfgd = rcfgd;
+				}
+			}
 
 			// CPU trace output - skip while ROM is downloading
 			// TG68 issues a bus fetch for every code-space word (opcode AND extension
@@ -427,17 +580,54 @@ int verilate() {
 
 					main_time++;
 					// Print progress every 10 million cycles (~300ms of simulated time at 32MHz)
-					if ((main_time % 10000000) == 0) {
-						fprintf(stderr, "Cycle %llu: PC=%08X Op=%04X\n",
+					if ((main_time % 5000000) == 0) {
+						DLOG( "Cycle %llu [F%d]: PC=%08X Op=%04X\n",
 							(unsigned long long)main_time,
+							video.count_frame,
 							VERTOPINTERN->debug_pc,
 							VERTOPINTERN->debug_opcode);
 					}
+
+					// --- Bus-stall measurement during the RAM-test march ---
+					// Per clk_sys: classify the CPU bus state. AS asserted (=0) with
+					// DTACK not yet acked (=1) => stalled waiting; AS asserted & DTACK
+					// acked (=0) => transfer cycle; AS negated => internal/idle.
+					{
+						static uint64_t bm_total=0, bm_stall=0, bm_xfer=0, bm_idle=0, bm_accesses=0;
+						static bool bm_as_prev=true; static int bm_last_report_frame=-1;
+						uint32_t mpc = VERTOPINTERN->debug_pc & 0xFFFFFF;
+						bool in_march = (mpc >= 0xA46880 && mpc <= 0xA46960);
+						if (in_march) {
+							bool as = VERTOPINTERN->debug_cpu_as;       // 1=negated,0=asserted
+							bool dtack = VERTOPINTERN->debug_cpu_dtack; // 1=not acked,0=acked
+							bm_total++;
+							if (!as && dtack) bm_stall++;
+							else if (!as && !dtack) bm_xfer++;
+							else bm_idle++;
+							if (bm_as_prev && !as) bm_accesses++; // AS falling edge = new access
+							bm_as_prev = as;
+							int f = video.count_frame;
+							if (f != bm_last_report_frame && (f % 40)==0 && bm_total>0) {
+								bm_last_report_frame = f;
+								DLOG( "[BUS F%d] total=%llu stall=%llu xfer=%llu idle=%llu accesses=%llu | stall=%.0f%% xfer=%.0f%% idle=%.0f%% -> %.1f clk/access\n",
+									f,
+									(unsigned long long)bm_total,
+									(unsigned long long)bm_stall,
+									(unsigned long long)bm_xfer,
+									(unsigned long long)bm_idle,
+									(unsigned long long)bm_accesses,
+									100.0*bm_stall/bm_total,
+									100.0*bm_xfer/bm_total,
+									100.0*bm_idle/bm_total,
+									bm_accesses?(double)bm_total/bm_accesses:0.0);
+							}
+						}
+					}
 					// Enable trace after download completes to see initial 68K execution
 					static bool last_download = false;
-					if (last_download && !*bus.ioctl_download && !cpu_trace_enable) {
+					if (last_download && !*bus.ioctl_download && !cpu_trace_enable && !cpu_trace_disabled) {
 						cpu_trace_enable = true;
-						fprintf(stderr, "*** Enabling CPU trace after ROM download ***\n");
+						DLOG( "*** Enabling CPU trace after ROM download ***\n");
 						if (!cpu_trace_file) {
 							cpu_trace_file = fopen(cpu_trace_filename, "w");
 						}
@@ -462,6 +652,8 @@ void show_help() {
 	printf("  --screenshot <frames>         Take screenshots at specified frame numbers\n");
 	printf("                                (comma-separated list, e.g., 100,200,300)\n");
 	printf("  --stop-at-frame <frame>       Exit simulation after specified frame\n");
+	printf("  -v, --verbose                 Enable verbose bring-up diagnostics\n");
+	printf("                                (overlay/FC/march/RAMCFG/bus/CPU-trace spam)\n");
 	printf("\n");
 	printf("Examples:\n");
 	printf("  ./Vemu                        Run simulator in windowed mode\n");
@@ -526,6 +718,16 @@ unsigned char mouse_buttons = 0;
 unsigned char mouse_x = 0;
 unsigned char mouse_y = 0;
 
+// Real SDL mouse capture (like lbmactwo_MiSTer): click the VGA image to capture
+// the host mouse; move/click to drive the ADB mouse; press Esc or F1 to release.
+// Relative motion is accumulated during each frame's SDL event poll, then applied
+// to ps2_mouse below.
+extern SDL_Window* window;
+bool mouse_captured = false;
+int  sdl_mouse_dx = 0;
+int  sdl_mouse_dy = 0;
+int  sdl_mouse_btn = 0;
+
 int main(int argc, char** argv, char** env) {
 
 	// Parse command-line arguments
@@ -550,6 +752,12 @@ int main(int argc, char** argv, char** env) {
 			stop_at_frame_enabled = true;
 			printf("Will stop at frame %d\n", stop_at_frame);
 			i++;
+		} else if (strcmp(argv[i], "--no-cpu-trace") == 0) {
+			cpu_trace_disabled = true;
+			printf("Per-instruction CPU trace disabled (cpu_trace.log will not be written)\n");
+		} else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
+			verbose_diag = true;
+			printf("Verbose bring-up diagnostics enabled\n");
 		}
 	}
 
@@ -679,12 +887,34 @@ int main(int argc, char** argv, char** env) {
 	bool done = false;
 	while (!done)
 	{
+		sdl_mouse_dx = 0;
+		sdl_mouse_dy = 0;
 		SDL_Event event;
 		while (SDL_PollEvent(&event))
 		{
 			ImGui_ImplSDL2_ProcessEvent(&event);
 			if (event.type == SDL_QUIT)
 				done = true;
+
+			// Mouse capture uses SDL relative mode: the OS cursor is hidden and
+			// confined, and motion.xrel/yrel give pure relative deltas, so the
+			// pointer can never wander off the emulated screen.
+			if (event.type == SDL_MOUSEMOTION && mouse_captured) {
+				sdl_mouse_dx += event.motion.xrel;
+				sdl_mouse_dy += event.motion.yrel;
+			}
+			if (mouse_captured) {
+				if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT)
+					sdl_mouse_btn = 1;
+				if (event.type == SDL_MOUSEBUTTONUP && event.button.button == SDL_BUTTON_LEFT)
+					sdl_mouse_btn = 0;
+			}
+			// Esc / F1 releases the captured mouse.
+			if (event.type == SDL_KEYDOWN && mouse_captured &&
+			    (event.key.keysym.sym == SDLK_ESCAPE || event.key.keysym.sym == SDLK_F1)) {
+				mouse_captured = false;
+				SDL_SetRelativeMouseMode(SDL_FALSE);
+			}
 		}
 #endif
 		video.StartFrame();
@@ -739,7 +969,9 @@ int main(int argc, char** argv, char** env) {
 
 		int windowX = 550;
 		int windowWidth = (VGA_WIDTH * VGA_SCALE_X) + 24;
-		int windowHeight = (VGA_HEIGHT * VGA_SCALE_Y) + 90;
+		// +120: room for the zoom/rotate/flip controls, the stats line, and the
+		// mouse-capture status line below the image, so the full frame is visible.
+		int windowHeight = (VGA_HEIGHT * VGA_SCALE_Y) + 120;
 
 		// Video window
 		ImGui::Begin(windowTitle_Video);
@@ -751,8 +983,18 @@ int main(int argc, char** argv, char** env) {
 		ImGui::Checkbox("Flip V", &video.output_vflip);
 		ImGui::Text("main_time: %ld frame_count: %d sim FPS: %f", main_time, video.count_frame, video.stats_fps);
 
-		// Draw VGA output
-		ImGui::Image(video.texture_id, ImVec2(video.output_width * VGA_SCALE_X, video.output_height * VGA_SCALE_Y));
+		// Draw VGA output, and let a click on it capture the host mouse.
+		ImVec2 vga_size(video.output_width * VGA_SCALE_X, video.output_height * VGA_SCALE_Y);
+		ImVec2 vga_cursor = ImGui::GetCursorPos();
+		ImGui::Image(video.texture_id, vga_size);
+		ImGui::SetCursorPos(vga_cursor);
+		ImGui::InvisibleButton("##vga_capture", vga_size);
+		if (ImGui::IsItemClicked(0)) {
+			mouse_captured = true;
+			SDL_SetRelativeMouseMode(SDL_TRUE);   // hide + confine the host cursor
+		}
+		ImGui::Text("%s", mouse_captured ? "Mouse captured - press Esc or F1 to release"
+		                                  : "Click display to capture mouse");
 		ImGui::End();
 
 		// Serial terminal window
@@ -827,21 +1069,37 @@ int main(int argc, char** argv, char** env) {
 			break;
 		}
 
-		// Pass inputs to sim - PS2 mouse for Mac
-		mouse_buttons = 0;
-		mouse_x = 0;
-		mouse_y = 0;
-		if (input.inputs[input_left]) { mouse_x = -2; }
-		if (input.inputs[input_right]) { mouse_x = 2; }
-		if (input.inputs[input_up]) { mouse_y = 2; }
-		if (input.inputs[input_down]) { mouse_y = -2; }
+		// Pass inputs to sim - PS2 mouse for Mac.  Build the MiSTer ps2_mouse
+		// packet with the X/Y SIGN bits (bit4 = X<0, bit5 = Y<0) — the core reads
+		// these as the 9th (sign) bit of the delta, so without them every negative
+		// move looks like a large positive one (mouse only goes right/down).
+		int dx = 0, dy = 0;
+		int btn = 0;
+		if (mouse_captured) {
+			// Real host mouse: relative motion accumulated this frame.  SDL screen
+			// Y is down-positive; the Mac wants up-positive, so negate dy.
+			dx =  sdl_mouse_dx;
+			dy = -sdl_mouse_dy;
+			if (sdl_mouse_btn) btn |= 0x01;
+		} else {
+			// Fallback: arrow keys / A,B buttons when the mouse isn't captured.
+			if (input.inputs[input_left])  dx = -2;
+			if (input.inputs[input_right]) dx =  2;
+			if (input.inputs[input_up])    dy =  2;
+			if (input.inputs[input_down])  dy = -2;
+			if (input.inputs[input_a])     btn |= 0x01;
+			if (input.inputs[input_b])     btn |= 0x02;
+		}
+		if (dx >  127) dx =  127; if (dx < -127) dx = -127;
+		if (dy >  127) dy =  127; if (dy < -127) dy = -127;
 
-		if (input.inputs[input_a]) { mouse_buttons |= (1UL << 0); }  // Left click
-		if (input.inputs[input_b]) { mouse_buttons |= (1UL << 1); }  // Right click
+		unsigned char status_byte = (unsigned char)(btn & 0x07) | 0x08;
+		if (dx < 0) status_byte |= 0x10;   // X sign  -> ps2_mouse[4]
+		if (dy < 0) status_byte |= 0x20;   // Y sign  -> ps2_mouse[5]
 
-		unsigned long mouse_temp = mouse_buttons;
-		mouse_temp += (mouse_x << 8);
-		mouse_temp += (mouse_y << 16);
+		unsigned long mouse_temp = status_byte;
+		mouse_temp |= ((unsigned char)dx << 8);
+		mouse_temp |= ((unsigned char)dy << 16);
 		if (mouse_clock) { mouse_temp |= (1UL << 24); }
 		mouse_clock = !mouse_clock;
 

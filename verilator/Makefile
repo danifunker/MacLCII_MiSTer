@@ -12,11 +12,14 @@ V_DEFINE = +define+debug=1 +define+SIMULATION=1 +define+USE_EGRET_CPU=1 +define+
 	-I$(RTL)/egret \
         --timing
 # Suppress common warnings that don't affect simulation correctness
-V_DEFINE += -Wno-WIDTH -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-IMPLICIT -Wno-PINMISSING -Wno-UNUSEDSIGNAL -Wno-UNOPTFLAT -Wno-CASEINCOMPLETE -Wno-UNSIGNED -Wno-CMPCONST -Wno-LATCH -Wno-UNDRIVEN -Wno-MISINDENT -Wno-COMBDLY -Wno-INITIALDLY -Wno-SYNCASYNCNET
+V_DEFINE += -Wno-WIDTH -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-IMPLICIT -Wno-PINMISSING -Wno-UNUSEDSIGNAL -Wno-UNOPTFLAT -Wno-CASEINCOMPLETE -Wno-UNSIGNED -Wno-CMPCONST -Wno-LATCH -Wno-UNDRIVEN -Wno-MISINDENT -Wno-COMBDLY -Wno-INITIALDLY -Wno-SYNCASYNCNET -Wno-BLKLOOPINIT -Wno-MULTIDRIVEN -Wno-GENUNNAMED
 #V_DEFINE += --threads 8  # this slows it way down
 V_DEFINE += --trace-fst
 # Uncomment to enable verbose per-instruction/per-cycle debug traces (HC05, TG68, VIA, PVIA, etc.)
 # V_DEFINE += +define+VERBOSE_TRACE=1
+# Uncomment for a FOCUSED HC05 stuck-loop trace (no flood) - prints the Egret PC +
+# BYTEACK/TIP/TREQ every ~32k fetches. Use to pinpoint the byte-4 SR/BYTEACK hang.
+# V_DEFINE += +define+EGRET_SRDEBUG=1
 V_DEFINE +=
 
 UNAME_S := $(shell uname -s)
@@ -72,6 +75,7 @@ V_SRC = \
 	$(RTL)/pseudovia.sv \
 	$(RTL)/via6522.sv \
 	$(RTL)/adb.sv \
+	$(RTL)/adb_device.sv \
 	$(RTL)/asc.sv \
 	$(RTL)/v8_clocks.sv \
 	$(RTL)/ps2_kbd.sv \
@@ -84,7 +88,9 @@ V_SRC = \
 	$(RTL)/scc.v \
 	$(RTL)/cuda_maclc.sv \
 	$(RTL)/pll/pll_0002.v \
-	$(RTL)/egret_behavioral.sv \
+	$(RTL)/egret/egret_wrapper.sv \
+	$(RTL)/egret/m68hc05_core.sv \
+	$(RTL)/egret/m68hc05_alu.sv \
 	$(RTL)/uart/txuart.v \
 	$(RTL)/uart/rxuart.v
 

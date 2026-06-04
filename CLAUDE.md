@@ -52,6 +52,13 @@ Exit codes: 0=PASS, 1=FAIL, 2=missing log. Suitable for pre-commit hooks.
 - **Console output (stderr):** Contains HC05 (Egret) traces, VIA/peripheral debug messages
 - **Important:** Do NOT re-run the simulator multiple times when diagnosing. Run once, then analyze the log files.
 
+#### Comparing against MAME (ground truth)
+When the core misbehaves, diff it against MAME's `maclc` running the same ROM.
+Tooling: `verilator/mame/` (`run_mame.sh`, `tap.lua`, `snap.lua`, `trace.dbg`).
+Full process + gotchas: **`docs/mame_compare.md`** (memory tap, maincpu trace,
+PC-stream divergence diff; macOS has no `timeout`, debugger defaults to the Egret
+HC05 not the 68020, MAME PCs are 8-digit `00Axxxxx`, etc.).
+
 ## Architecture
 
 ### Top-Level Module
@@ -119,6 +126,8 @@ ghdl synth -fsynopsys -fexplicit --latches --out=verilog
 
 **Conditional compilation:** `USE_EGRET_CPU` and `SIMULATION` are defined in `verilator/Makefile` for simulation. For FPGA, `USE_EGRET_CPU` is set in `MacLC.qsf`. Guard simulation-only code (`$display`, debug counters) with `` `ifdef SIMULATION ``.
 
+**Top-level split:** the Verilator top is `verilator/sim.v` (`module emu`), NOT `MacLC.sv`. It has its **own** CPU instantiation and bus glue (VPA/DTACK/BERR/overlay); peripheral RTL is shared via `dataController_top`. CPU-glue/top-level fixes must go in **both** files or sim and FPGA silently diverge. Tracked differences (and a maintenance checklist) live in **`docs/verilator_differences.md`** — update it when you add a top-level signal or hardwire a sim config.
+
 ## VIA Shift Register — Simulation Sensitivity
 
 **Critical:** Changes to the VIA SR logic in `rtl/via6522.sv` can break Egret communication and stall the boot. After any SR change, verify simulation still boots:
@@ -130,11 +139,11 @@ cd verilator && make clean && make
 
 Check `screenshot_frame_0350.png` — it must show the grey/black alternating line pattern (memory test). Uniform grey means the SR change broke Egret communication.
 
-**Known-bad patterns (do not re-introduce):**
-- `ext_fall_edge_pending` — latching CB1 falling edges for shift-out. Use `shift_tick_f` instead.
-- `cb2_latched` — capturing CB2 at CB1 rising edge for shift-in. Use live `cb2_i` instead.
+**SR edge-detection patterns (history + FPGA caveat):**
+- `cb2_latched` (shift-in: capturing CB2 at the CB1 rising edge) — **removed; do not re-introduce.** Shift-in uses live `cb2_i`. Re-introducing it hung the 4th Egret SR transfer in Verilator (CPU stuck polling IFR bit 2 at `0xA14E5E`).
+- `ext_fall_edge_pending` (shift-out: latching CB1 falling edges in external-clock mode) — **currently IN USE in `via6522.sv`.** It was reverted in `a8f9f33`, then deliberately re-added in `e067857` ("switching to fake egret"). It boots in Verilator only because the behavioral Egret drives CB1 slowly, so edges never coalesce. It is the **suspected cause of the FPGA overlay-stuck bug**: the real HC05 toggles CB1 far faster than the VIA's E-rate (only one pending edge is consumed per E-falling phase), so edges coalesce, SR bytes corrupt, the boot ROM's Egret handshake never completes, and the ROM overlay never clears. Do NOT assume it is FPGA-safe — prefer rate-limiting CB1 in `egret_wrapper` over re-touching this SR path.
 
-These were attempted for FPGA timing improvement but cause the 4th Egret SR transfer to hang in Verilator (CPU stuck polling IFR bit 2 at `0xA14E5E`).
+Re-verify boot (the screenshot check above) after ANY SR change.
 
 ## Known Limitations
 

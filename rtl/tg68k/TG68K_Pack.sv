@@ -116,7 +116,8 @@ localparam [6:0]
     div_end1     = 7'd89,
     div_end2     = 7'd90,
     moves1       = 7'd91,
-    moves2       = 7'd92;
+    moves2       = 7'd92,
+    ld_An1       = 7'd93;
 
 // Opcode constants for exec bit vector
 localparam opcMOVE           = 0;

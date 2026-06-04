@@ -265,7 +265,18 @@ module dataController_top(
                         selectAriel ? arielDataOut_full :
                         selectPseudoVIA ? pviaDataOut_full :
                         selectASC ? ascDataOut_full :
-                        selectUnmapped ? 16'h0000 :
+                        // Unmapped reads: return 16'hFFFF (MAME's open-bus
+                        // convention). Previously returned 16'h0000 which was
+                        // deterministic — the boot ROM's RAM-probe XOR-pattern
+                        // test cascaded zeros through unmapped SIMM addresses
+                        // and falsely concluded "RAM here, value = 0" instead
+                        // of "no RAM here", because (a) the unmapped writes
+                        // were silently dropped (_ramWE not asserted), and
+                        // (b) the subsequent read returned 0, matching the
+                        // 0 that the XOR test had cascaded. 0xFFFF is the
+                        // conventional "open bus" value that the probe's
+                        // write-pattern/read-mismatch check correctly rejects.
+                        selectUnmapped ? 16'hFFFF :
                         (cpuBusControl && memoryLatch) ? memoryDataIn : cpu_data;
 
 
@@ -311,10 +322,15 @@ module dataController_top(
 		.reset(!_cpuReset),
 		.bus_cs(selectSCSI),
 		.bus_rs(cpuAddrRegMid),
+		// Mac LC V8: SCSI (like SWIM) lives on the UPPER byte at even addresses.
+		// Reads already used _cpuUDS / D15-D8; writes were wrongly on _cpuLDS /
+		// D7-D0, so byte writes to even regs (e.g. MR_ARB=$01 → $F10020) never
+		// fired iow → mr[0] never set → ICR AIP stuck 0 → the boot's SCSI
+		// arbitration scan ($A076D8) spun forever. MAME scsi_w uses (data >> 8).
 		.ior(!_cpuUDS),
-		.iow(!_cpuLDS),
+		.iow(!_cpuUDS),
 		.dack(cpuAddrRegHi[0]),   // A9
-		.wdata(cpuDataIn[7:0]),
+		.wdata(cpuDataIn[15:8]),
 		.rdata(scsiDataOut),
 
 		// connections to io controller
@@ -363,11 +379,13 @@ module dataController_top(
 
 	assign _viaIrq = ~viaIrq;
 
-	// Port A - Mac LC configuration
-	// Mac LC V8 returns 0x55 for Port A reads (machine identification)
-	// 0x55 = 0101 0101
-	//   Bit 7 = 0 (SCC wait/request - matches expected state for boot)
-	//   Bits 6-0 = 1010101 (Mac LC identification pattern)
+	// Port A - Mac LC configuration sense lines.
+	// MAME v8.cpp via_in_a(): return 0xd4 | (config & 1), where config bit0 =
+	// FPU present. The LC has no FPU, so the correct value is $D4 (not the old
+	// $55 placeholder). NOTE: setting $D4 alone does NOT avoid the STM serial
+	// monitor (confirmed: with $D4 our VIA matches MAME exactly yet still enters
+	// STM), so the STM-entry root cause is elsewhere (boot state machine). Keep
+	// $55 until the real cause is found, to avoid mixing unconfirmed changes.
 	assign via_pa_i = 8'h55;
 	// Sound volume still comes from PA[2:0] output latch
 	assign snd_vol = ~via_pa_oe[2:0] | via_pa_o[2:0];
@@ -617,7 +635,49 @@ module dataController_top(
 	end
 
 `ifdef USE_EGRET_CPU
+	// Use the real 68HC05 + 341S0851 firmware (rtl/egret/egret_wrapper.sv)
+	// for FPGA synthesis, but fall back to egret_behavioral for Verilator.
+	// The behavioral SM (rtl/egret_behavioral.sv) was previously instantiated
+	// here but synthesized its 256-entry PRAM as flat flops, eating ~48k ALMs
+	// — about 94% of the entire design. The HC05 wrapper has the exact same
+	// port signature ("drop-in replacement") and infers block RAM for ROM/PRAM.
+	// CONSOLIDATED: the real HC05 wrapper is now used for BOTH Verilator and
+	// FPGA so the simulation matches hardware. The behavioral SM hid the Egret
+	// CB1/overlay-escape bug (it drives CB1 slowly, so the VIA SR never drops
+	// edges); using the HC05 in sim lets us reproduce and fix that bug without
+	// burning Quartus builds. The behavioral SM remains available only if
+	// EGRET_BEHAVIORAL is defined. The GHDL-converted HC05 core needs a few
+	// -Wno-* in the Verilator Makefile (BLKLOOPINIT, etc.).
+
+	// ADB open-collector line: the Egret HC05 drives PA7 (adb_data_out, where
+	// 1 = pull the line LOW per MAME egret.cpp `m_adb_out = !(PA7)`) and reads the
+	// wired-AND line value back on PA6 (adb_data_in). With NO device, the line =
+	// ~adb_data_out (the Egret reads back its own drive). The old stub tied
+	// adb_data_in to 1'b1, so the HC05 could never see the line it was driving —
+	// breaking its ADB probe state machine. Loopback restores correct
+	// idle-bus behaviour. When an ADB device is added, AND its (open-collector,
+	// 1 = released) line into this: adb_data_in = ~adb_data_out & adb_dev_line.
+	wire egret_adb_dout;
+	wire adb_dev_line;                    // open-collector drive from the ADB device(s)
+	wire egret_adb_din = ~egret_adb_dout & adb_dev_line;
+
+	// Wire-level ADB keyboard (addr 2) + mouse (addr 3) on the Egret ADB line.
+	// host_line = the line as driven by the Egret (~adb_data_out, 1 = idle high);
+	// dev_line is the device's open-collector drive (1 = released, 0 = pull low),
+	// wire-ANDed into adb_data_in above.
+	adb_device adb_dev(
+		.clk        (clk32),
+		.reset      (!_cpuReset),
+		.host_line  (~egret_adb_dout),
+		.dev_line   (adb_dev_line),
+		.ps2_key    (ps2_key),
+		.ps2_mouse  (ps2_mouse)
+	);
+`ifdef EGRET_BEHAVIORAL
 	egret_behavioral egret_inst(
+`else
+	egret_wrapper egret_inst(
+`endif
 		.clk            (clk32),
 		.clk8_en        (clk8_en_p),
 		.reset          (egretReset),  // Egret uses shorter reset than 68000
@@ -651,9 +711,9 @@ module dataController_top(
 		.cuda_portb     (cuda_pb_o),
 		.cuda_portb_oe  (cuda_pb_oe),
 
-		// ADB (not implemented yet)
-		.adb_data_in    (1'b1),
-		.adb_data_out   (),
+		// ADB open-collector line (loopback; no device yet — see above)
+		.adb_data_in    (egret_adb_din),
+		.adb_data_out   (egret_adb_dout),
 
 		// System control - Egret controls 68000 reset via Port C bit 3
 		.reset_680x0    (egret_reset_680x0),
@@ -809,7 +869,7 @@ module dataController_top(
 		._reset(_cpuReset),
 		.selectSWIM(selectIWM),
 		._cpuRW(_cpuRW),
-		._cpuLDS(_cpuLDS),
+		._cpuUDS(_cpuUDS),  // LC V8: SWIM is on the upper byte (even addresses)
 		.dataIn(cpuDataIn),
 		.cpuAddrRegHi(cpuAddrRegHi),
 		.SEL(SEL),
