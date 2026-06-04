@@ -75,6 +75,7 @@ V_SRC = \
 	$(RTL)/pseudovia.sv \
 	$(RTL)/via6522.sv \
 	$(RTL)/adb.sv \
+	$(RTL)/adb_device.sv \
 	$(RTL)/asc.sv \
 	$(RTL)/v8_clocks.sv \
 	$(RTL)/ps2_kbd.sv \

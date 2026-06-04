@@ -658,8 +658,21 @@ module dataController_top(
 	// idle-bus behaviour. When an ADB device is added, AND its (open-collector,
 	// 1 = released) line into this: adb_data_in = ~adb_data_out & adb_dev_line.
 	wire egret_adb_dout;
-	wire adb_dev_line = 1'b1;             // no device yet → released (idle high)
+	wire adb_dev_line;                    // open-collector drive from the ADB device(s)
 	wire egret_adb_din = ~egret_adb_dout & adb_dev_line;
+
+	// Wire-level ADB keyboard (addr 2) + mouse (addr 3) on the Egret ADB line.
+	// host_line = the line as driven by the Egret (~adb_data_out, 1 = idle high);
+	// dev_line is the device's open-collector drive (1 = released, 0 = pull low),
+	// wire-ANDed into adb_data_in above.
+	adb_device adb_dev(
+		.clk        (clk32),
+		.reset      (!_cpuReset),
+		.host_line  (~egret_adb_dout),
+		.dev_line   (adb_dev_line),
+		.ps2_key    (ps2_key),
+		.ps2_mouse  (ps2_mouse)
+	);
 `ifdef EGRET_BEHAVIORAL
 	egret_behavioral egret_inst(
 `else
