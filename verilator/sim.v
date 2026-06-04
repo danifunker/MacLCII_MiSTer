@@ -161,7 +161,8 @@ module emu
 
 	///////////////////////////////////////////////////
 
-	assign CE_PIXEL  = 1;
+	wire v8_ce_pix;
+	assign CE_PIXEL  = v8_ce_pix;  // real pixel-clock enable (was hardwired 1 -> doubled every pixel)
 
 	// Video Output - Mac LC V8 video system
 	assign VGA_R  = v8_vga_r;
@@ -585,7 +586,7 @@ module emu
 		.vga_g(v8_vga_g),
 		.vga_b(v8_vga_b),
 		.de(v8_de),
-		.ce_pix(),  // Not used in sim
+		.ce_pix(v8_ce_pix),  // drives CE_PIXEL so the sim samples one pixel per real pixel-clock
 
 		.palette_addr(ariel_pixel_addr),
 		.palette_data(ariel_palette_data)
