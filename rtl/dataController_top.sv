@@ -322,10 +322,15 @@ module dataController_top(
 		.reset(!_cpuReset),
 		.bus_cs(selectSCSI),
 		.bus_rs(cpuAddrRegMid),
+		// Mac LC V8: SCSI (like SWIM) lives on the UPPER byte at even addresses.
+		// Reads already used _cpuUDS / D15-D8; writes were wrongly on _cpuLDS /
+		// D7-D0, so byte writes to even regs (e.g. MR_ARB=$01 → $F10020) never
+		// fired iow → mr[0] never set → ICR AIP stuck 0 → the boot's SCSI
+		// arbitration scan ($A076D8) spun forever. MAME scsi_w uses (data >> 8).
 		.ior(!_cpuUDS),
-		.iow(!_cpuLDS),
+		.iow(!_cpuUDS),
 		.dack(cpuAddrRegHi[0]),   // A9
-		.wdata(cpuDataIn[7:0]),
+		.wdata(cpuDataIn[15:8]),
 		.rdata(scsiDataOut),
 
 		// connections to io controller
@@ -643,6 +648,18 @@ module dataController_top(
 	// burning Quartus builds. The behavioral SM remains available only if
 	// EGRET_BEHAVIORAL is defined. The GHDL-converted HC05 core needs a few
 	// -Wno-* in the Verilator Makefile (BLKLOOPINIT, etc.).
+
+	// ADB open-collector line: the Egret HC05 drives PA7 (adb_data_out, where
+	// 1 = pull the line LOW per MAME egret.cpp `m_adb_out = !(PA7)`) and reads the
+	// wired-AND line value back on PA6 (adb_data_in). With NO device, the line =
+	// ~adb_data_out (the Egret reads back its own drive). The old stub tied
+	// adb_data_in to 1'b1, so the HC05 could never see the line it was driving —
+	// breaking its ADB probe state machine. Loopback restores correct
+	// idle-bus behaviour. When an ADB device is added, AND its (open-collector,
+	// 1 = released) line into this: adb_data_in = ~adb_data_out & adb_dev_line.
+	wire egret_adb_dout;
+	wire adb_dev_line = 1'b1;             // no device yet → released (idle high)
+	wire egret_adb_din = ~egret_adb_dout & adb_dev_line;
 `ifdef EGRET_BEHAVIORAL
 	egret_behavioral egret_inst(
 `else
@@ -681,9 +698,9 @@ module dataController_top(
 		.cuda_portb     (cuda_pb_o),
 		.cuda_portb_oe  (cuda_pb_oe),
 
-		// ADB (not implemented yet)
-		.adb_data_in    (1'b1),
-		.adb_data_out   (),
+		// ADB open-collector line (loopback; no device yet — see above)
+		.adb_data_in    (egret_adb_din),
+		.adb_data_out   (egret_adb_dout),
 
 		// System control - Egret controls 68000 reset via Port C bit 3
 		.reset_680x0    (egret_reset_680x0),

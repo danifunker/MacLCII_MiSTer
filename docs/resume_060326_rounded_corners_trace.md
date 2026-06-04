@@ -88,6 +88,51 @@ fix later. This is NOT the rounded corners (those are framebuffer content).
 - MAME: `cd /Users/dani/repos/mame && /opt/homebrew/bin/mame maclc -rompath
   /private/tmp/goodroms -ramsize 2M ...` (see [[mame-ground-truth-maclc]]).
 
+## RESOLVED — root cause found (2026-06-03, this session)
+
+**The rounded corners are NOT a VRAM/QuickDraw/addressing bug.** They are a
+DOWNSTREAM desktop redraw our boot never reaches because it is stuck in the
+floppy drive-poll loop. Trace forensics (MAME maincpu trace `/tmp/maincpu.tr`
++ our `cpu_trace.log`):
+
+1. **The corner routine**: black corner pixels (`$F40000 = $FFFFFFFF`) are
+   written by `$A2FFCC` (`move.l D0,(A1)+`, a masked region blit) called via
+   `$A34CE2`/`$A34D14` (QuickDraw region paint), reached from the MAIN boot
+   thread (`...$A0E33E→$A09A7C→$A34xxx`, SR=$2008 supervisor/IPL0, NOT an
+   interrupt). MAME writes the black corners at frame ~456, AFTER the grey fill.
+2. **Our boot reaches `$A2FFCC`/`$A34CE2` only for the early GREY desktop fill
+   (frames 307–312)** and NEVER writes black to `$F40000` (0 hits). After F312
+   it does no further VRAM writes — it parks.
+3. **Where it parks**: tight spin at `$A01484` (~13.7k iters/frame). MAME
+   executes `$A01484` ZERO times — our boot took a path MAME never takes.
+4. **EXACT divergence** = the result of the `_A07F` disk/drive-poll A-trap.
+   Both sims run `$A0146A: andi.b #$80,D0 ; $A0146E: bne $a014de` after polling
+   drive 2 (internal floppy). **MAME: D0 bit 7 = 1 → bne taken → `$A014DE`
+   (rts, proceed)** → boot continues to `$A14xxx` and eventually the
+   rounded-corner desktop redraw. **Ours: D0 bit 7 = 0 → bne falls through →
+   second `_A07F` (drive 6) → `$A01484` infinite spin.** D0 is the return of the
+   `_A07F` dispatch trap (handler `$A099B0`, which does
+   `jsr ([$400,D2.w*4])` to the actual drive handler).
+   - NB: the `andi.b #$0` (immediate `$00`) seen at the FIRST `$A0146A` line is
+     a TRACE ARTIFACT (the trap return-address line logged before prefetch);
+     the real execution is `andi.b #$80` correctly. **No ROM/CPU read bug.**
+
+**ROOT CAUSE**: our floppy/SWIM(IWM) drive-poll reports a status whose bit 7 is
+CLEAR for the internal drive (drive 2), where MAME reports it SET. That bit
+drives the boot into an unrecoverable external-drive retry/spin, so the
+downstream desktop redraw (which paints the rounded black corners + "?") never
+runs. This is the **floppy "?" / SWIM no-disk-sense fidelity** item, exactly as
+[[desktop-stage-open-issues]] predicted ("PC downstream of our parked drive-poll
+loop → comes with the floppy '?' work").
+
+**FIX PATH**: make our IWM/SWIM report the internal floppy drive present with the
+correct status during the `_A07F` drive poll so D0 bit 7 = 1 and `bne $a014de`
+is taken. Next step to pin the exact bit: trace the dispatched drive handler
+(`jsr ([$400,D2*4])` from `$A099B0`, D2=$0200 for drive 2) and find the device
+register read whose bit feeds D0 bit 7; compare that read in MAME vs our IWM.
+Once the poll passes, the boot proceeds and the rounded corners render — no
+VRAM-side change is needed.
+
 ## Done-when
 - Identified the ROM PC/stage that writes the black rounded corners, and
   determined whether our boot reaches it; documented the cause and the fix path

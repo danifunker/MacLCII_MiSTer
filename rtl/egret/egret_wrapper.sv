@@ -265,6 +265,20 @@ always @(*) begin
     adb_data_out = pa_out[7];
 end
 
+`ifdef SIMULATION
+// Log ADB line drive edges with timestamps so we can derive the HC05's wire-level
+// ADB cell timing (attention/sync/data cells) when designing the ADB device.
+reg adb_out_prev;
+always @(posedge clk) begin
+    if (cen) begin
+        if (adb_data_out !== adb_out_prev) begin
+            $display("ADBLINE[%0d]: out=%b (line=%b) PA7=%b", cycle_count, adb_data_out, ~adb_data_out, pa_out[7]);
+            adb_out_prev <= adb_data_out;
+        end
+    end
+end
+`endif
+
 // ============================================================================
 // Port B - VIA interface (this is the key interface)
 // ============================================================================
