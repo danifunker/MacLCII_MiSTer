@@ -52,6 +52,13 @@ Exit codes: 0=PASS, 1=FAIL, 2=missing log. Suitable for pre-commit hooks.
 - **Console output (stderr):** Contains HC05 (Egret) traces, VIA/peripheral debug messages
 - **Important:** Do NOT re-run the simulator multiple times when diagnosing. Run once, then analyze the log files.
 
+#### Comparing against MAME (ground truth)
+When the core misbehaves, diff it against MAME's `maclc` running the same ROM.
+Tooling: `verilator/mame/` (`run_mame.sh`, `tap.lua`, `snap.lua`, `trace.dbg`).
+Full process + gotchas: **`docs/mame_compare.md`** (memory tap, maincpu trace,
+PC-stream divergence diff; macOS has no `timeout`, debugger defaults to the Egret
+HC05 not the 68020, MAME PCs are 8-digit `00Axxxxx`, etc.).
+
 ## Architecture
 
 ### Top-Level Module
