@@ -197,7 +197,7 @@ module emu
 		"OBC,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
 		"-;",
 		"OFG,Video Mode,4bpp,1bpp,2bpp,8bpp,16bpp;",
-		"OAB,Monitor,512x384 12in RGB,640x480 VGA,Portrait;",
+		"OAB,Monitor,640x480 VGA,512x384 12in RGB,Portrait;",
 		"-;",
 		"ODE,CPU,68020;",
 		"O4,Memory,2MB,10MB;",
@@ -1030,8 +1030,8 @@ module emu
 	// Monitor ID Selection — OSD-driven via status[11:10] instead of V8
 	// SENSE0/SENSE2 pins.  This is intentional for emulation: real hardware
 	// reads the monitor sense lines on the DB-15 connector.
-	wire [3:0] v8_monitor_id = status[11:10] == 2'b00 ? 4'h2 : // 512x384 12" RGB
-							   status[11:10] == 2'b01 ? 4'h6 : // 640x480 VGA
+	wire [3:0] v8_monitor_id = status[11:10] == 2'b00 ? 4'h6 : // 640x480 VGA (default, matches MAME)
+							   status[11:10] == 2'b01 ? 4'h2 : // 512x384 12" RGB
 							   4'h1;                           // Portrait
 
 	ariel_ramdac ariel(

@@ -192,11 +192,24 @@ reg [3:0]  shift_count;
 reg video_latch_pending;
 reg [15:0] video_latch_data;
 
+// The bus grants one video fetch per 16 clk_sys (= one word per 8 pix_en).
+// That cadence only matches 2 bpp. At 1 bpp a word holds 16 pixels and
+// video_addr only advances every 16 pixels, so the SAME word address is
+// fetched twice per word — reloading pixel_shift mid-word made pixels 0-7
+// render twice (the doubled cursor / striped dither) and 8-15 never show.
+// Ignore a redundant re-fetch of the same address so the shift register runs
+// through all 16 bits. No-op for >=2 bpp (every fetch is a new address).
+// Reset the dedup tracker each blank so the first word of every line loads.
+reg [21:0] last_fetch_addr;
 always @(posedge clk_sys) begin
-    if (video_latch && !hblank && !vblank) begin
+    if (hblank || vblank) begin
+        last_fetch_addr <= 22'h3FFFFF;  // sentinel: force first fetch of next line to load
+        video_latch_pending <= 1'b0;
+    end else if (video_latch && video_addr != last_fetch_addr) begin
         video_data <= video_data_in;
         video_latch_data <= video_data_in;
         video_latch_pending <= 1'b1;
+        last_fetch_addr <= video_addr;
     end
     // Clear pending flag when consumed by shift register on pix_en
     if (pix_en && video_latch_pending && !hblank && !vblank)
