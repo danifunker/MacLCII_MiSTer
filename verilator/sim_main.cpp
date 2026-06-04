@@ -708,6 +708,16 @@ unsigned char mouse_buttons = 0;
 unsigned char mouse_x = 0;
 unsigned char mouse_y = 0;
 
+// Real SDL mouse capture (like lbmactwo_MiSTer): click the VGA image to capture
+// the host mouse; move/click to drive the ADB mouse; press Esc or F1 to release.
+// Relative motion is accumulated during each frame's SDL event poll, then applied
+// to ps2_mouse below.
+extern SDL_Window* window;
+bool mouse_captured = false;
+int  sdl_mouse_dx = 0;
+int  sdl_mouse_dy = 0;
+int  sdl_mouse_btn = 0;
+
 int main(int argc, char** argv, char** env) {
 
 	// Parse command-line arguments
@@ -864,12 +874,38 @@ int main(int argc, char** argv, char** env) {
 	bool done = false;
 	while (!done)
 	{
+		sdl_mouse_dx = 0;
+		sdl_mouse_dy = 0;
 		SDL_Event event;
 		while (SDL_PollEvent(&event))
 		{
 			ImGui_ImplSDL2_ProcessEvent(&event);
 			if (event.type == SDL_QUIT)
 				done = true;
+
+			// Mouse capture: accumulate relative motion and warp back to centre.
+			if (event.type == SDL_MOUSEMOTION && mouse_captured) {
+				int win_w, win_h;
+				SDL_GetWindowSize(window, &win_w, &win_h);
+				int cx = win_w / 2, cy = win_h / 2;
+				int dx = event.motion.x - cx;
+				int dy = event.motion.y - cy;
+				if (dx != 0 || dy != 0) {
+					sdl_mouse_dx += dx;
+					sdl_mouse_dy += dy;
+					SDL_WarpMouseInWindow(window, cx, cy);
+				}
+			}
+			if (mouse_captured) {
+				if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT)
+					sdl_mouse_btn = 1;
+				if (event.type == SDL_MOUSEBUTTONUP && event.button.button == SDL_BUTTON_LEFT)
+					sdl_mouse_btn = 0;
+			}
+			// Esc / F1 releases the captured mouse.
+			if (event.type == SDL_KEYDOWN && mouse_captured &&
+			    (event.key.keysym.sym == SDLK_ESCAPE || event.key.keysym.sym == SDLK_F1))
+				mouse_captured = false;
 		}
 #endif
 		video.StartFrame();
@@ -936,8 +972,20 @@ int main(int argc, char** argv, char** env) {
 		ImGui::Checkbox("Flip V", &video.output_vflip);
 		ImGui::Text("main_time: %ld frame_count: %d sim FPS: %f", main_time, video.count_frame, video.stats_fps);
 
-		// Draw VGA output
-		ImGui::Image(video.texture_id, ImVec2(video.output_width * VGA_SCALE_X, video.output_height * VGA_SCALE_Y));
+		// Draw VGA output, and let a click on it capture the host mouse.
+		ImVec2 vga_size(video.output_width * VGA_SCALE_X, video.output_height * VGA_SCALE_Y);
+		ImVec2 vga_cursor = ImGui::GetCursorPos();
+		ImGui::Image(video.texture_id, vga_size);
+		ImGui::SetCursorPos(vga_cursor);
+		ImGui::InvisibleButton("##vga_capture", vga_size);
+		if (ImGui::IsItemClicked(0)) {
+			mouse_captured = true;
+			int win_w, win_h;
+			SDL_GetWindowSize(window, &win_w, &win_h);
+			SDL_WarpMouseInWindow(window, win_w / 2, win_h / 2);
+		}
+		ImGui::Text("%s", mouse_captured ? "Mouse captured - press Esc or F1 to release"
+		                                  : "Click display to capture mouse");
 		ImGui::End();
 
 		// Serial terminal window
@@ -1016,13 +1064,25 @@ int main(int argc, char** argv, char** env) {
 		mouse_buttons = 0;
 		mouse_x = 0;
 		mouse_y = 0;
-		if (input.inputs[input_left]) { mouse_x = -2; }
-		if (input.inputs[input_right]) { mouse_x = 2; }
-		if (input.inputs[input_up]) { mouse_y = 2; }
-		if (input.inputs[input_down]) { mouse_y = -2; }
-
-		if (input.inputs[input_a]) { mouse_buttons |= (1UL << 0); }  // Left click
-		if (input.inputs[input_b]) { mouse_buttons |= (1UL << 1); }  // Right click
+		if (mouse_captured) {
+			// Real host mouse: relative motion accumulated this frame (SDL screen
+			// Y is down-positive; the ADB/Mac wants up-positive, so negate Y).
+			int mx = sdl_mouse_dx;
+			int my = -sdl_mouse_dy;
+			if (mx > 127) mx = 127; if (mx < -127) mx = -127;
+			if (my > 127) my = 127; if (my < -127) my = -127;
+			mouse_x = (unsigned char)(signed char)mx;
+			mouse_y = (unsigned char)(signed char)my;
+			if (sdl_mouse_btn) mouse_buttons |= (1UL << 0);
+		} else {
+			// Fallback: arrow keys / A,B buttons drive the mouse when not captured.
+			if (input.inputs[input_left]) { mouse_x = -2; }
+			if (input.inputs[input_right]) { mouse_x = 2; }
+			if (input.inputs[input_up]) { mouse_y = 2; }
+			if (input.inputs[input_down]) { mouse_y = -2; }
+			if (input.inputs[input_a]) { mouse_buttons |= (1UL << 0); }  // Left click
+			if (input.inputs[input_b]) { mouse_buttons |= (1UL << 1); }  // Right click
+		}
 
 		unsigned long mouse_temp = mouse_buttons;
 		mouse_temp += (mouse_x << 8);
