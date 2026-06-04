@@ -70,6 +70,11 @@ int multi_step_amount = 1024;
 int cfg_cpuType = 2;       // 68020 mode via TG68K
 int cfg_memSize = 1;       // 0=1MB, 1=4MB
 
+// Verbose bring-up diagnostics (overlay/FC/march/STM/RAMCFG/bus/CPU-trace
+// console spam). Off by default for a quiet console; enable with --verbose/-v.
+bool verbose_diag = false;
+#define DLOG(...) do { if (verbose_diag) fprintf(stderr, __VA_ARGS__); } while (0)
+
 // CPU trace
 // ---------
 bool cpu_trace_enable = false;  // Enable after ROM download
@@ -235,15 +240,15 @@ int verilate() {
 				static int prev_ov = -1;
 				int ov = (int)VERTOPINTERN->emu__DOT__ac0__DOT__rom_overlay;
 				if (ov != prev_ov) {
-					fprintf(stderr, "[OVERLAY] rom_overlay %d->%d at F%d cyc=%llu\n",
+					DLOG( "[OVERLAY] rom_overlay %d->%d at F%d cyc=%llu\n",
 						prev_ov, ov, video.count_frame, (unsigned long long)main_time);
 					prev_ov = ov;
 				}
 				static int prev_pend = -1, prev_rst = -1;
 				int pend = (int)VERTOPINTERN->emu__DOT__ac0__DOT__overlay_disable_pending;
 				int rst = (int)VERTOPINTERN->emu__DOT___cpuReset;
-				if (pend != prev_pend) { fprintf(stderr, "[OVERLAY] pending %d->%d F%d cyc=%llu\n", prev_pend, pend, video.count_frame, (unsigned long long)main_time); prev_pend = pend; }
-				if (rst != prev_rst) { fprintf(stderr, "[OVERLAY] _cpuReset %d->%d F%d cyc=%llu\n", prev_rst, rst, video.count_frame, (unsigned long long)main_time); prev_rst = rst; }
+				if (pend != prev_pend) { DLOG( "[OVERLAY] pending %d->%d F%d cyc=%llu\n", prev_pend, pend, video.count_frame, (unsigned long long)main_time); prev_pend = pend; }
+				if (rst != prev_rst) { DLOG( "[OVERLAY] _cpuReset %d->%d F%d cyc=%llu\n", prev_rst, rst, video.count_frame, (unsigned long long)main_time); prev_rst = rst; }
 				// FC during $A0xxxx accesses (overlay-clear gate is cpuFC[1])
 				static int fc_logs = 0;
 				uint32_t ca = top->debug_cpuAddr;
@@ -251,7 +256,7 @@ int verilate() {
 					unsigned fc = VERTOPINTERN->emu__DOT__cpuFC;
 					static uint32_t last_ca = 0xFFFFFFFF; static unsigned last_fc = 0xFF;
 					if (ca != last_ca || fc != last_fc) {
-						fprintf(stderr, "[FC] $A-access addr=%06X FC=%u (fc1=%u) F%d\n",
+						DLOG( "[FC] $A-access addr=%06X FC=%u (fc1=%u) F%d\n",
 							ca & 0xFFFFFF, fc, (fc>>1)&1, video.count_frame);
 						fc_logs++; last_ca = ca; last_fc = fc;
 					}
@@ -272,7 +277,7 @@ int verilate() {
 						bool in_stm   = (mpc >= 0xA49800 && mpc <= 0xA499FF);
 						bool prev_stm = (march_last_pc >= 0xA49800 && march_last_pc <= 0xA499FF);
 						if (in_stm && !prev_stm && stm_logs < 12) {
-							fprintf(stderr, "[STM_ENTRY] -> %06X from %06X F%d\n", mpc, march_last_pc, video.count_frame);
+							DLOG( "[STM_ENTRY] -> %06X from %06X F%d\n", mpc, march_last_pc, video.count_frame);
 							stm_logs++;
 						}
 					}
@@ -282,9 +287,9 @@ int verilate() {
 						static int en=0;
 						if ((mpc==0xA48CD0 || mpc==0xA48CDA || mpc==0xA4638C || mpc==0xA46200) && en<12) {
 							auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
-							fprintf(stderr, "[ERR] ->%06X from %06X F%d D0=%08X D1=%08X D2=%08X D6=%08X D7=%08X\n",
+							DLOG( "[ERR] ->%06X from %06X F%d D0=%08X D1=%08X D2=%08X D6=%08X D7=%08X\n",
 								mpc, march_last_pc, video.count_frame,
-								(unsigned)rf[0],(unsigned)rf[1],(unsigned)rf[2],(unsigned)rf[6],(unsigned)rf[7]); fprintf(stderr,"      D4(testmask)=%08X D3=%08X A0=%08X A1=%08X\n",(unsigned)rf[4],(unsigned)rf[3],(unsigned)rf[8],(unsigned)rf[9]); en++;
+								(unsigned)rf[0],(unsigned)rf[1],(unsigned)rf[2],(unsigned)rf[6],(unsigned)rf[7]); DLOG("      D4(testmask)=%08X D3=%08X A0=%08X A1=%08X\n",(unsigned)rf[4],(unsigned)rf[3],(unsigned)rf[8],(unsigned)rf[9]); en++;
 						}
 					}
 					{   // MOVES-BERR fix verification: machine-config word D2 (and D5
@@ -292,7 +297,7 @@ int verilate() {
 						static int n=0;
 						if (mpc==0xA00AB0 && n<8) {
 							auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
-							fprintf(stderr, "[D2PROBE] $A00AB0 #%d F%d D2=%08X D5=%08X\n",
+							DLOG( "[D2PROBE] $A00AB0 #%d F%d D2=%08X D5=%08X\n",
 								n, video.count_frame, (unsigned)rf[2], (unsigned)rf[5]); n++;
 						}
 					}
@@ -304,36 +309,36 @@ int verilate() {
 						bool ish=false; for (unsigned i=0;i<11;i++) if (mpc==H[i]) ish=true;
 						
 						if (ish && mpc!=last_h && st<300) {
-							fprintf(stderr, "[STATE] handler %06X F%d\n", mpc, video.count_frame); st++; last_h=mpc;
+							DLOG( "[STATE] handler %06X F%d\n", mpc, video.count_frame); st++; last_h=mpc;
 						}
 					}
 					march_last_pc = mpc;
 					if (mpc == 0xA46910) { hit_910++;
 						auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
-						fprintf(stderr, "[MARCH] PASS#%d F%d D0=%08X D1=%08X D2=%08X D4=%08X D6=%08X D7=%08X A0=%08X A1=%08X A2=%08X A3=%08X A4=%08X A5=%08X\n",
+						DLOG( "[MARCH] PASS#%d F%d D0=%08X D1=%08X D2=%08X D4=%08X D6=%08X D7=%08X A0=%08X A1=%08X A2=%08X A3=%08X A4=%08X A5=%08X\n",
 							hit_910, video.count_frame,
 							(unsigned)rf[0],(unsigned)rf[1],(unsigned)rf[2],(unsigned)rf[4],
 							(unsigned)rf[6],(unsigned)rf[7],(unsigned)rf[8],(unsigned)rf[9],
 							(unsigned)rf[10],(unsigned)rf[11],(unsigned)rf[12],(unsigned)rf[13]); }
 					else if (mpc == 0xA4694C) { hit_694c++;
-						fprintf(stderr, "[MARCH] *** DONE $A4694C hit#%d cyc=%llu F%d ***\n",
+						DLOG( "[MARCH] *** DONE $A4694C hit#%d cyc=%llu F%d ***\n",
 							hit_694c, (unsigned long long)main_time, video.count_frame); }
 					else if (mpc == 0xA4A590) { hit_a590++;
-						if (hit_a590 <= 3) fprintf(stderr, "[MARCH] bank-scan $A4A590 hit#%d cyc=%llu F%d\n",
+						if (hit_a590 <= 3) DLOG( "[MARCH] bank-scan $A4A590 hit#%d cyc=%llu F%d\n",
 							hit_a590, (unsigned long long)main_time, video.count_frame); }
-					else if (mpc == 0xA467FE) { static int n=0; if(++n<=8) fprintf(stderr, "[PROBE] PASS $A467FE (bank present) #%d F%d\n", n, video.count_frame); }
-					else if (mpc == 0xA467F6) { static int n=0; if(++n<=8) fprintf(stderr, "[PROBE] FAIL $A467F6 (bank absent) #%d F%d\n", n, video.count_frame); }
+					else if (mpc == 0xA467FE) { static int n=0; if(++n<=8) DLOG( "[PROBE] PASS $A467FE (bank present) #%d F%d\n", n, video.count_frame); }
+					else if (mpc == 0xA467F6) { static int n=0; if(++n<=8) DLOG( "[PROBE] FAIL $A467F6 (bank absent) #%d F%d\n", n, video.count_frame); }
 					else if (mpc == 0xA46584) { static int n=0; if(++n<=12) { // cmpaw #-1,a0 : A0=region start loaded, A5=table base
 						auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
-						fprintf(stderr, "[TBL] $A46584 #%d F%d D7=%08X A0(start)=%08X A4=%08X A5(tbl)=%08X SP=%08X\n",
+						DLOG( "[TBL] $A46584 #%d F%d D7=%08X A0(start)=%08X A4=%08X A5(tbl)=%08X SP=%08X\n",
 							n, video.count_frame, (unsigned)rf[7], (unsigned)rf[8], (unsigned)rf[12], (unsigned)rf[13], (unsigned)rf[15]); } }
 					else if (mpc == 0xA4658A) { static int n=0; if(++n<=12) { // movel a4@+,d0 : D0=region length
 						auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
-						fprintf(stderr, "[TBL] $A4658A #%d F%d D0(len)=%08X A0=%08X A4=%08X\n",
+						DLOG( "[TBL] $A4658A #%d F%d D0(len)=%08X A0=%08X A4=%08X\n",
 							n, video.count_frame, (unsigned)rf[0], (unsigned)rf[8], (unsigned)rf[12]); } }
 					else if (mpc == 0xA4657E) { static int n=0; if(++n<=8) { // moveal sp@,a4 : about to read table ptr from SP
 						auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
-						fprintf(stderr, "[TBL] $A4657E #%d F%d (D7=3 RAM-region entry) SP=%08X overlay=%d\n",
+						DLOG( "[TBL] $A4657E #%d F%d (D7=3 RAM-region entry) SP=%08X overlay=%d\n",
 							n, video.count_frame, (unsigned)rf[15],
 							(int)VERTOPINTERN->emu__DOT__ac0__DOT__rom_overlay);
 						// READ-ONLY dump of built descriptor table memory before the march
@@ -341,10 +346,10 @@ int verilate() {
 						// (motherboard_high: word = {3'b000, cpuAddr[20:1]}). 68k longwords
 						// are big-endian word pairs in the 16-bit mem[] array.
 						auto &M = VERTOPINTERN->emu__DOT__ram__DOT__mem;
-						fprintf(stderr, "[TBLMEM] #%d F%d CPU$9FFFE0:", n, video.count_frame);
+						DLOG( "[TBLMEM] #%d F%d CPU$9FFFE0:", n, video.count_frame);
 						for (uint32_t w = 0xFFFF0; w <= 0xFFFFE; w += 2)
-							fprintf(stderr, " %08X", ((unsigned)M[w] << 16) | (unsigned)M[w+1]);
-						fprintf(stderr, "\n"); } }
+							DLOG( " %08X", ((unsigned)M[w] << 16) | (unsigned)M[w+1]);
+						DLOG( "\n"); } }
 				}
 			}
 
@@ -355,7 +360,7 @@ int verilate() {
 				static int prev_ramcfg = -1;
 				int rc = (int)VERTOPINTERN->emu__DOT__pvia__DOT__ram_cfg;
 				if (rc != prev_ramcfg) {
-					fprintf(stderr, "[RAMCFG] %02X->%02X F%d pc=%06X bits76=%d%d\n",
+					DLOG( "[RAMCFG] %02X->%02X F%d pc=%06X bits76=%d%d\n",
 						prev_ramcfg & 0xFF, rc & 0xFF, video.count_frame,
 						VERTOPINTERN->debug_pc & 0xFFFFFF, (rc>>7)&1, (rc>>6)&1);
 					prev_ramcfg = rc;
@@ -366,7 +371,7 @@ int verilate() {
 				static int prev_rcfgd = -1;
 				int rcfgd = (int)VERTOPINTERN->emu__DOT__pvia_ram_configured;
 				if (rcfgd != prev_rcfgd) {
-					fprintf(stderr, "[RAMCFGD] ram_configured %d->%d F%d pc=%06X\n",
+					DLOG( "[RAMCFGD] ram_configured %d->%d F%d pc=%06X\n",
 						prev_rcfgd, rcfgd, video.count_frame,
 						VERTOPINTERN->debug_pc & 0xFFFFFF);
 					prev_rcfgd = rcfgd;
@@ -576,7 +581,7 @@ int verilate() {
 					main_time++;
 					// Print progress every 10 million cycles (~300ms of simulated time at 32MHz)
 					if ((main_time % 5000000) == 0) {
-						fprintf(stderr, "Cycle %llu [F%d]: PC=%08X Op=%04X\n",
+						DLOG( "Cycle %llu [F%d]: PC=%08X Op=%04X\n",
 							(unsigned long long)main_time,
 							video.count_frame,
 							VERTOPINTERN->debug_pc,
@@ -604,7 +609,7 @@ int verilate() {
 							int f = video.count_frame;
 							if (f != bm_last_report_frame && (f % 40)==0 && bm_total>0) {
 								bm_last_report_frame = f;
-								fprintf(stderr, "[BUS F%d] total=%llu stall=%llu xfer=%llu idle=%llu accesses=%llu | stall=%.0f%% xfer=%.0f%% idle=%.0f%% -> %.1f clk/access\n",
+								DLOG( "[BUS F%d] total=%llu stall=%llu xfer=%llu idle=%llu accesses=%llu | stall=%.0f%% xfer=%.0f%% idle=%.0f%% -> %.1f clk/access\n",
 									f,
 									(unsigned long long)bm_total,
 									(unsigned long long)bm_stall,
@@ -622,7 +627,7 @@ int verilate() {
 					static bool last_download = false;
 					if (last_download && !*bus.ioctl_download && !cpu_trace_enable && !cpu_trace_disabled) {
 						cpu_trace_enable = true;
-						fprintf(stderr, "*** Enabling CPU trace after ROM download ***\n");
+						DLOG( "*** Enabling CPU trace after ROM download ***\n");
 						if (!cpu_trace_file) {
 							cpu_trace_file = fopen(cpu_trace_filename, "w");
 						}
@@ -647,6 +652,8 @@ void show_help() {
 	printf("  --screenshot <frames>         Take screenshots at specified frame numbers\n");
 	printf("                                (comma-separated list, e.g., 100,200,300)\n");
 	printf("  --stop-at-frame <frame>       Exit simulation after specified frame\n");
+	printf("  -v, --verbose                 Enable verbose bring-up diagnostics\n");
+	printf("                                (overlay/FC/march/RAMCFG/bus/CPU-trace spam)\n");
 	printf("\n");
 	printf("Examples:\n");
 	printf("  ./Vemu                        Run simulator in windowed mode\n");
@@ -748,6 +755,9 @@ int main(int argc, char** argv, char** env) {
 		} else if (strcmp(argv[i], "--no-cpu-trace") == 0) {
 			cpu_trace_disabled = true;
 			printf("Per-instruction CPU trace disabled (cpu_trace.log will not be written)\n");
+		} else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
+			verbose_diag = true;
+			printf("Verbose bring-up diagnostics enabled\n");
 		}
 	}
 

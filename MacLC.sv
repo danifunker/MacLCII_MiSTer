@@ -180,7 +180,7 @@ module emu
 		.ARY((!ar) ? 12'd171 : 12'd0),
 		.CROP_SIZE(0),
 		.CROP_OFF(0),
-		.SCALE(status[12:11])
+		.SCALE(status[13:12])
 	);
 	
 	`include "build_id.v"
@@ -194,17 +194,10 @@ module emu
 		"SC1,IMGVHD,Mount SCSI-5;",
 		"-;",
 		"O78,Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
-		"OBC,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
-		"-;",
-		"OFG,Video Mode,4bpp,1bpp,2bpp,8bpp,16bpp;",
+		"OCD,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
 		"OAB,Monitor,640x480 VGA,512x384 12in RGB,Portrait;",
 		"-;",
-		"ODE,CPU,68020;",
 		"O4,Memory,2MB,10MB;",
-		"O6,Palette Test,Off,On;",
-		"O5,V8 Bypass Test,Off,On;",
-		"OHI,V8 Test Pat,Hbars,Vbars,Checker,XOR;",
-		"OJ,Seed VRAM,On,Off;",
 		"-;",
 		"R0,Reset & Apply CPU+Memory;",
 		"V,v",`BUILD_DATE
@@ -235,7 +228,7 @@ module emu
 			// NOTE: Do NOT include ~_cpuReset_o here — the CPU executes the RESET
 			// instruction during boot to reset peripherals, which would cause an
 			// infinite reset loop if fed back to the system reset.
-			if(~pll_locked || status[0] || buttons[1] || RESET || dio_download || vinit_active) begin
+			if(~pll_locked || status[0] || buttons[1] || RESET || dio_download) begin
 				rst_cnt <= '1;
 				n_reset <= 0;
 			end
@@ -317,394 +310,14 @@ module emu
 	assign CLK_VIDEO = clk_sys;
 	assign CE_PIXEL  = v8_ce_pix;
 
-	// Test pattern mode: 0=Off, 2=Palette Test (uses Ariel RAMDAC lookup with h_count as index)
-	wire palette_test = status[6];
+	// (Former on-screen debug HUD removed — boot reaches the floppy screen on
+	// hardware. Signal-level debug is preserved via the SignalTap `stp_*` keeps
+	// below and the dataController/v8_video debug telemetry outputs.)
 
-	// Debug indicator: pixel counter synced to DE
-	reg [9:0] dbg_x, dbg_y;
-	reg dbg_de_prev;
-	always @(posedge clk_sys) begin
-		dbg_de_prev <= v8_de;
-		if (v8_ce_pix) begin
-			if (v8_de) begin
-				dbg_x <= dbg_x + 1'd1;
-			end else begin
-				if (dbg_de_prev && !v8_de)
-					dbg_y <= dbg_y + 1'd1;
-				dbg_x <= 0;
-			end
-			if (v8_vsync)
-				dbg_y <= 0;
-		end
-	end
-	// VIA SR debug signals from dataController
-	wire [2:0]  via_sr_dbg_bit_cnt;
-	wire        via_sr_dbg_edge_pending;
-	wire        via_sr_dbg_fall_pending;
-	wire [7:0]  via_sr_dbg_shift_reg;
-	wire        via_sr_dbg_active;
-	wire        via_sr_dbg_dir;
-	wire        via_sr_dbg_cb1;
-	wire        via_sr_dbg_cb2;
-
-	// Egret debug signals from dataController
-	wire        egret_dbg_running;
-	wire        egret_dbg_port_test_done;
-	wire        egret_dbg_handshake_done;
-	wire        egret_dbg_treq;
-	wire        egret_dbg_tip;
-	wire        egret_dbg_byteack;
-	wire        egret_dbg_reset_680x0;
-	wire        egret_dbg_cpu_reset_out;
-
-	// Latch SR transfer count (increments each time shift_active goes 1->0)
-	reg [7:0] sr_xfer_count = 0;
-	reg sr_active_prev = 0;
-	always @(posedge clk_sys) begin
-		sr_active_prev <= via_sr_dbg_active;
-		if (sr_active_prev && !via_sr_dbg_active)
-			sr_xfer_count <= sr_xfer_count + 1'd1;
-	end
-
-	// === On-screen debug overlay ===
-	// Row A (y=0..7):     Egret status indicators (8 blocks)
-	// Row B (y=16..30):   PC[23:0] — green hex (snapshot at overlay-off, or live ~1/sec)
-	// Row C (y=36..50):   Last opcode — cyan hex (snapshot at overlay-off)
-	// Row D (y=56..70):   SDRAM addr — yellow hex (snapshot at overlay-off)
-	// Row E (y=76..90):   Overlay trigger addr — magenta hex (one-shot capture)
-	// Row F (y=96..110):  First ROM read — white hex (SDRAM bank + data word)
-
-	wire debug_egret  = (dbg_y < 10'd8) && (dbg_x < 10'd64);
-	wire debug_pchex  = (dbg_y >= 10'd16) && (dbg_y < 10'd31) && (dbg_x < 10'd92);
-	wire debug_ophex  = (dbg_y >= 10'd36) && (dbg_y < 10'd51) && (dbg_x < 10'd60);
-	wire debug_sahex  = (dbg_y >= 10'd56) && (dbg_y < 10'd71) && (dbg_x < 10'd92);
-	wire debug_ovhex  = (dbg_y >= 10'd76) && (dbg_y < 10'd91) && (dbg_x < 10'd92);
-	wire debug_r1hex  = (dbg_y >= 10'd96) && (dbg_y < 10'd111) && (dbg_x < 10'd92);
-	wire debug_vmon   = (dbg_y >= 10'd116) && (dbg_y < 10'd124) && (dbg_x < 10'd64);
-	// Row M (y=128..142): last instruction-fetch PC in the ROM region.
-	// Six hex digits, orange-on-dark — distinct from green (live PC).
-	wire debug_rmhex  = (dbg_y >= 10'd128) && (dbg_y < 10'd143) && (dbg_x < 10'd92);
-	wire debug_any    = debug_egret
-	                  || debug_pchex || debug_ophex || debug_sahex || debug_ovhex || debug_r1hex
-	                  || debug_vmon || debug_rmhex;
-
-	// Egret status row: 8 blocks, each 8px wide
-	// Block 0: running (Green=yes)
-	// Block 1: port_test_done (Green=done)
-	// Block 2: handshake_done (Green=done)
-	// Block 3: TREQ (Red=asserted)
-	// Block 4: TIP (Yellow=active/low)
-	// Block 5: BYTEACK (Cyan=active)
-	// Block 6: reset_680x0 (Red=holding reset, Green=released)
-	// Block 7: _cpuReset (Green=running, Red=held)
-	wire [2:0] egret_block = dbg_x[5:3];
-	wire egret_val = (egret_block == 0) ? egret_dbg_running :
-	                 (egret_block == 1) ? egret_dbg_port_test_done :
-	                 (egret_block == 2) ? egret_dbg_handshake_done :
-	                 (egret_block == 3) ? egret_dbg_treq :
-	                 (egret_block == 4) ? ~egret_dbg_tip :       // TIP is active LOW, show bright when active
-	                 (egret_block == 5) ? egret_dbg_byteack :
-	                 (egret_block == 6) ? egret_dbg_reset_680x0 :
-	                                      egret_dbg_cpu_reset_out;
-
-	// Row G (y=116..123): V8 video monitor — 8 blocks of 8 px each
-	//   0: V8 fetching heartbeat (latch_count[20] toggles ~every 0.03s @ 32.5MHz)
-	//   1: V8 receiving non-trivial data (nonzero_count[7])
-	//   2: vinit_active (lit while VRAM init writer is running)
-	//   3: vinit_state[1] (lit once VRAM init has reached DONE state)
-	//   4-6: video_mode[2:0] bits
-	//   7: ariel_written (CPU has written palette)
-	wire [2:0] vmon_block = dbg_x[5:3];
-	wire vmon_val = (vmon_block == 0) ? v8_dbg_latch_count[20] :
-	                (vmon_block == 1) ? v8_dbg_nonzero_count[7] :
-	                (vmon_block == 2) ? vinit_active :
-	                (vmon_block == 3) ? vinit_state[1] :
-	                (vmon_block == 4) ? v8_video_mode[0] :
-	                (vmon_block == 5) ? v8_video_mode[1] :
-	                (vmon_block == 6) ? v8_video_mode[2] :
-	                                    ariel_written;
-
-	// 68K AS edge detection
-	reg cpu_as_prev = 1;
-	always @(posedge clk_sys)
-		cpu_as_prev <= _cpuAS;
-
-	// 68K PC address — capture cpuAddr on instruction fetches only (FC[1]=1)
-	reg [7:0] cpu_pc_upper = 0;
-	reg [7:0] cpu_pc_lower = 0;
-	reg [7:0] cpu_pc_lowest = 0;
-	// Last ROM PC — only captures fetches whose cpuAddr falls in the ROM
-	// region ($A00000-$AFFFFF). When the CPU wild-branches into RAM
-	// (e.g. lands on $0000-filled words and starts executing ORI.B #0,D0),
-	// the live cpu_pc_* drifts through RAM and tells us nothing about
-	// where the boot actually derailed. last_rom_pc_* freezes at the
-	// most recent legitimate ROM PC, so the HUD shows the exact ROM
-	// address the CPU was last executing before it ran off the rails.
-	reg [7:0] last_rom_pc_upper  = 0;
-	reg [7:0] last_rom_pc_lower  = 0;
-	reg [7:0] last_rom_pc_lowest = 0;
-	always @(posedge clk_sys) begin
-		if (cpu_as_prev && !_cpuAS && cpuFC[1]) begin
-			cpu_pc_upper <= cpuAddr[23:16];
-			cpu_pc_lower <= cpuAddr[15:8];
-			cpu_pc_lowest <= cpuAddr[7:0];
-			if (cpuAddr[23:20] == 4'hA) begin
-				last_rom_pc_upper  <= cpuAddr[23:16];
-				last_rom_pc_lower  <= cpuAddr[15:8];
-				last_rom_pc_lowest <= cpuAddr[7:0];
-			end
-		end
-	end
-	// Capture last opcode data and SDRAM address during instruction fetches
-	reg [15:0] fetch_opcode = 0;
-	reg [22:0] fetch_sdram_addr = 0;
-	always @(posedge clk_sys) begin
-		if (memoryLatch && cpuBusControl && cpuFC[1] && _cpuRW)  begin
-			fetch_opcode <= sdram_do;
-			fetch_sdram_addr <= memoryAddr;
-		end
-	end
-
-	// Latched display values — updates ~1x/sec (every 60 VBlanks)
-	reg [7:0] hex_pc_upper = 0, hex_pc_lower = 0, hex_pc_lowest = 0;
-	reg [15:0] hex_opcode = 0;
-	reg [22:0] hex_sdram_addr = 0;
-	reg [5:0] vblank_count = 0;
-	reg vblank_prev = 0;
-
-	// Capture PC/opcode/SDRAM at the moment overlay turns off (one-shot)
-	reg overlay_prev = 1;
-	reg overlay_snapshot_taken = 0;
-	reg [7:0] snap_pc_upper = 0, snap_pc_lower = 0, snap_pc_lowest = 0;
-	reg [15:0] snap_opcode = 0;
-	reg [22:0] snap_sdram_addr = 0;
-
-	// First ROM read verification: capture first SDRAM data word read via ROM select
-	reg first_rom_read_captured = 0;
-	reg [15:0] first_rom_data = 0;
-	reg [22:0] first_rom_addr = 0;
-
-	always @(posedge clk_sys) begin
-		overlay_prev <= memoryOverlayOn;
-
-		// Capture snapshot when overlay transitions from ON to OFF
-		if (overlay_prev && !memoryOverlayOn && !overlay_snapshot_taken) begin
-			overlay_snapshot_taken <= 1;
-			snap_pc_upper <= cpu_pc_upper;
-			snap_pc_lower <= cpu_pc_lower;
-			snap_pc_lowest <= cpu_pc_lowest;
-			snap_opcode <= fetch_opcode;
-			snap_sdram_addr <= fetch_sdram_addr;
-		end
-
-		// Capture first ROM read data after reset
-		if (!_cpuReset) begin
-			first_rom_read_captured <= 0;
-		end else if (!first_rom_read_captured && memoryLatch && !_romOE) begin
-			first_rom_read_captured <= 1;
-			first_rom_data <= sdram_do;
-			first_rom_addr <= memoryAddr;
-		end
-
-		// VBlank-based hex display update (~1x/sec)
-		// TURN 7: Always show LIVE PC + opcode + SDRAM addr (no longer
-		// the frozen overlay-disable snapshot). The overlay-trigger and
-		// first-rom-read snapshots still appear in their own rows. This
-		// lets us see whether the CPU is moving, looping, or stuck.
-		vblank_prev <= v8_vblank;
-		if (v8_vblank && !vblank_prev) begin
-			if (vblank_count >= 6'd59) begin
-				vblank_count <= 0;
-				hex_pc_upper  <= cpu_pc_upper;
-				hex_pc_lower  <= cpu_pc_lower;
-				hex_pc_lowest <= cpu_pc_lowest;
-				hex_opcode    <= fetch_opcode;
-				hex_sdram_addr <= fetch_sdram_addr;
-			end else begin
-				vblank_count <= vblank_count + 1'd1;
-			end
-		end
-
-		if (!_cpuReset) begin
-			overlay_snapshot_taken <= 0;
-			overlay_prev <= 1;
-		end
-	end
-
-	// Hex display shared geometry — 3x scale, 4px wide × 5px tall font
-	// Layout: stride=16px per digit (12px char + 4px gap)
-	wire [3:0] hex_slot_x = dbg_x[3:0];     // x % 16 within digit slot
-	wire [2:0] hex_digit_idx = dbg_x[6:4];   // which digit (0-5)
-	wire hex_in_glyph = (hex_slot_x < 4'd12); // in character vs gap
-
-	// Font column (0-3) from local x, dividing by 3
-	wire [1:0] hex_font_col = (hex_slot_x < 4'd3) ? 2'd0 :
-	                           (hex_slot_x < 4'd6) ? 2'd1 :
-	                           (hex_slot_x < 4'd9) ? 2'd2 : 2'd3;
-
-	// Font row (0-4) — relative to start of whichever hex row is active
-	wire [9:0] hex_base_y = debug_pchex ? 10'd16 :
-	                         debug_ophex ? 10'd36 :
-	                         debug_sahex ? 10'd56 :
-	                         debug_ovhex ? 10'd76 :
-	                         debug_r1hex ? 10'd96 : 10'd128;
-	wire [9:0] hex_local_y = dbg_y - hex_base_y;
-	wire [2:0] hex_font_row = (hex_local_y < 10'd3) ? 3'd0 :
-	                           (hex_local_y < 10'd6) ? 3'd1 :
-	                           (hex_local_y < 10'd9) ? 3'd2 :
-	                           (hex_local_y < 10'd12) ? 3'd3 : 3'd4;
-
-	// Nibble selector: PC (6 digits), opcode (4 digits), SDRAM addr (6 digits)
-	wire [3:0] pc_nibble = (hex_digit_idx == 3'd0) ? hex_pc_upper[7:4] :
-	                        (hex_digit_idx == 3'd1) ? hex_pc_upper[3:0] :
-	                        (hex_digit_idx == 3'd2) ? hex_pc_lower[7:4] :
-	                        (hex_digit_idx == 3'd3) ? hex_pc_lower[3:0] :
-	                        (hex_digit_idx == 3'd4) ? hex_pc_lowest[7:4] :
-	                                                  hex_pc_lowest[3:0];
-	wire [3:0] op_nibble = (hex_digit_idx == 3'd0) ? hex_opcode[15:12] :
-	                        (hex_digit_idx == 3'd1) ? hex_opcode[11:8] :
-	                        (hex_digit_idx == 3'd2) ? hex_opcode[7:4] :
-	                                                  hex_opcode[3:0];
-	wire [3:0] sa_nibble = (hex_digit_idx == 3'd0) ? {1'b0, hex_sdram_addr[22:20]} :
-	                        (hex_digit_idx == 3'd1) ? hex_sdram_addr[19:16] :
-	                        (hex_digit_idx == 3'd2) ? hex_sdram_addr[15:12] :
-	                        (hex_digit_idx == 3'd3) ? hex_sdram_addr[11:8] :
-	                        (hex_digit_idx == 3'd4) ? hex_sdram_addr[7:4] :
-	                                                  hex_sdram_addr[3:0];
-	wire [3:0] ov_nibble = (hex_digit_idx == 3'd0) ? overlay_trigger_addr[23:20] :
-	                        (hex_digit_idx == 3'd1) ? overlay_trigger_addr[19:16] :
-	                        (hex_digit_idx == 3'd2) ? overlay_trigger_addr[15:12] :
-	                        (hex_digit_idx == 3'd3) ? overlay_trigger_addr[11:8] :
-	                        (hex_digit_idx == 3'd4) ? overlay_trigger_addr[7:4] :
-	                                                  overlay_trigger_addr[3:0];
-	// First ROM read: show SDRAM addr (6 digits) + data (4 digits) = need 10 chars
-	// But hex_digit_idx is only 3 bits (0-7). Show addr in first 6 digits, data in remaining 2+2
-	// Simplify: show 6 digits = addr[22:0] first, then use digit 6-7 for data high/low
-	wire [3:0] r1_nibble = (hex_digit_idx == 3'd0) ? {1'b0, first_rom_addr[22:20]} :
-	                        (hex_digit_idx == 3'd1) ? first_rom_addr[19:16] :
-	                        (hex_digit_idx == 3'd2) ? first_rom_data[15:12] :
-	                        (hex_digit_idx == 3'd3) ? first_rom_data[11:8] :
-	                        (hex_digit_idx == 3'd4) ? first_rom_data[7:4] :
-	                                                  first_rom_data[3:0];
-	// Last ROM PC: 6 digits = last_rom_pc[23:0]
-	wire [3:0] rm_nibble = (hex_digit_idx == 3'd0) ? last_rom_pc_upper[7:4] :
-	                        (hex_digit_idx == 3'd1) ? last_rom_pc_upper[3:0] :
-	                        (hex_digit_idx == 3'd2) ? last_rom_pc_lower[7:4] :
-	                        (hex_digit_idx == 3'd3) ? last_rom_pc_lower[3:0] :
-	                        (hex_digit_idx == 3'd4) ? last_rom_pc_lowest[7:4] :
-	                                                  last_rom_pc_lowest[3:0];
-	wire [3:0] hex_nibble = debug_pchex ? pc_nibble :
-	                         debug_ophex ? op_nibble :
-	                         debug_sahex ? sa_nibble :
-	                         debug_ovhex ? ov_nibble :
-	                         debug_r1hex ? r1_nibble : rm_nibble;
-
-	// 4×5 hex font glyphs — each digit is 5 rows of 4 bits (MSB=left)
-	reg [19:0] hex_glyph;
-	always @(*) begin
-		case (hex_nibble)
-			4'h0: hex_glyph = {4'b0110, 4'b1001, 4'b1001, 4'b1001, 4'b0110};
-			4'h1: hex_glyph = {4'b0100, 4'b1100, 4'b0100, 4'b0100, 4'b1110};
-			4'h2: hex_glyph = {4'b1110, 4'b0001, 4'b0110, 4'b1000, 4'b1111};
-			4'h3: hex_glyph = {4'b1110, 4'b0001, 4'b0110, 4'b0001, 4'b1110};
-			4'h4: hex_glyph = {4'b1001, 4'b1001, 4'b1111, 4'b0001, 4'b0001};
-			4'h5: hex_glyph = {4'b1111, 4'b1000, 4'b1110, 4'b0001, 4'b1110};
-			4'h6: hex_glyph = {4'b0110, 4'b1000, 4'b1110, 4'b1001, 4'b0110};
-			4'h7: hex_glyph = {4'b1111, 4'b0001, 4'b0010, 4'b0100, 4'b0100};
-			4'h8: hex_glyph = {4'b0110, 4'b1001, 4'b0110, 4'b1001, 4'b0110};
-			4'h9: hex_glyph = {4'b0110, 4'b1001, 4'b0111, 4'b0001, 4'b0110};
-			4'hA: hex_glyph = {4'b0110, 4'b1001, 4'b1111, 4'b1001, 4'b1001};
-			4'hB: hex_glyph = {4'b1110, 4'b1001, 4'b1110, 4'b1001, 4'b1110};
-			4'hC: hex_glyph = {4'b0110, 4'b1001, 4'b1000, 4'b1001, 4'b0110};
-			4'hD: hex_glyph = {4'b1110, 4'b1001, 4'b1001, 4'b1001, 4'b1110};
-			4'hE: hex_glyph = {4'b1111, 4'b1000, 4'b1110, 4'b1000, 4'b1111};
-			4'hF: hex_glyph = {4'b1111, 4'b1000, 4'b1110, 4'b1000, 4'b1000};
-		endcase
-	end
-
-	// Index into glyph: bit position = (4-row)*4 + (3-col)
-	wire [4:0] hex_bit_idx = {(3'd4 - hex_font_row), 2'b00} + {3'd0, (2'd3 - hex_font_col)};
-	wire hex_pixel_on = hex_glyph[hex_bit_idx];
-
-	// Debug pixel color
-	reg [7:0] dbg_r, dbg_g, dbg_b;
-	always @(*) begin
-		dbg_r = 8'h10; dbg_g = 8'h10; dbg_b = 8'h10; // dark background
-		if (debug_egret) begin
-			// Row A: Egret status indicators - color per block
-			case (egret_block)
-				0: begin dbg_r = 8'h00; dbg_g = egret_val ? 8'hFF : 8'h30; dbg_b = 8'h00; end // running: Green
-				1: begin dbg_r = 8'h00; dbg_g = egret_val ? 8'hFF : 8'h30; dbg_b = 8'h00; end // port_test: Green
-				2: begin dbg_r = 8'h00; dbg_g = egret_val ? 8'hFF : 8'h30; dbg_b = 8'h00; end // handshake: Green
-				3: begin dbg_r = egret_val ? 8'hFF : 8'h30; dbg_g = 8'h00; dbg_b = 8'h00; end // TREQ: Red
-				4: begin dbg_r = egret_val ? 8'hFF : 8'h30; dbg_g = egret_val ? 8'hFF : 8'h30; dbg_b = 8'h00; end // TIP: Yellow
-				5: begin dbg_r = 8'h00; dbg_g = egret_val ? 8'hFF : 8'h30; dbg_b = egret_val ? 8'hFF : 8'h30; end // BYTEACK: Cyan
-				6: begin dbg_r = egret_val ? 8'hFF : 8'h00; dbg_g = egret_val ? 8'h00 : 8'hFF; dbg_b = 8'h00; end // reset_680x0: R=hold,G=release
-				default: begin dbg_r = egret_val ? 8'h00 : 8'hFF; dbg_g = egret_val ? 8'hFF : 8'h00; dbg_b = 8'h00; end // cpuReset: G=run,R=held
-			endcase
-		end else if (debug_pchex) begin
-			// Row H: PC hex display — bright green on dark
-			if (hex_in_glyph && hex_pixel_on) begin
-				dbg_r = 8'h00; dbg_g = 8'hFF; dbg_b = 8'h00;
-			end else begin
-				dbg_r = 8'h00; dbg_g = 8'h10; dbg_b = 8'h00;
-			end
-		end else if (debug_ophex) begin
-			// Row I: Opcode hex — cyan on dark
-			if (hex_in_glyph && hex_pixel_on) begin
-				dbg_r = 8'h00; dbg_g = 8'hFF; dbg_b = 8'hFF;
-			end else begin
-				dbg_r = 8'h00; dbg_g = 8'h10; dbg_b = 8'h10;
-			end
-		end else if (debug_sahex) begin
-			// Row J: SDRAM addr hex — yellow on dark
-			if (hex_in_glyph && hex_pixel_on) begin
-				dbg_r = 8'hFF; dbg_g = 8'hFF; dbg_b = 8'h00;
-			end else begin
-				dbg_r = 8'h10; dbg_g = 8'h10; dbg_b = 8'h00;
-			end
-		end else if (debug_ovhex) begin
-			// Row K: Overlay trigger addr hex — magenta on dark
-			if (hex_in_glyph && hex_pixel_on) begin
-				dbg_r = 8'hFF; dbg_g = 8'h00; dbg_b = 8'hFF;
-			end else begin
-				dbg_r = 8'h10; dbg_g = 8'h00; dbg_b = 8'h10;
-			end
-		end else if (debug_r1hex) begin
-			// Row L: First ROM read — white on dark (2 digits SDRAM bank + 4 digits data)
-			if (hex_in_glyph && hex_pixel_on) begin
-				dbg_r = 8'hFF; dbg_g = 8'hFF; dbg_b = 8'hFF;
-			end else begin
-				dbg_r = 8'h10; dbg_g = 8'h10; dbg_b = 8'h10;
-			end
-		end else if (debug_rmhex) begin
-			// Row M: Last ROM PC — orange on dark.
-			// Frozen at the most recent fetch in $A00000-$AFFFFF;
-			// remains visible after the CPU wild-branches into RAM.
-			if (hex_in_glyph && hex_pixel_on) begin
-				dbg_r = 8'hFF; dbg_g = 8'h80; dbg_b = 8'h00;
-			end else begin
-				dbg_r = 8'h18; dbg_g = 8'h0C; dbg_b = 8'h00;
-			end
-		end else if (debug_vmon) begin
-			// Row G: V8 video monitor — 8 colored blocks
-			case (vmon_block)
-				0: begin dbg_r = 8'h00; dbg_g = vmon_val ? 8'hFF : 8'h30; dbg_b = 8'h00; end // fetch heartbeat: Green
-				1: begin dbg_r = vmon_val ? 8'hFF : 8'h30; dbg_g = vmon_val ? 8'hFF : 8'h30; dbg_b = 8'h00; end // nonzero heartbeat: Yellow
-				2: begin dbg_r = 8'h00; dbg_g = vmon_val ? 8'hFF : 8'h30; dbg_b = vmon_val ? 8'hFF : 8'h30; end // bypass test: Cyan
-				3: begin dbg_r = vmon_val ? 8'hFF : 8'h30; dbg_g = 8'h00; dbg_b = vmon_val ? 8'hFF : 8'h30; end // palette test: Magenta
-				4: begin dbg_r = vmon_val ? 8'hFF : 8'h30; dbg_g = 8'h00; dbg_b = 8'h00; end // mode bit 0: Red
-				5: begin dbg_r = vmon_val ? 8'hFF : 8'h30; dbg_g = 8'h00; dbg_b = 8'h00; end // mode bit 1: Red
-				6: begin dbg_r = vmon_val ? 8'hFF : 8'h30; dbg_g = 8'h00; dbg_b = 8'h00; end // mode bit 2: Red
-				default: begin dbg_r = 8'hFF; dbg_g = vmon_val ? 8'hFF : 8'h30; dbg_b = 8'hFF; end // ariel_written: W
-			endcase
-		end
-	end
-
-	// Video Output
-	assign VGA_R  = (debug_any && v8_de) ? dbg_r : v8_vga_r;
-	assign VGA_G  = (debug_any && v8_de) ? dbg_g : v8_vga_g;
-	assign VGA_B  = (debug_any && v8_de) ? dbg_b : v8_vga_b;
+	// Video Output — straight V8 video, no overlays.
+	assign VGA_R  = v8_vga_r;
+	assign VGA_G  = v8_vga_g;
+	assign VGA_B  = v8_vga_b;
 	assign VGA_DE = v8_de;
 	assign VGA_VS = v8_vsync;
 	assign VGA_HS = v8_hsync;
@@ -1045,9 +658,8 @@ module emu
 		.we(selectAriel && !_cpuRW && cpuBusControl),
 		.req(selectAriel && cpuBusControl),
 
-		// The RAMDAC now takes the index from v8_video and returns RGB data
-		// Palette test mode: override with h_count gradient to test palette independently of SDRAM
-		.pixel_index(palette_test ? dbg_x[8:1] : ariel_pixel_addr),
+		// The RAMDAC takes the pixel index from v8_video and returns RGB data
+		.pixel_index(ariel_pixel_addr),
 		.rgb_out(ariel_palette_data),
 		.ariel_written(ariel_written)
 	);
@@ -1095,11 +707,9 @@ module emu
 		.video_mode(v8_video_mode),
 		.monitor_id(v8_monitor_id),
 
-		// Test / diagnostic controls (OSD-controlled).
-		// Turn 2 confirmed pipeline works with hardwired bypass=1;
-		// reverted to status[5] for Turn 3+.
-		.test_bypass_vram(status[5]),
-		.test_pattern_sel(status[18:17]),
+		// Test / diagnostic controls — disabled (OSD test options removed).
+		.test_bypass_vram(1'b0),
+		.test_pattern_sel(2'b00),
 
 		// Video Signals
 		.hsync(v8_hsync),
@@ -1239,26 +849,7 @@ module emu
 		.sd_buff_addr(sd_buff_addr),
 		.sd_buff_dout(sd_buff_dout),
 		.sd_buff_din(sd_buff_din),
-		.sd_buff_wr(sd_buff_wr),
-
-		// VIA SR debug
-		.via_sr_dbg_bit_cnt(via_sr_dbg_bit_cnt),
-		.via_sr_dbg_edge_pending(via_sr_dbg_edge_pending),
-		.via_sr_dbg_fall_pending(via_sr_dbg_fall_pending),
-		.via_sr_dbg_shift_reg(via_sr_dbg_shift_reg),
-		.via_sr_dbg_active(via_sr_dbg_active),
-		.via_sr_dbg_dir(via_sr_dbg_dir),
-		.via_sr_dbg_cb1(via_sr_dbg_cb1),
-		.via_sr_dbg_cb2(via_sr_dbg_cb2),
-
-		.egret_dbg_running(egret_dbg_running),
-		.egret_dbg_port_test_done(egret_dbg_port_test_done),
-		.egret_dbg_handshake_done(egret_dbg_handshake_done),
-		.egret_dbg_treq(egret_dbg_treq),
-		.egret_dbg_tip(egret_dbg_tip),
-		.egret_dbg_byteack(egret_dbg_byteack),
-		.egret_dbg_reset_680x0(egret_dbg_reset_680x0),
-		.egret_dbg_cpu_reset_out(egret_dbg_cpu_reset_out)
+		.sd_buff_wr(sd_buff_wr)
 	);
 
 	reg disk_act;
@@ -1353,114 +944,27 @@ module emu
 	wire download_cycle = dio_download && dioBusControl;
 
 	// ============================================================
-	// VRAM Init Writer (Turn 3)
+	// VRAM is left uninitialized — the Mac's video driver clears and
+	// fills the framebuffer itself (matches real hardware). The old
+	// rainbow test-pattern seeder was removed.
 	// ============================================================
-	// After ROM download finishes, sweeps the 256K-word VRAM region
-	// ($580000-$5BFFFF) and writes a known pattern so the V8 video can
-	// render real-looking pixels even before the CPU writes the framebuffer.
-	// The CPU is held in reset until init completes (~130ms).
-	//
-	// Pattern: 32x32 px checker cells, palette index per cell =
-	//   { cell_y[2:0] /*hue 0-7*/, cell_x[4:0] /*brightness 0-31*/ }
-	// In SDRAM word terms, counter c maps to byte address 2*c at VRAM base:
-	//   y         = c[17:9]   (row, 0..511 — only 0..383 visible)
-	//   x_word    = c[8:0]    (word offset in row, 0..511)
-	//   x_byte    = c[8:0]*2  (= byte position in 1024-byte stride row)
-	//   cell_y    = y[8:5]    = c[14:10]
-	//   cell_x    = x_byte[8:5] = c[6:4]
-	// Cell color encodes:
-	//   bits[7:5] = hue   = cell_y[2:0] = c[12:10]
-	//   bits[4:0] = bri/8 = cell_x      = c[6:4] → 5-bit brightness 0..7
-	// Resulting visual: 8 hue rows (every 32 px tall), 8 brightness columns
-	// (every 32 px wide), giving a 64-cell 8x8 patch repeated to fill VRAM.
-	localparam [22:0] VINIT_SDRAM_BASE = 23'h580000;
-	localparam [17:0] VINIT_LAST_WORD  = 18'h3FFFF;  // 256K-1 = 262143
-	reg [1:0]  vinit_state;
-	localparam [1:0] VINIT_IDLE = 2'd0, VINIT_WRITING = 2'd1, VINIT_DONE = 2'd2;
-	reg [17:0] vinit_cnt;
-	reg        vinit_dio_was;
-	reg        dio_dl_prev2;
-
-	wire        vinit_active     = (vinit_state == VINIT_WRITING);
-	wire [22:0] vinit_sdram_addr = VINIT_SDRAM_BASE + {5'b0, vinit_cnt};
-	// Address decomposition for the 1024-byte stride / 8bpp layout:
-	//   y       = vinit_cnt[17:9]   (scanline row 0..511, visible 0..383)
-	//   x_word  = vinit_cnt[8:0]    (word offset within row 0..511)
-	//   x_byte  = vinit_cnt[8:0]*2  (byte position 0..1022, visible <1024)
-	// Cells of 32 rows tall × 64 px wide. With the V8's current 8x
-	// horizontal stretching (1 word per 16 clk_sys vs. 2 px per word in
-	// 8bpp) each c value visually covers ~8 pixels, so 8 c values give
-	// us a 64-pixel-wide cell.
-	//   hue  = y[7:5]      = vinit_cnt[16:14]      (8 hue rows × 32 px)
-	//   bri  = x_word[5:3] = vinit_cnt[5:3]        (8 bri cols × 64 px)
-	// Encoded byte = {hue, 2'b10, bri} → palette index whose top 3 bits
-	// pick the hue bin and bottom 5 bits give a moderate brightness.
-	wire [7:0]  vinit_byte       = {vinit_cnt[16:14], 2'b10, vinit_cnt[5:3]};
-	wire [15:0] vinit_pattern    = {vinit_byte, vinit_byte};
-	wire        vinit_cycle      = vinit_active && dioBusControl;
-
-	always @(posedge clk_sys) begin
-		dio_dl_prev2 <= dio_download;
-		vinit_dio_was <= dioBusControl;
-		if (!pll_locked) begin
-			vinit_state <= VINIT_IDLE;
-			vinit_cnt   <= 18'd0;
-		end else case (vinit_state)
-			VINIT_IDLE: begin
-				// Start when dio_download falls (ROM finished). The
-				// status[19] OSD bit ("Seed VRAM") gates this: when set
-				// (=Off), the writer skips straight to DONE and VRAM is
-				// left zeroed, so the V8 displays whatever the CPU writes
-				// (or black if it never does).
-				if (dio_dl_prev2 && !dio_download) begin
-					if (status[19]) begin
-						vinit_state <= VINIT_DONE;
-					end else begin
-						vinit_state <= VINIT_WRITING;
-						vinit_cnt   <= 18'd0;
-					end
-				end
-			end
-			VINIT_WRITING: begin
-				// Advance counter after each dioBusControl pulse falls
-				if (vinit_dio_was && !dioBusControl) begin
-					if (vinit_cnt == VINIT_LAST_WORD) begin
-						vinit_state <= VINIT_DONE;
-					end else begin
-						vinit_cnt <= vinit_cnt + 1'd1;
-					end
-				end
-			end
-			VINIT_DONE: ;
-			default: vinit_state <= VINIT_IDLE;
-		endcase
-	end
-
-	// SignalTap-keep wires for JTAG probing
-	wire [1:0]  stp_vinit_state = vinit_state /* synthesis keep */;
-	wire [17:0] stp_vinit_cnt   = vinit_cnt   /* synthesis keep */;
 
 	////////////////////////// SDRAM /////////////////////////////////
 
 	// SDRAM Address mapping for Mac LC (V8-style):
 	// memoryAddr[22:0] is already the SDRAM word address from addrController
 	// Download path uses dio_a[22:0] directly
-	wire [24:0] sdram_addr = vinit_cycle    ? {2'b00, vinit_sdram_addr} :
-	                         download_cycle ? {2'b00, dio_a[22:0]} :
+	wire [24:0] sdram_addr = download_cycle ? {2'b00, dio_a[22:0]} :
 	                                          {2'b00, memoryAddr[22:0]};
-	wire [15:0] sdram_din  = vinit_cycle    ? vinit_pattern :
-	                         download_cycle ? dio_data :
+	wire [15:0] sdram_din  = download_cycle ? dio_data :
 	                                          memoryDataOut;
-	wire  [1:0] sdram_ds   = vinit_cycle    ? 2'b11 :
-	                         download_cycle ? 2'b11 :
+	wire  [1:0] sdram_ds   = download_cycle ? 2'b11 :
 	                                          { !_memoryUDS, !_memoryLDS };
-	wire        sdram_we   = vinit_cycle    ? 1'b1 :
-	                         download_cycle ? dio_write :
+	wire        sdram_we   = download_cycle ? dio_write :
 	                                          !_ramWE;
-	wire        sdram_oe   = vinit_cycle    ? 1'b0 :
-	                         download_cycle ? 1'b0 :
+	wire        sdram_oe   = download_cycle ? 1'b0 :
 	                                          (!_ramOE || !_romOE || dskReadAckInt || dskReadAckExt);
-	wire [15:0] sdram_do   = (download_cycle || vinit_active) ? 16'hffff :
+	wire [15:0] sdram_do   = download_cycle ? 16'hffff :
 	                         (dskReadAckInt || dskReadAckExt) ? extra_rom_data_demux :
 	                                                            sdram_out;
 	// during rom/disk download ffff is returned so the screen is black during download

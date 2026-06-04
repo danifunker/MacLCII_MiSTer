@@ -76,6 +76,9 @@ set_global_assignment -name SEED 1
 # Use real 68HC05 CPU + Egret ROM instead of state machine (cuda_maclc.sv)
 set_global_assignment -name VERILOG_MACRO "USE_EGRET_CPU=1"
 
+# Enable the ASC FIFO + sample-output audio path (else asc.sv is a silent stub)
+set_global_assignment -name VERILOG_MACRO "USE_ASC_AUDIO=1"
+
 source sys/sys.tcl
 set_global_assignment -name FAMILY "Cyclone V"
 set_global_assignment -name DEVICE 5CSEBA6U23I7
