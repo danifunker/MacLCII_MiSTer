@@ -168,7 +168,10 @@ const int input_menu = 12;
 #define VGA_SCALE_X vga_scale
 #define VGA_SCALE_Y vga_scale
 SimVideo video(VGA_WIDTH, VGA_HEIGHT, VGA_ROTATE);
-float vga_scale = 1.5;
+// Default 1:1 so the full 640x480 frame fits the video window on a typical
+// display (at 1.5x the 960x720 image + panels overran many screens, clipping
+// the bottom/right edges). Use the Zoom slider to scale up.
+float vga_scale = 1.0;
 
 // Verilog module
 // --------------
@@ -883,18 +886,12 @@ int main(int argc, char** argv, char** env) {
 			if (event.type == SDL_QUIT)
 				done = true;
 
-			// Mouse capture: accumulate relative motion and warp back to centre.
+			// Mouse capture uses SDL relative mode: the OS cursor is hidden and
+			// confined, and motion.xrel/yrel give pure relative deltas, so the
+			// pointer can never wander off the emulated screen.
 			if (event.type == SDL_MOUSEMOTION && mouse_captured) {
-				int win_w, win_h;
-				SDL_GetWindowSize(window, &win_w, &win_h);
-				int cx = win_w / 2, cy = win_h / 2;
-				int dx = event.motion.x - cx;
-				int dy = event.motion.y - cy;
-				if (dx != 0 || dy != 0) {
-					sdl_mouse_dx += dx;
-					sdl_mouse_dy += dy;
-					SDL_WarpMouseInWindow(window, cx, cy);
-				}
+				sdl_mouse_dx += event.motion.xrel;
+				sdl_mouse_dy += event.motion.yrel;
 			}
 			if (mouse_captured) {
 				if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT)
@@ -904,8 +901,10 @@ int main(int argc, char** argv, char** env) {
 			}
 			// Esc / F1 releases the captured mouse.
 			if (event.type == SDL_KEYDOWN && mouse_captured &&
-			    (event.key.keysym.sym == SDLK_ESCAPE || event.key.keysym.sym == SDLK_F1))
+			    (event.key.keysym.sym == SDLK_ESCAPE || event.key.keysym.sym == SDLK_F1)) {
 				mouse_captured = false;
+				SDL_SetRelativeMouseMode(SDL_FALSE);
+			}
 		}
 #endif
 		video.StartFrame();
@@ -960,7 +959,9 @@ int main(int argc, char** argv, char** env) {
 
 		int windowX = 550;
 		int windowWidth = (VGA_WIDTH * VGA_SCALE_X) + 24;
-		int windowHeight = (VGA_HEIGHT * VGA_SCALE_Y) + 90;
+		// +120: room for the zoom/rotate/flip controls, the stats line, and the
+		// mouse-capture status line below the image, so the full frame is visible.
+		int windowHeight = (VGA_HEIGHT * VGA_SCALE_Y) + 120;
 
 		// Video window
 		ImGui::Begin(windowTitle_Video);
@@ -980,9 +981,7 @@ int main(int argc, char** argv, char** env) {
 		ImGui::InvisibleButton("##vga_capture", vga_size);
 		if (ImGui::IsItemClicked(0)) {
 			mouse_captured = true;
-			int win_w, win_h;
-			SDL_GetWindowSize(window, &win_w, &win_h);
-			SDL_WarpMouseInWindow(window, win_w / 2, win_h / 2);
+			SDL_SetRelativeMouseMode(SDL_TRUE);   // hide + confine the host cursor
 		}
 		ImGui::Text("%s", mouse_captured ? "Mouse captured - press Esc or F1 to release"
 		                                  : "Click display to capture mouse");
@@ -1060,33 +1059,37 @@ int main(int argc, char** argv, char** env) {
 			break;
 		}
 
-		// Pass inputs to sim - PS2 mouse for Mac
-		mouse_buttons = 0;
-		mouse_x = 0;
-		mouse_y = 0;
+		// Pass inputs to sim - PS2 mouse for Mac.  Build the MiSTer ps2_mouse
+		// packet with the X/Y SIGN bits (bit4 = X<0, bit5 = Y<0) — the core reads
+		// these as the 9th (sign) bit of the delta, so without them every negative
+		// move looks like a large positive one (mouse only goes right/down).
+		int dx = 0, dy = 0;
+		int btn = 0;
 		if (mouse_captured) {
-			// Real host mouse: relative motion accumulated this frame (SDL screen
-			// Y is down-positive; the ADB/Mac wants up-positive, so negate Y).
-			int mx = sdl_mouse_dx;
-			int my = -sdl_mouse_dy;
-			if (mx > 127) mx = 127; if (mx < -127) mx = -127;
-			if (my > 127) my = 127; if (my < -127) my = -127;
-			mouse_x = (unsigned char)(signed char)mx;
-			mouse_y = (unsigned char)(signed char)my;
-			if (sdl_mouse_btn) mouse_buttons |= (1UL << 0);
+			// Real host mouse: relative motion accumulated this frame.  SDL screen
+			// Y is down-positive; the Mac wants up-positive, so negate dy.
+			dx =  sdl_mouse_dx;
+			dy = -sdl_mouse_dy;
+			if (sdl_mouse_btn) btn |= 0x01;
 		} else {
-			// Fallback: arrow keys / A,B buttons drive the mouse when not captured.
-			if (input.inputs[input_left]) { mouse_x = -2; }
-			if (input.inputs[input_right]) { mouse_x = 2; }
-			if (input.inputs[input_up]) { mouse_y = 2; }
-			if (input.inputs[input_down]) { mouse_y = -2; }
-			if (input.inputs[input_a]) { mouse_buttons |= (1UL << 0); }  // Left click
-			if (input.inputs[input_b]) { mouse_buttons |= (1UL << 1); }  // Right click
+			// Fallback: arrow keys / A,B buttons when the mouse isn't captured.
+			if (input.inputs[input_left])  dx = -2;
+			if (input.inputs[input_right]) dx =  2;
+			if (input.inputs[input_up])    dy =  2;
+			if (input.inputs[input_down])  dy = -2;
+			if (input.inputs[input_a])     btn |= 0x01;
+			if (input.inputs[input_b])     btn |= 0x02;
 		}
+		if (dx >  127) dx =  127; if (dx < -127) dx = -127;
+		if (dy >  127) dy =  127; if (dy < -127) dy = -127;
 
-		unsigned long mouse_temp = mouse_buttons;
-		mouse_temp += (mouse_x << 8);
-		mouse_temp += (mouse_y << 16);
+		unsigned char status_byte = (unsigned char)(btn & 0x07) | 0x08;
+		if (dx < 0) status_byte |= 0x10;   // X sign  -> ps2_mouse[4]
+		if (dy < 0) status_byte |= 0x20;   // Y sign  -> ps2_mouse[5]
+
+		unsigned long mouse_temp = status_byte;
+		mouse_temp |= ((unsigned char)dx << 8);
+		mouse_temp |= ((unsigned char)dy << 16);
 		if (mouse_clock) { mouse_temp |= (1UL << 24); }
 		mouse_clock = !mouse_clock;
 
