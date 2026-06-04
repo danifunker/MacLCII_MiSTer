@@ -1,0 +1,17 @@
+# Line-ending policy for files synced from the MiSTer template (../Template_MiSTer).
+#
+# Scoped to EXACT paths on purpose: the repo currently has a mix of committed
+# line endings in sys/ (LF, CRLF, and a few mixed). A broad pattern like *.v or
+# *.sv would force-renormalize those existing blobs and produce huge whole-file
+# diffs. These exact paths cover only the files involved in the template update,
+# all of which are already stored as LF, so pinning them to eol=lf is churn-free.
+#
+# Effect: these files are treated as text and always stored/checked out with LF,
+# regardless of the editor or OS (immune to core.autocrlf).
+/MacLC.sv          text eol=lf
+/sys/sys_top.v     text eol=lf
+/sys/hps_io.sv     text eol=lf
+/sys/osd.v         text eol=lf
+/sys/sys.qip       text eol=lf
+/sys/audio_out.sv  text eol=lf
+/sys/emu_ports.vh  text eol=lf
