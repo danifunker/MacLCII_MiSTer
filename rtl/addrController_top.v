@@ -152,11 +152,13 @@ module addrController_top(
 	// fabricated a phantom 8MB SIMM at $0, turning $0 into a SEPARATE bank instead
 	// of a $800000 mirror; the boot's bank scan then recorded a phantom $0 entry and
 	// the march clobbered the descriptor table at $9FFFEC.
-	wire [22:0] simm_byte_size = (ram_config_phys[7:6] == 2'b00) ? 23'h000000 :  // 0MB
-	                              (ram_config_phys[7:6] == 2'b01) ? 23'h200000 :  // 2MB
-	                              (ram_config_phys[7:6] == 2'b10) ? 23'h400000 :  // 4MB
-	                                                                23'h800000;   // 8MB
-	wire [21:0] simm_word_size = simm_byte_size[22:1];
+	// NOTE: 8MB = $800000 needs bit 23, so this field MUST be 24 bits wide.
+	// A 23-bit field silently truncated $800000 to 0, killing the 8MB/10MB config.
+	wire [23:0] simm_byte_size = (ram_config_phys[7:6] == 2'b00) ? 24'h000000 :  // 0MB
+	                              (ram_config_phys[7:6] == 2'b01) ? 24'h200000 :  // 2MB
+	                              (ram_config_phys[7:6] == 2'b10) ? 24'h400000 :  // 4MB
+	                                                                24'h800000;   // 8MB
+	wire [22:0] simm_word_size = simm_byte_size[23:1];
 
 	// CPU address classification for RAM
 	wire motherboard_high = (cpuAddr[23:21] == 3'b100);  // $800000-$9FFFFF
@@ -166,7 +168,8 @@ module addrController_top(
 	wire [21:0] cpu_word = cpuAddr[22:1];
 
 	// Motherboard mirror offset: (cpu_word - simm_words) mod 2MB
-	wire [21:0] mb_mirror_offset_raw = cpu_word - simm_word_size;
+	// (dead when the SIMM fills the whole lower bank, e.g. 8MB, but kept width-clean)
+	wire [22:0] mb_mirror_offset_raw = {1'b0, cpu_word} - simm_word_size;
 	wire [19:0] mb_mirror_offset = mb_mirror_offset_raw[19:0];  // Wrap to 2MB (1M words)
 
 	// V8 RAM translation to SDRAM word address
