@@ -20,6 +20,7 @@ module dataController_top(
 	input [3:0] cpuAddrRegHi, // A12-A9
 	input [2:0] cpuAddrRegMid, // A6-A4
 	input [1:0] cpuAddrRegLo, // A2-A1
+	input cpuLongword,         // TG68 longword-access flag (for SCSI pseudo-DMA)
 	input _cpuUDS,
 	input _cpuLDS,	
 	input _cpuRW,
@@ -27,6 +28,8 @@ module dataController_top(
 	
 	// peripherals:
 	input selectSCSI,
+	input selectSCSIDMA,    // SCSI pseudo-DMA window (DACK)
+	output scsiDREQ,        // SCSI pseudo-DMA request (gates CPU DTACK upstream)
 	input selectSCC,
 	input selectIWM,
 	input selectVIA,
@@ -233,7 +236,7 @@ module dataController_top(
 	wire [15:0] viaDataOut;
 	wire [15:0] swimDataOut;
 	wire [7:0] sccDataOut;
-	wire [7:0] scsiDataOut;
+	wire [15:0] scsiDataOut;   // 16-bit: ncr5380 returns word for pseudo-DMA, byte-duplicated otherwise
 	wire mouseX1, mouseX2, mouseY1, mouseY2, mouseButton;
 	
 	// Mac LC interrupt priorities (active low encoding: 111=none, 110=1, 101=2, 011=4, etc.)
@@ -253,7 +256,8 @@ module dataController_top(
 	// CPU-side data output mux
     wire [15:0] viaDataOut_full = viaDataOut;
     wire [15:0] sccDataOut_full = { sccDataOut, sccDataOut };
-    wire [15:0] scsiDataOut_full = { scsiDataOut, scsiDataOut };
+    // scsiDataOut is already 16-bit: ncr5380 returns cur_data_pair on word
+    // pseudo-DMA reads and { rdata8, rdata8 } otherwise — no duplication here.
     wire [15:0] arielDataOut_full = {ariel_data_in, ariel_data_in};
     wire [15:0] pviaDataOut_full = {pseudovia_data_in, pseudovia_data_in};
     wire [15:0] ascDataOut_full = {asc_data_in, asc_data_in};
@@ -261,7 +265,7 @@ module dataController_top(
     assign cpuDataOut = selectIWM ? swimDataOut :
                         selectVIA ? viaDataOut_full :
                         selectSCC ? sccDataOut_full :
-                        selectSCSI ? scsiDataOut_full :
+                        selectSCSI ? scsiDataOut :
                         selectAriel ? arielDataOut_full :
                         selectPseudoVIA ? pviaDataOut_full :
                         selectASC ? ascDataOut_full :
@@ -316,21 +320,27 @@ module dataController_top(
 	// Memory-side
 	assign memoryDataOut = cpuDataIn;
 
-	// SCSI
-	ncr5380 #(SCSI_DEVS) scsi(
+	// SCSI (NCR5380 with Mac LC pseudo-DMA — ported from lbmactwo)
+	// Mac LC V8: SCSI (like SWIM) lives on the UPPER byte at even addresses, so
+	// ior/iow gate on _cpuUDS and the 16-bit data path is duplicated/serialised
+	// inside the ncr5380. DACK is the decoded pseudo-DMA window (selectSCSIDMA,
+	// $F06000/$F12000) — NOT A9 as on the Mac Plus. dma_word/dma_longword/
+	// dma_second_word describe the 68020 access width so the chip packs 1/2/4
+	// bytes per cycle (matches MAME scsi_drq_r/w). dreq feeds the CPU DTACK
+	// gate upstream so a pseudo-DMA cycle stalls until the target has data.
+	ncr5380 #(.DEVS(SCSI_DEVS), .ENABLE_EMPTY_CD(0)) scsi(
 		.clk(clk32),
 		.reset(!_cpuReset),
 		.bus_cs(selectSCSI),
 		.bus_rs(cpuAddrRegMid),
-		// Mac LC V8: SCSI (like SWIM) lives on the UPPER byte at even addresses.
-		// Reads already used _cpuUDS / D15-D8; writes were wrongly on _cpuLDS /
-		// D7-D0, so byte writes to even regs (e.g. MR_ARB=$01 → $F10020) never
-		// fired iow → mr[0] never set → ICR AIP stuck 0 → the boot's SCSI
-		// arbitration scan ($A076D8) spun forever. MAME scsi_w uses (data >> 8).
-		.ior(!_cpuUDS),
-		.iow(!_cpuUDS),
-		.dack(cpuAddrRegHi[0]),   // A9
-		.wdata(cpuDataIn[15:8]),
+		.ior(_cpuRW && !_cpuUDS),
+		.iow(!_cpuRW && !_cpuUDS),
+		.dack(selectSCSIDMA),
+		.dma_word(!_cpuUDS && !_cpuLDS),
+		.dma_longword(cpuLongword),
+		.dma_second_word(cpuAddrRegLo[0]),
+		.dreq(scsiDREQ),
+		.wdata(cpuDataIn),
 		.rdata(scsiDataOut),
 
 		// connections to io controller
@@ -344,7 +354,14 @@ module dataController_top(
 		.sd_buff_addr(sd_buff_addr),
 		.sd_buff_dout(sd_buff_dout),
 		.sd_buff_din(sd_buff_din),
-		.sd_buff_wr(sd_buff_wr)
+		.sd_buff_wr(sd_buff_wr),
+
+		// JTAG debug outputs unused in this core
+		.dbg_scsi(),
+		.dbg_scsi2(),
+		.dbg_scsi3(),
+		.dbg_scsi4(),
+		.dbg_scsi5()
 	);
 
 	// count vblanks, and set 1 second interrupt after 60 vblanks

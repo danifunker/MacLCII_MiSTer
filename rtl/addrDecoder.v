@@ -64,6 +64,7 @@ module addrDecoder(
     output reg selectRAM,
     output reg selectROM,
     output reg selectSCSI,
+    output reg selectSCSIDMA,   // SCSI pseudo-DMA window (DRQ regions $F06000/$F12000)
     output reg selectSCC,
     output reg selectIWM,
     output reg selectASC,
@@ -116,6 +117,7 @@ module addrDecoder(
         selectRAM = 0;
         selectROM = 0;
         selectSCSI = 0;
+        selectSCSIDMA = 0;
         selectSCC = 0;
         selectIWM = 0;
         selectASC = 0;
@@ -158,14 +160,14 @@ module addrDecoder(
                     // SCC: $F04000-$F05FFF
                     8'b0000_010?: selectSCC = 1;
 
-                    // SCSI DRQ: $F06000-$F07FFF
-                    8'b0000_011?: selectSCSI = 1;
+                    // SCSI DRQ: $F06000-$F07FFF (pseudo-DMA window)
+                    8'b0000_011?: begin selectSCSI = 1; selectSCSIDMA = 1; end
 
-                    // SCSI: $F10000-$F11FFF
+                    // SCSI: $F10000-$F11FFF (NCR5380 registers)
                     8'b0001_000?: selectSCSI = 1;
 
-                    // SCSI DRQ: $F12000-$F13FFF
-                    8'b0001_001?: selectSCSI = 1;
+                    // SCSI DRQ: $F12000-$F13FFF (pseudo-DMA window)
+                    8'b0001_001?: begin selectSCSI = 1; selectSCSIDMA = 1; end
 
                     // ASC: $F14000-$F15FFF
                     8'b0001_010?: selectASC = 1;

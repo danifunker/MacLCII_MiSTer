@@ -46,6 +46,7 @@ module addrController_top(
 
 	// peripherals:
 	output selectSCSI,
+	output selectSCSIDMA,
 	output selectSCC,
 	output selectIWM,
 	output selectASC,
@@ -230,6 +231,7 @@ module addrController_top(
 		.selectRAM(selectRAM),
 		.selectROM(selectROM),
 		.selectSCSI(selectSCSI),
+		.selectSCSIDMA(selectSCSIDMA),
 		.selectSCC(selectSCC),
 		.selectIWM(selectIWM),
 		.selectASC(selectASC),
