@@ -49,3 +49,13 @@ scratch/
 verilator/*.out
 verilator/*.err
 verilator/build*.log
+
+# local/personal env (host IP, ssh key path) — never commit
+scripts/local.env
+# debug captures / build artifacts kept locally
+*.zip
+*.stp
+quartus_build*.log
+MacLC_baseline_pre_fw.rbf
+verilator/asc_sim.log
+verilator/sim_stdout.log

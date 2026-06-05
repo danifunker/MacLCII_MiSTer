@@ -29,13 +29,7 @@ module maclc_v8_video(
     output reg ce_pix,
 
     output [7:0] palette_addr,
-    input [23:0] palette_data,
-
-    // Debug telemetry (live)
-    output reg [31:0] dbg_latch_count,    // total VRAM latches since reset
-    output reg [15:0] dbg_last_data,      // most recent word fetched
-    output reg [21:0] dbg_last_addr,      // address that produced it
-    output reg [15:0] dbg_nonzero_count   // count of fetches where data != 0 and != FFFF
+    input [23:0] palette_data
 );
 
 localparam [21:0] VRAM_BASE = 22'h0;  // Outputs byte offset; SDRAM base added in addrController
@@ -87,6 +81,10 @@ reg [9:0] v_count;
 
 // Pixel clock enable: divide clk_sys by 2
 // clk_sys=32.5MHz / 2 = 16.25MHz pixel clock (close to Mac LC's 15.6672MHz)
+// NOTE: a fractional (Bresenham) pix_en for a 25.175MHz VGA dot clock was tried
+// and REVERTED — with CLK_VIDEO fixed at clk_sys, a non-uniform CE_PIXEL makes
+// the clk_sys-cycles-per-line jitter, which the scaler renders as a shaky image.
+// A proper 640x480@60Hz needs a dedicated 25.175MHz PLL clock, not a fractional enable.
 reg pix_div;
 always @(posedge clk_sys) begin
     if (reset)
@@ -232,6 +230,11 @@ end
 always @(posedge clk_sys) begin
     if (pix_en) begin
         if (hblank || vblank) begin
+            // Blank: clear the shift register. NOTE: a 0xFFFF fill was tried to turn
+            // the leading-edge startup pixels black, but index 0xFF is not reliably
+            // black across palette states and produced an intermittent left-edge line
+            // on hardware — reverted. A proper fix forces RGB=0 for the pre-first-word
+            // pixels (palette-independent); deferred to the video cosmetic pass.
             pixel_shift <= 16'h0000;
             shift_count <= 0;
         end else if (video_latch_pending) begin
@@ -290,26 +293,6 @@ end
 
 assign pixel_index = test_bypass_vram ? pixel_index_test : pixel_index_real;
 assign palette_addr = pixel_index;
-
-// --- Debug telemetry ---
-// Counts every VRAM latch into the V8 video module, records the most recent
-// fetched word + address, and tallies fetches that returned a "non-trivial"
-// value (not 0x0000 and not 0xFFFF) — handy for confirming the CPU has
-// started writing real pixel data.
-always @(posedge clk_sys) begin
-    if (reset) begin
-        dbg_latch_count   <= 32'd0;
-        dbg_nonzero_count <= 16'd0;
-        dbg_last_data     <= 16'd0;
-        dbg_last_addr     <= 22'd0;
-    end else if (video_latch && !hblank && !vblank) begin
-        dbg_latch_count <= dbg_latch_count + 32'd1;
-        dbg_last_data   <= video_data_in;
-        dbg_last_addr   <= video_addr;
-        if (video_data_in != 16'h0000 && video_data_in != 16'hFFFF)
-            dbg_nonzero_count <= dbg_nonzero_count + 16'd1;
-    end
-end
 
 // Pipeline delay: palette RAM read is synchronous (1-cycle latency),
 // so delay de, video_mode, and video_data to align with palette_data output.

@@ -37,6 +37,7 @@ module adb_device(
 	localparam [17:0] D_SHORT = 18'd340;   // ADB short cell phase
 	localparam [17:0] D_LONG  = 18'd600;   // ADB long  cell phase
 	localparam [17:0] D_T1T   = 18'd1200;  // stop -> device-response gap (Tlt)
+	localparam [17:0] D_SRQ   = 18'd2700;  // service-request low pulse (~3 bit cells); tunable
 
 	localparam [3:0] ADDR_KBD   = 4'd2;
 	localparam [3:0] ADDR_MOUSE = 4'd3;
@@ -82,7 +83,11 @@ module adb_device(
 	// ---- main state machine ----
 	localparam [3:0]
 		S_IDLE = 4'd0, S_ATTN = 4'd1, S_BITS = 4'd2, S_TSTOP = 4'd3,
-		S_T1T  = 4'd4, S_SEND = 4'd5;
+		S_T1T  = 4'd4, S_SEND = 4'd5,
+		// Listen receive (host -> device data packet, e.g. Register 3 address reassign)
+		S_LRX_WAIT = 4'd6, S_LRX_START = 4'd7, S_LRX_BITS = 4'd8, S_LRX_DONE = 4'd9,
+		// Service Request: hold the bus low after a non-mouse poll while mouse data is pending
+		S_SRQ = 4'd10;
 	reg [3:0]  st;
 	reg [7:0]  command;
 	reg [3:0]  bitcnt;
@@ -92,10 +97,23 @@ module adb_device(
 	reg [3:0]  send_bits;
 	reg [1:0]  send_byte;
 	reg        cur_bit;
+	reg [15:0] lrx_sr;       // Listen data shift register (16-bit Register 3 payload)
+	reg        lrx_target;   // which device this Listen addresses: 1 = mouse, 0 = keyboard
+`ifdef USE_ADB_ISSP
+	reg [7:0]  dbg_listen_seen;  // count of Listen R3 detected (entered S_LRX)
+	reg [7:0]  dbg_listen_done;  // count of Listen receive completed (reached S_LRX_DONE)
+`endif
 
 	wire [3:0] cmd_addr = command[7:4];
 	wire [1:0] cmd_type = command[3:2];
 	wire [1:0] cmd_reg  = command[1:0];
+
+	// Service Request: assert when EITHER emulated device (mouse addr 3 / keyboard
+	// addr 2) has pending data and the command just seen wasn't a poll of that
+	// device. Covers both so neither starves the other (the Egret autopolls only
+	// the last-active device; others must SRQ to get serviced).
+	wire srq_want = (mouse_evt    && cmd_addr != mouse_addr) ||
+	                (!kbdFifoEmpty && cmd_addr != kbd_addr);
 
 	always @(posedge clk) begin
 		if (reset) begin
@@ -105,6 +123,10 @@ module adb_device(
 			resp_len <= 0; resp0 <= 0; resp1 <= 0;
 			sendtmr <= 0; send_stage <= 0; send_sr <= 0; send_bits <= 0;
 			send_byte <= 0; cur_bit <= 0;
+			lrx_sr <= 0; lrx_target <= 0;
+`ifdef USE_ADB_ISSP
+			dbg_listen_seen <= 0; dbg_listen_done <= 0;
+`endif
 			kbdFifoRd <= 0; kbdFifoWr <= 0;
 			mouseX <= 0; mouseY <= 0; mouseButton <= 0; mouse_evt <= 0; mouse_init <= 1'b1;
 			kstb_s1 <= ps2_key[10]; kstb_s2 <= ps2_key[10]; kstb_s3 <= ps2_key[10]; kstb_d <= ps2_key[10];
@@ -693,6 +715,21 @@ module adb_device(
 					resp_len <= 2'd0;
 					if (cmd_type == 2'b00 && cmd_reg == 2'b00) begin
 						kbd_addr <= ADDR_KBD; mouse_addr <= ADDR_MOUSE; mouse_init <= 1'b1;
+						st <= S_T1T; sendtmr <= D_T1T; dev_line <= 1'b1;
+					end
+					// Listen Register 3 to one of our addresses = address reassignment.
+					// The host (Egret) follows the command with a 16-bit data packet that
+					// carries the new bus address; receive it in S_LRX_* and relocate.
+					// The OS does this during ADBReInit when System loads; without it the
+					// device is lost off its default address and the mouse/keyboard freeze.
+					else if (cmd_type == 2'b10 && cmd_reg == 2'b11 &&
+					         (cmd_addr == kbd_addr || cmd_addr == mouse_addr)) begin
+						lrx_target <= (cmd_addr == mouse_addr);  // 1 = mouse, 0 = keyboard
+						lrx_sr <= 16'd0; bitcnt <= 4'd0;
+						st <= S_LRX_WAIT; dev_line <= 1'b1;
+`ifdef USE_ADB_ISSP
+						dbg_listen_seen <= dbg_listen_seen + 8'd1;
+`endif
 					end
 					else if (cmd_type == 2'b11) begin // Talk
 						if (cmd_addr == kbd_addr) begin
@@ -732,9 +769,30 @@ module adb_device(
 								default: ;
 							endcase
 						end
+						// SRQ: if a device has data but this poll wasn't for it, hold the
+						// bus low after the command so the Egret services it next.
+						if (srq_want) begin
+							dev_line <= 1'b0; sendtmr <= D_SRQ; st <= S_SRQ;
+						end else begin
+							st <= S_T1T; sendtmr <= D_T1T; dev_line <= 1'b1;
+						end
 					end
-					st <= S_T1T; sendtmr <= D_T1T; dev_line <= 1'b1;
+					else begin
+						// Flush / Listen to another register / Talk to another address: no response
+						if (srq_want) begin
+							dev_line <= 1'b0; sendtmr <= D_SRQ; st <= S_SRQ;  // SRQ
+						end else begin
+							st <= S_T1T; sendtmr <= D_T1T; dev_line <= 1'b1;
+						end
+					end
 				end
+			end
+			S_SRQ: begin
+				// Hold the bus low to signal a pending mouse event (ADB Service Request),
+				// then drop into the normal response/idle path. The Egret detects the low
+				// and follows up by polling the mouse (Talk R0), which then sends data.
+				if (sendtmr != 0) sendtmr <= sendtmr - 18'd1;
+				else begin dev_line <= 1'b1; st <= S_T1T; sendtmr <= D_T1T; end
 			end
 			S_T1T: begin
 				if (sendtmr != 0) sendtmr <= sendtmr - 18'd1;
@@ -771,6 +829,40 @@ module adb_device(
 					default: begin dev_line <= 1'b1; st <= S_IDLE; end
 				endcase
 			end
+			// ---- Listen data reception (host -> device, e.g. Register 3 reassign) ----
+			// Mirrors the command receive framing: sample each data bit at the falling
+			// edge from the preceding high-phase length (long high = 1). The packet is a
+			// start bit then 16 data bits; a long-low attention re-syncs to a new command.
+			S_LRX_WAIT: begin
+				if (rise && (dur > T_ATTN)) begin st <= S_ATTN; command <= 0; bitcnt <= 0; end
+				else if (fall) st <= S_LRX_START;   // start-bit low begins
+			end
+			S_LRX_START: begin
+				if (rise && (dur > T_ATTN)) begin st <= S_ATTN; command <= 0; bitcnt <= 0; end
+				else if (fall) begin st <= S_LRX_BITS; bitcnt <= 4'd0; end  // consume start bit
+			end
+			S_LRX_BITS: begin
+				if (rise && (dur > T_ATTN)) begin st <= S_ATTN; command <= 0; bitcnt <= 0; end
+				else if (fall) begin
+					lrx_sr <= {lrx_sr[14:0], (dur > T_BITTH)};  // sample data bit (long high = 1)
+					bitcnt <= bitcnt + 4'd1;
+					if (bitcnt == 4'd15) st <= S_LRX_DONE;       // 16 data bits captured
+				end
+			end
+			S_LRX_DONE: begin
+				// Register 3 payload: byte0 bits[3:0] = new address, byte1 = handler ID.
+				// Honor only a VALID relocation: handler != self-test (0xFF) AND a real
+				// ADB address (1..15). A garbage 0 capture must NOT relocate the device
+				// to address 0 — the host never polls address 0, so that kills it.
+				if (lrx_sr[7:0] != 8'hFF && lrx_sr[11:8] != 4'd0) begin
+					if (lrx_target) mouse_addr <= lrx_sr[11:8];
+					else            kbd_addr   <= lrx_sr[11:8];
+				end
+`ifdef USE_ADB_ISSP
+				dbg_listen_done <= dbg_listen_done + 8'd1;
+`endif
+				st <= S_IDLE; dev_line <= 1'b1;
+			end
 			default: st <= S_IDLE;
 			endcase
 		end
@@ -781,6 +873,65 @@ module adb_device(
 		if (!reset && st == S_TSTOP && rise)
 			$display("ADBDEV[%0t]: cmd=%02x (addr=%0d type=%0d reg=%0d) resp_len=%0d",
 			         $time, command, command[7:4], command[3:2], command[1:0], resp_len);
+	always @(posedge clk)
+		if (!reset && st == S_LRX_DONE && lrx_sr[7:0] != 8'hFF)
+			$display("ADBDEV[%0t]: Listen R3 reassign %s -> addr %0d (handler %02x)",
+			         $time, lrx_target ? "mouse" : "kbd", lrx_sr[11:8], lrx_sr[7:0]);
+`endif
+
+`ifdef USE_ADB_ISSP
+	// JTAG In-System Sources & Probes (read-only) — JTAG observability without SignalTap.
+	// Read live in Quartus: Tools > In-System Sources and Probes Editor, instance "ADB".
+	//   probe[7:0]   = last ADB command byte (addr<<4 | type<<2 | reg)
+	//   probe[11:8]  = mouse_addr  (boot default 3; should change after System ADBReInit)
+	//   probe[15:12] = kbd_addr    (boot default 2)
+	//   probe[31:16] = last Listen-Register-3 payload {addr/flags byte, handler byte}
+	// Enabled via the USE_ADB_ISSP macro in MacLC.qsf; absent from release/Verilator builds.
+	// ---- mouse/keyboard data-path diagnostics (separate block; does not touch FSM) ----
+	reg [7:0] dbg_mtalk, dbg_ktalk, dbg_mmove, dbg_mresp;
+	reg [7:0] dbg_kbd_evt, dbg_ksrq;
+	always @(posedge clk) begin
+		if (reset) begin
+			dbg_mtalk<=0; dbg_ktalk<=0; dbg_mmove<=0; dbg_mresp<=0;
+			dbg_kbd_evt<=0; dbg_ksrq<=0;
+		end
+		else begin
+			if (st == S_TSTOP && rise && cmd_type == 2'b11 && cmd_reg == 2'd0) begin
+				if (cmd_addr == mouse_addr) begin
+					dbg_mtalk <= dbg_mtalk + 8'd1;          // OS polled the mouse (Talk R0)
+					if (mouse_evt) dbg_mresp <= dbg_mresp + 8'd1;  // device had data to send
+				end
+				if (cmd_addr == kbd_addr) dbg_ktalk <= dbg_ktalk + 8'd1; // OS polled the keyboard
+			end
+			if (mouse_edge && (mX_s2 != 9'd0 || mY_s2 != 9'd0 || mBtn_s2 != mouseButton))
+				dbg_mmove <= dbg_mmove + 8'd1;             // PS2 movement reached adb_device
+			// keyboard data-path diagnostics:
+			//   kbd_evt = a decoded key was pushed into kbdFifo (the PS2->ADB path works)
+			//   ksrq    = a command NOT addressed to the keyboard was seen while the kbd FIFO
+			//             held data, so the device asserted a Service Request to be polled.
+			// Reading kbd_evt>0, ksrq>0, but ktalk static => Egret ignores the kbd SRQ.
+			if (key_pending && keyData[6:0] != 7'h7F)
+				dbg_kbd_evt <= dbg_kbd_evt + 8'd1;
+			if (st == S_TSTOP && rise && !kbdFifoEmpty && cmd_addr != kbd_addr)
+				dbg_ksrq <= dbg_ksrq + 8'd1;
+		end
+	end
+	// [7:0]=command [11:8]=mouse_addr [15:12]=kbd_addr [23:16]=mtalk [31:24]=mmove
+	// [39:32]=mresp [47:40]=ktalk [55:48]=kbd_evt [63:56]=ksrq
+	wire [63:0] adb_probe_bus = { dbg_ksrq, dbg_kbd_evt, dbg_ktalk, dbg_mresp,
+	                              dbg_mmove, dbg_mtalk, kbd_addr, mouse_addr, command };
+	altsource_probe #(
+		.sld_auto_instance_index ("YES"),
+		.sld_instance_index      (0),
+		.instance_id             ("ADB"),
+		.probe_width             (64),
+		.source_width            (0),
+		.source_initial_value    ("0"),
+		.enable_metastability    ("NO")
+	) u_adb_issp (
+		.probe  (adb_probe_bus),
+		.source ()
+	);
 `endif
 
 endmodule

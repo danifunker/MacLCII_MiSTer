@@ -57,11 +57,11 @@ module emu
 	localparam CONF_STR = {
 		"MACLC;UART115200;",
 		"-;",
-		"F1,DSK,Mount Pri Floppy;",
-		"F2,DSK,Mount Sec Floppy;",
+		"F1,DSKIMG,Mount Pri Floppy;",
+		"F2,DSKIMG,Mount Sec Floppy;",
 		"-;",
-		"SC0,IMGVHD,Mount SCSI-6;",
-		"SC1,IMGVHD,Mount SCSI-5;",
+		"SC0,IMGVHDHDA,Mount SCSI-6;",
+		"SC1,IMGVHDHDA,Mount SCSI-5;",
 		"-;",
 		"O78,Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 		"OCD,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
@@ -185,10 +185,6 @@ module emu
 	assign CLK_VIDEO = clk_sys;
 	assign CE_PIXEL  = v8_ce_pix;
 
-	// (Former on-screen debug HUD removed — boot reaches the floppy screen on
-	// hardware. Signal-level debug is preserved via the SignalTap `stp_*` keeps
-	// below and the dataController/v8_video debug telemetry outputs.)
-
 	// Video Output — straight V8 video, no overlays.
 	assign VGA_R  = v8_vga_r;
 	assign VGA_G  = v8_vga_g;
@@ -293,34 +289,6 @@ module emu
 	wire scsiDREQ;        // SCSI pseudo-DMA request → gates CPU DTACK on DMA cycles
 	wire [23:0] overlay_trigger_addr;
 	wire [15:0] dataControllerDataOut;
-
-	// ========== SignalTap debug probes ==========
-	// Active-preserved copies so Quartus keeps them visible to SignalTap.
-	wire        stp_cpuReset      = _cpuReset              /* synthesis keep */;
-	wire        stp_cpuAS         = _cpuAS                 /* synthesis keep */;
-	wire        stp_cpuRW         = _cpuRW                 /* synthesis keep */;
-	wire [23:1] stp_cpuAddr       = cpuAddr[23:1]          /* synthesis keep */;
-	wire        stp_overlay       = memoryOverlayOn        /* synthesis keep */;
-	wire        stp_selectROM     = selectROM              /* synthesis keep */;
-	wire        stp_selectRAM     = selectRAM              /* synthesis keep */;
-	wire [22:0] stp_memAddr       = memoryAddr             /* synthesis keep */;
-	wire        stp_memLatch      = memoryLatch            /* synthesis keep */;
-	wire        stp_cpuBusCtl     = cpuBusControl          /* synthesis keep */;
-	wire        stp_romOE         = _romOE                 /* synthesis keep */;
-	wire        stp_ramOE         = _ramOE                 /* synthesis keep */;
-	wire        stp_dtack         = _cpuDTACK              /* synthesis keep */;
-	wire        stp_dtack_en      = dtack_en               /* synthesis keep */;
-	wire [15:0] stp_dataOut       = dataControllerDataOut  /* synthesis keep */;
-	// V8 video debug signals (preserved for SignalTap / JTAG probes)
-	wire [31:0] stp_v8_latch_cnt  = v8_dbg_latch_count     /* synthesis keep */;
-	wire [15:0] stp_v8_last_data  = v8_dbg_last_data       /* synthesis keep */;
-	wire [21:0] stp_v8_last_addr  = v8_dbg_last_addr       /* synthesis keep */;
-	wire [15:0] stp_v8_nonzero    = v8_dbg_nonzero_count   /* synthesis keep */;
-	wire [2:0]  stp_v8_mode       = v8_video_mode          /* synthesis keep */;
-	wire [3:0]  stp_v8_monid      = v8_monitor_id          /* synthesis keep */;
-	wire        stp_v8_de         = v8_de                  /* synthesis keep */;
-	wire        stp_v8_vsync      = v8_vsync               /* synthesis keep */;
-	wire        stp_v8_vlatch     = v8_video_latch         /* synthesis keep */;
 
 	// floppy disk image interface
 	wire dskReadAckInt;
@@ -576,11 +544,6 @@ module emu
 		.ram_configured(pvia_ram_configured)
 	);
 
-	wire [31:0] v8_dbg_latch_count;
-	wire [15:0] v8_dbg_last_data;
-	wire [21:0] v8_dbg_last_addr;
-	wire [15:0] v8_dbg_nonzero_count;
-
 	maclc_v8_video v8_video(
 		.clk_sys(clk_sys),
 		.clk8_en_p(clk8_en_p),
@@ -612,13 +575,7 @@ module emu
 
 		// Palette Interface (Connected to Ariel RAMDAC)
 		.palette_addr(ariel_pixel_addr),
-		.palette_data(ariel_palette_data),
-
-		// Debug telemetry
-		.dbg_latch_count(v8_dbg_latch_count),
-		.dbg_last_data(v8_dbg_last_data),
-		.dbg_last_addr(v8_dbg_last_addr),
-		.dbg_nonzero_count(v8_dbg_nonzero_count)
+		.palette_data(ariel_palette_data)
 	);
 
 	// ASC sample outputs (Commit C will route to AUDIO_L/R)
@@ -645,6 +602,48 @@ module emu
 		.sample_tick(asc_sample_tick),
 		.irq(asc_irq)
 	);
+
+`ifdef USE_AUDIO_ISSP
+	// JTAG audio-confirmation probe (read-only) — no SignalTap. Instance "AUD".
+	// Read live: Tools > In-System Sources and Probes Editor.
+	//   probe[15:0]  = current ASC sample (signed) driving AUDIO_L/R
+	//   probe[31:16] = sample-tick counter — advances iff the ASC is producing
+	//                  samples. If it counts on hardware but you hear nothing,
+	//                  the ASC works and the issue is downstream (sys_top/output/
+	//                  build). If it's frozen, the ASC isn't being clocked/selected.
+	// Enabled via the USE_AUDIO_ISSP macro in MacLC.qsf; absent from release/sim.
+	//   probe[15:0]  = current ASC sample (signed)
+	//   probe[31:16] = ASC write count — edge-detected CPU writes to the ASC. If this
+	//                  advances, the CPU IS feeding the ASC (issue is the ASC/output);
+	//                  if it stays ~0, the audio data never reaches the ASC (decode/bus).
+	// probe[15:0]=ASC writes, probe[31:16]=ASC reads (both edge-detected, sticky).
+	//   reads>0 & writes=0 → CPU probes the ASC but never feeds it (ROM/OS audio path)
+	//   reads=0 & writes=0 → CPU never touches the ASC (selectASC decode / not mapped)
+	//   writes>0           → CPU feeds it (then issue is ASC sample-gen / output)
+	reg [15:0] asc_wr_cnt = 16'd0, asc_rd_cnt = 16'd0;
+	reg        asc_wr_d   = 1'b0,  asc_rd_d   = 1'b0;
+	wire       asc_wr_now = selectASC && !_cpuRW && cpuBusControl;
+	wire       asc_rd_now = selectASC &&  _cpuRW && cpuBusControl;
+	always @(posedge clk_sys) begin
+		asc_wr_d <= asc_wr_now;
+		asc_rd_d <= asc_rd_now;
+		if (asc_wr_now && !asc_wr_d) asc_wr_cnt <= asc_wr_cnt + 16'd1;
+		if (asc_rd_now && !asc_rd_d) asc_rd_cnt <= asc_rd_cnt + 16'd1;
+	end
+	wire [31:0] aud_probe_bus = { asc_rd_cnt, asc_wr_cnt };
+	altsource_probe #(
+		.sld_auto_instance_index ("YES"),
+		.sld_instance_index      (0),
+		.instance_id             ("AUD"),
+		.probe_width             (32),
+		.source_width            (0),
+		.source_initial_value    ("0"),
+		.enable_metastability    ("NO")
+	) u_aud_issp (
+		.probe  (aud_probe_bus),
+		.source ()
+	);
+`endif
 
 	/*
 	always @(posedge clk_sys) begin
@@ -869,12 +868,6 @@ module emu
 	wire [15:0] extra_rom_data_demux = memoryAddr[0]?
 							 {sdram_out[7:0],sdram_out[7:0]}:{sdram_out[15:8],sdram_out[15:8]};
 	wire [15:0] sdram_out;
-
-	// SignalTap SDRAM probes
-	wire [15:0] stp_sdramOut      = sdram_out              /* synthesis keep */;
-	wire        stp_sdramOE       = sdram_oe               /* synthesis keep */;
-	wire        stp_sdramWE       = sdram_we               /* synthesis keep */;
-	wire        stp_downloading   = dio_download           /* synthesis keep */;
 
 	assign SDRAM_CKE = 1;
 
