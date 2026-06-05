@@ -445,6 +445,9 @@ module emu
 		._cpuAS(_cpuAS),
 		.cpuFC(cpuFC),
 		.ram_config(pvia_ram_config_out),
+		.ram_config_phys(configRAMSize),   // PHYSICAL SIMM size — was unconnected (=0),
+		                                   // so the 10MB SIMM was invisible and the Mac
+		                                   // only ever saw the 2MB board. Mirrors sim.v.
 		.ram_configured(pvia_ram_configured),
 		.memoryAddr(memoryAddr),
 		.memoryLatch(memoryLatch),
@@ -824,7 +827,7 @@ module emu
 			case (dio_index[1:0])
 				2'b01:   dio_a <= 23'h600000 + {3'b0, dio_addr[19:0]};  // Floppy 1
 				2'b10:   dio_a <= 23'h700000 + {3'b0, dio_addr[19:0]};  // Floppy 2
-				default: dio_a <= {5'b01010, dio_addr[17:0]};            // ROM at $500000
+				default: dio_a <= {5'b10100, dio_addr[17:0]};            // ROM at $500000 (must match addrController rom_sdram_word)
 			endcase
 			ioctl_wait <= 1;
 		end

@@ -738,7 +738,7 @@ module emu
 			case (dio_index[1:0])
 				2'b01:   dio_a <= 23'h600000 + {3'b0, dio_addr[19:0]};  // Floppy 1
 				2'b10:   dio_a <= 23'h700000 + {3'b0, dio_addr[19:0]};  // Floppy 2
-				default: dio_a <= {5'b01010, dio_addr[17:0]};            // ROM at $500000
+				default: dio_a <= {5'b10100, dio_addr[17:0]};            // ROM at $500000 (must match addrController rom_sdram_word)
 			endcase
 			ioctl_wait <= 1;
 		end
@@ -759,7 +759,7 @@ module emu
 	wire [22:0] dio_a_comb;
 	assign dio_a_comb = (ioctl_index[1:0] == 2'b01) ? 23'h600000 + {3'b0, ioctl_addr[20:1]} :  // Floppy 1
 	                    (ioctl_index[1:0] == 2'b10) ? 23'h700000 + {3'b0, ioctl_addr[20:1]} :  // Floppy 2
-	                    {5'b01010, ioctl_addr[18:1]};                                            // ROM at $500000
+	                    {5'b10100, ioctl_addr[18:1]};                                            // ROM at $500000 (must match addrController rom_sdram_word)
 
 	wire [24:0] ram_addr = download_cycle ? {2'b00, dio_a_comb[22:0]} :
 	                                        {2'b00, memoryAddr[22:0]};

@@ -180,7 +180,12 @@ module addrController_top(
 		                   {3'b000, mb_mirror_offset};                        // → Motherboard mirror at SDRAM $000000+
 
 	// ROM translation: SDRAM word $500000 + offset within 512KB
-	wire [22:0] rom_sdram_word = {5'b01010, cpuAddr[18:1]};  // $500000 + offset
+	wire [22:0] rom_sdram_word = {5'b10100, cpuAddr[18:1]};  // $500000 + offset
+	// NOTE: 5'b10100 == $14, giving base $14<<18 = $500000. The old 5'b01010 ($0A)
+	// placed ROM at $280000 — INSIDE the 8MB SIMM SDRAM region ($100000-$4FFFFF),
+	// so a 10MB RAM fill overwrote the ROM image and crashed the boot. $500000 sits
+	// safely between the SIMM ($100000-$4FFFFF) and VRAM ($580000). Must match the
+	// download mapping in MacLC.sv and verilator/sim.v.
 
 	// VRAM CPU access: CPU $F40000-$FBFFFF → SDRAM word $580000+
 	// Offset from VRAM start = cpuAddr[19:0] - $40000
