@@ -147,6 +147,12 @@ SimSerialTerminal serialTerminal;
 SimBus bus(console);
 SimBlockDevice blockdevice(console);
 
+// Disk images (mirrors lbmactwo): SCSI -> block device (MountDisk),
+// floppy -> ioctl download into SDRAM (QueueDownload). Set via --scsi0/1
+// and --floppy0/1 on the command line.
+std::string scsi_disk_files[2];
+std::string floppy_disk_files[2];
+
 // Input handling
 // --------------
 SimInput input(13, console);
@@ -758,6 +764,14 @@ int main(int argc, char** argv, char** env) {
 		} else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
 			verbose_diag = true;
 			printf("Verbose bring-up diagnostics enabled\n");
+		} else if (strcmp(argv[i], "--scsi0") == 0 && i + 1 < argc) {
+			scsi_disk_files[0] = argv[++i];   // SCSI-6 (.img/.vhd) -> block device
+		} else if (strcmp(argv[i], "--scsi1") == 0 && i + 1 < argc) {
+			scsi_disk_files[1] = argv[++i];   // SCSI-5
+		} else if (strcmp(argv[i], "--floppy0") == 0 && i + 1 < argc) {
+			floppy_disk_files[0] = argv[++i]; // primary floppy (.dsk) -> SDRAM download
+		} else if (strcmp(argv[i], "--floppy1") == 0 && i + 1 < argc) {
+			floppy_disk_files[1] = argv[++i]; // secondary floppy
 		}
 	}
 
@@ -788,6 +802,12 @@ int main(int argc, char** argv, char** env) {
 	blockdevice.sd_buff_wr = &VERTOPINTERN->sd_buff_wr;
 	blockdevice.img_mounted = &VERTOPINTERN->img_mounted;
 	blockdevice.img_size = &VERTOPINTERN->img_size;
+	for (int disk_index = 0; disk_index < 2; disk_index++) {
+		if (!scsi_disk_files[disk_index].empty()) {
+			blockdevice.MountDisk(scsi_disk_files[disk_index], disk_index);
+			fprintf(stderr, "Mounting SCSI%d image: %s\n", disk_index, scsi_disk_files[disk_index].c_str());
+		}
+	}
 
 #ifndef DISABLE_AUDIO
 	audio.Initialise();
@@ -865,6 +885,18 @@ int main(int argc, char** argv, char** env) {
 	const char* rom_file = "../releases/boot0.rom";
 	bus.QueueDownload(rom_file, 0, 1);  // index 0 for ROM
 	fprintf(stderr, "Machine type: Mac LC, loading ROM: %s\n", rom_file);
+
+	// Floppy images stream into SDRAM via ioctl, same as a HPS mount.
+	// MacLC uses ioctl_index 1 (F1/primary) and 2 (F2/secondary) — see
+	// MacLC.sv dio_a decode. (lbmactwo uses 2/3 because index 1 is its NuBus ROM.)
+	for (int disk_index = 0; disk_index < 2; disk_index++) {
+		if (!floppy_disk_files[disk_index].empty()) {
+			int ioctl_index = disk_index == 0 ? 1 : 2;
+			bus.QueueDownload(floppy_disk_files[disk_index], ioctl_index, 1);
+			fprintf(stderr, "Loading floppy%d image (ioctl_index %d): %s\n",
+			        disk_index, ioctl_index, floppy_disk_files[disk_index].c_str());
+		}
+	}
 
 	// Initial eval() to establish clock state for Verilator
 	// This is needed for correct rising edge detection on the first cycle
