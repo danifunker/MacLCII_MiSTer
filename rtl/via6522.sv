@@ -554,6 +554,27 @@ module via6522 (
     assign port_a_t = pio_i_ddra;
     assign port_b_t[6:0] = pio_i_ddrb[6:0];
     assign port_b_t[7] = pio_i_ddrb[7] | tmr_a_output_en;
+    // ------------------------------------------------------------------
+    // Mac LC timer prescaler: the V8 clocks the real VIA at C15M/20 =
+    // 783.36 kHz (MAME v8.cpp: R65NC22(..., 15.6672_MHz_XTAL / 20)), but our
+    // rising/falling enables come from the TG68's 68000-style E = CPU/10 =
+    // 1.56672 MHz — exactly 2x too fast. Software that times against the VIA
+    // (TattleTech CPU-speed report, T2 delay loops) reads half the true CPU
+    // speed. Divide ONLY the timer count cadence by 2; register access, port
+    // latching and the (Egret-critical) shift-register path stay on the bus-E
+    // rate so VPA-timed reads/writes are never missed. Reload consumption and
+    // the timeout/tick clears stay at full rate so each timeout still spans
+    // exactly one falling→falling window and IRQ events fire exactly once.
+    // ------------------------------------------------------------------
+    reg timer_phase = 1'b0;
+    always @(posedge clock) begin
+        if (reset == 1'b1)
+            timer_phase <= 1'b0;
+        else if (falling == 1'b1)
+            timer_phase <= ~timer_phase;
+    end
+    wire timer_tick = timer_phase;  // true on every other falling (783.36 kHz)
+
     // Timer A
     reg        timer_a_reload = 1'b0;
     reg        timer_a_toggle = 1'b1;
@@ -561,7 +582,7 @@ module via6522 (
     always @(posedge clock) begin
         if (falling == 1'b1) begin
             // always count, or load
-                
+
             if (timer_a_reload == 1'b1) begin
                 timer_a_count <= timer_a_latch;
                 if (write_t1c_l == 1'b1) begin
@@ -569,7 +590,7 @@ module via6522 (
                 end
                 timer_a_reload <= 1'b0;
                 timer_a_may_interrupt <= timer_a_may_interrupt & tmr_a_freerun;
-            end else begin
+            end else if (timer_tick == 1'b1) begin
                 if (timer_a_count == 16'h0000) begin
                     // generate an event if we were triggered
                     timer_a_reload <= 1'b1;
@@ -623,11 +644,13 @@ module via6522 (
             timer_b_tick <= 1'b0;
 
             if (tmr_b_count_mode == 1'b1) begin
+                // PB6 pulse counting stays at full rate (counts external edges)
                 if (pb6_d == 1'b1 && pb6_c == 1'b0) begin
                     timer_b_decrement = 1'b1;
                 end
             end else begin // one shot or used for shift register
-                timer_b_decrement = 1'b1;
+                // Timed mode: prescaled to 783.36 kHz (see timer_phase above)
+                timer_b_decrement = timer_tick;
             end
                 
             if (timer_b_decrement == 1'b1) begin
