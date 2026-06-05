@@ -242,6 +242,8 @@ module emu
 	wire pds_slot_irq = 1'b0;  // PDS slot interrupt — single point for future PDS work
 	wire vid_alt;
 	wire memoryOverlayOn, selectSCSI, selectSCC, selectIWM, selectVIA, selectRAM, selectROM, selectUnmapped;
+	wire selectSCSIDMA;   // SCSI pseudo-DMA window (DACK) from address decoder
+	wire scsiDREQ;        // SCSI pseudo-DMA request → gates CPU DTACK on DMA cycles
 	wire [15:0] dataControllerDataOut;
 
 	// floppy disk image interface
@@ -287,8 +289,12 @@ module emu
 	// ROM's `moves.w $22000,D1` (SFC=7) relies on this fault; if VPA/DTACK answer it
 	// the probe completes inline and boot diverts into the STM serial diagnostic.
 	wire        fc7_berr = (cpuFC == 3'b111) && !fc7_iack;
-	assign      _cpuVPA = fc7_iack ? 1'b0 : (fc7_berr ? 1'b1 : ~(!_cpuAS && cpuAddr[23:21] == 3'b111 && !selectVRAM));
-	assign      _cpuDTACK = fc7_berr ? 1'b1 : (~(!_cpuAS && (cpuAddr[23:21] != 3'b111 || selectVRAM)) | !dtack_en);
+	// SCSI pseudo-DMA ($F06000/$F12000) uses async DTACK gated by the NCR5380 DREQ
+	// instead of the 6800-style VPA path the rest of $F0xxxx uses — see MacLC.sv.
+	assign      _cpuVPA = fc7_iack ? 1'b0 : (fc7_berr ? 1'b1 : ~(!_cpuAS && cpuAddr[23:21] == 3'b111 && !selectVRAM && !selectSCSIDMA));
+	assign      _cpuDTACK = fc7_berr ? 1'b1 :
+	                        selectSCSIDMA ? ~scsiDREQ :
+	                        (~(!_cpuAS && (cpuAddr[23:21] != 3'b111 || selectVRAM)) | !dtack_en);
 	wire        cpu_en_p      = clk16_en_p;
 	wire        cpu_en_n      = clk16_en_n;
 	assign      _cpuReset_o   = tg68_reset_n;
@@ -318,6 +324,7 @@ module emu
 	wire [15:0] tg68_dout;
 	wire [31:0] tg68_a;
 	wire        tg68_reset_n;
+	wire        tg68_longword;   // 32-bit access flag — drives SCSI pseudo-DMA byte packing
 	wire [1:0]  tg68_busstate;
 
 	// BERR: autovector path only for now. Unmapped-BERR disabled — see
@@ -370,6 +377,7 @@ module emu
 		.berr       ( cpu_berr ),
 		.din        ( dataControllerDataOut ),
 		.dout       ( tg68_dout ),
+		.longword   ( tg68_longword ),
 		.addr       ( tg68_a ),
 		.busstate   ( tg68_busstate )
 	);
@@ -465,6 +473,7 @@ module emu
 		.dioBusControl(dioBusControl),
 		.cpuBusControl(cpuBusControl),
 		.selectSCSI(selectSCSI),
+		.selectSCSIDMA(selectSCSIDMA),
 		.selectSCC(selectSCC),
 		.selectIWM(selectIWM),
 		.selectASC(selectASC),
@@ -513,6 +522,7 @@ module emu
 		.data_out(ariel_reg_dout),
 		.we(selectAriel && !_cpuRW && cpuBusControl),
 		.req(selectAriel && cpuBusControl),
+		.mem_latch(memoryLatch),
 
 		.pixel_index(ariel_pixel_addr),
 		.rgb_out(ariel_palette_data),
@@ -556,10 +566,14 @@ module emu
 		.clk(clk_sys),
 		.reset(~n_reset),
 		.cs(selectASC),
-		.addr(cpuAddr[11:0]),
+		// cpuAddr[0] is forced 0; reconstruct the real A0 (tg68_a[0]) so the
+		// odd ASC registers (MODE/FIFOMODE/CLOCK) don't alias onto the even reg
+		// below them. Same fix as the SWIM/IWM instance above.
+		.addr({cpuAddr[11:1], tg68_a[0]}),
 		.data_in(cpuDataOut[7:0]),
 		.data_out(asc_data_out),
 		.we(!_cpuRW && cpuBusControl),
+		.cpu_as_n(_cpuAS),
 		.sample_l(asc_sample_l),
 		.sample_r(asc_sample_r),
 		.sample_tick(asc_sample_tick),
@@ -613,7 +627,10 @@ module emu
 		.cpuAddrRegHi(cpuAddr[12:9]),
 		.cpuAddrRegMid(cpuAddr[6:4]),
 		.cpuAddrRegLo(cpuAddr[2:1]),
+		.cpuLongword(tg68_longword),
 		.selectSCSI(selectSCSI),
+		.selectSCSIDMA(selectSCSIDMA),
+		.scsiDREQ(scsiDREQ),
 		.selectSCC(selectSCC),
 		.selectIWM(selectIWM),
 		.selectVIA(selectVIA),

@@ -1,15 +1,22 @@
 // Apple Sound Chip (ASC) for Mac LC
 //
-// Real ASC has two 1 KB FIFOs (channel A at $F14000-$F143FF and channel B
-// at $F14400-$F147FF) and a register file at $F14800-$F1480F. The chip
-// drives DFAC via SND[0:2] + DFAC_CLK on real hardware; in this core the
-// FIFOs are popped at the sample rate and the resulting bytes are exposed
-// directly as 16-bit samples on sample_l/sample_r — no DFAC modelling.
+// The Mac LC uses the V8's ASC, which MAME models as asc_v8_device: a MONO,
+// FIFO-only chip. Only channel A's FIFO (FIFO[0]) is used; its sample is sent
+// to BOTH the left and right outputs. FIFO B and the MODE/CONTROL/CLOCK/
+// WTCONTROL registers are no-ops on the V8 (the chip is permanently in FIFO
+// mode). FIFO bytes are offset-binary (0x80 = centre); MAME converts with
+// (s8)x ^ 0x80, which is what the {~bit7, bits[6:0]} packing below does.
 //
-// Per docs/plan_040526.md Commit B (Step 3a): the FIFO + sample-output
-// path is gated behind `USE_ASC_AUDIO`. When undefined the original
-// register stub remains so we can fall back instantly during debugging.
-// Top-level sample wiring lands in Commit C.
+// Register file at $F14800-$F1480F, stride 1: register = (addr - 0x800).
+// IMPORTANT: the odd-numbered registers (MODE $801, FIFOMODE $803, CLOCK $807)
+// live at odd byte addresses, so the top level MUST feed the real A0 into
+// `addr` (see MacLC.sv / sim.v: .addr({cpuAddr[11:1], tg68_a[0]})). If A0 is
+// dropped, the odd regs alias onto the even reg below them and the boot-chime
+// FIFOMODE-clear / MODE-start / FIFOSTAT-poll handshake never completes.
+//
+// Per docs/plan_040526.md Commit B (Step 3a): the FIFO + sample-output path is
+// gated behind `USE_ASC_AUDIO`. When undefined the original register stub
+// remains so we can fall back instantly during debugging.
 
 module asc(
 	input         clk,
@@ -17,12 +24,13 @@ module asc(
 
 	// CPU Interface
 	input         cs,      // Chip Select (selectASC)
-	input  [11:0] addr,    // Offset within ASC window (4 KB)
+	input  [11:0] addr,    // Offset within ASC window (4 KB), real A0 in addr[0]
 	input   [7:0] data_in,
 	output  [7:0] data_out,
-	input         we,      // Write Enable
+	input         we,      // Write Enable (!_cpuRW && cpuBusControl)
+	input         cpu_as_n,// 68k _AS: low during a bus cycle, high between
 
-	// Sample output (Commit C will route to AUDIO_L/R)
+	// Sample output (routed to AUDIO_L/R)
 	output reg signed [15:0] sample_l,
 	output reg signed [15:0] sample_r,
 	output reg               sample_tick,
@@ -34,29 +42,52 @@ module asc(
 `ifdef USE_ASC_AUDIO
 
 	// ============================================================
-	// Real FIFO implementation
+	// Mac LC V8 ASC model (MAME asc_v8_device)
 	// ============================================================
-	// Sample rate divider: ~22.05 kHz from 32.5 MHz clk_sys → ÷1474.
-	localparam SAMPLE_DIV = 16'd1474;
+	//   $800 VERSION (RO, 0xE8)   $801 MODE      $802 CONTROL
+	//   $803 FIFOMODE (bit7=clr)  $804 FIFOSTAT  $806 VOLUME   $807 CLOCK
+	// ------------------------------------------------------------
+	// Sample rate: MAME streams the ASC at 22257 Hz. 32.5 MHz / 22257 ≈ 1460.
+	localparam SAMPLE_DIV = 16'd1460;
 
 	reg [7:0]  fifo_a [0:1023];
-	reg [7:0]  fifo_b [0:1023];
 	reg [9:0]  wptr_a, rptr_a;
-	reg [9:0]  wptr_b, rptr_b;
-	reg [10:0] count_a, count_b;
+	reg [10:0] count_a;          // 0..1024
 	reg [15:0] sample_div;
+	reg [7:0]  regs [0:15];
 
-	reg [7:0] regs [0:15];
-	reg [7:0] fifo_stat;
+	// `we` (cpuBusControl) is asserted in several separate bus slots during one
+	// CPU access, so edge-detecting cs&&we would push each byte multiple times
+	// (stretching FIFO playback). Arm a one-shot per bus cycle using _AS, which
+	// deasserts between every access (even back-to-back ones), so exactly one
+	// byte is pushed / one register write happens per CPU access.
+	reg  asc_armed;
+	always @(posedge clk) begin
+		if (reset)         asc_armed <= 1'b1;
+		else if (cpu_as_n) asc_armed <= 1'b1; // bus cycle ended → re-arm
+		else if (cs && we) asc_armed <= 1'b0; // captured this cycle's write
+	end
+	wire we_stb = asc_armed && cs && we && !cpu_as_n;
 
-	wire fifo_a_write = cs && we && (addr < 12'h400);
-	wire fifo_b_write = cs && we && (addr >= 12'h400) && (addr < 12'h800);
-	wire reg_write   = cs && we && (addr >= 12'h800) && (addr <= 12'h80F);
-	wire reg_read    = cs && !we && (addr >= 12'h800) && (addr <= 12'h80F);
+	wire fifo_a_write = we_stb && (addr < 12'h400);
+	// FIFO B ($400-$7FF) writes are ignored on the V8.
+	wire reg_write    = we_stb && (addr >= 12'h800) && (addr <= 12'h80F);
+	wire reg_read     = cs && !we && (addr >= 12'h800) && (addr <= 12'h80F);
 
-	wire pop_tick    = (sample_div == SAMPLE_DIV - 1);
-	wire pop_a       = pop_tick && (count_a != 0);
-	wire pop_b       = pop_tick && (count_b != 0);
+	// FIFOMODE ($803) bit7 clears the FIFO.
+	wire fifo_clear   = reg_write && (addr[3:0] == 4'h3) && data_in[7];
+
+	wire pop_tick     = (sample_div == SAMPLE_DIV - 1);
+	wire pop_a        = pop_tick && (count_a != 0);
+	wire fifo_a_push  = fifo_a_write && (count_a < 1024) && !fifo_clear;
+
+	// Live FIFO A status byte ($804): bit0 = STAT_HALF_FULL_A (half-empty),
+	// bit1 = STAT_EMPTY_OR_FULL_A. Per MAME asc_v8, bit1 is set when the FIFO is
+	// EMPTY (cap==0) OR FULL (cap>=0x3ff) — the ROM FIFO POST ($A45F2C) fills the
+	// FIFO and spins until bit1 reports FULL, so bit1 must include the full case.
+	wire [7:0] fifo_stat = {6'b0,
+	                        (count_a == 0) || (count_a >= 11'd1023),
+	                        (count_a < 512)};
 
 	integer i;
 	always @(posedge clk) begin
@@ -64,75 +95,63 @@ module asc(
 
 		if (reset) begin
 			wptr_a <= 0; rptr_a <= 0; count_a <= 0;
-			wptr_b <= 0; rptr_b <= 0; count_b <= 0;
 			sample_div <= 0;
 			sample_l <= 0;
 			sample_r <= 0;
 			irq <= 0;
-			fifo_stat <= 8'h05;
 			for (i = 0; i < 16; i = i + 1) regs[i] <= 8'h00;
 			regs[0] <= 8'hE8; // Version (RO)
 		end else begin
-			// Sample-rate divider
-			if (sample_div == SAMPLE_DIV - 1) begin
-				sample_div <= 0;
+			// Sample-rate divider + FIFO A pop (MONO: same sample to L and R).
+			if (pop_tick) begin
+				sample_div  <= 0;
 				sample_tick <= 1'b1;
-				// Pop one byte per channel (unsigned 8 → signed 16)
 				if (count_a != 0) begin
 					sample_l <= {~fifo_a[rptr_a][7], fifo_a[rptr_a][6:0], 8'h00};
-					rptr_a   <= rptr_a + 1'b1;
+					sample_r <= {~fifo_a[rptr_a][7], fifo_a[rptr_a][6:0], 8'h00};
 				end
-				if (count_b != 0) begin
-					sample_r <= {~fifo_b[rptr_b][7], fifo_b[rptr_b][6:0], 8'h00};
-					rptr_b   <= rptr_b + 1'b1;
-				end
+				// when empty, hold the last sample (matches MAME asc_v8)
 			end else begin
 				sample_div <= sample_div + 1'b1;
 			end
 
-			// FIFO A counter (handles concurrent push + pop)
-			case ({fifo_a_write, pop_a})
-				2'b10: if (count_a < 1024) count_a <= count_a + 1'b1;
-				2'b01: count_a <= count_a - 1'b1;
-				default: ; // 00 or 11 → no net change
-			endcase
-			if (fifo_a_write && count_a < 1024) begin
-				fifo_a[wptr_a] <= data_in;
-				wptr_a <= wptr_a + 1'b1;
+			// FIFO A pointer / count management (single driver each).
+			if (fifo_clear) begin
+				wptr_a <= 0; rptr_a <= 0; count_a <= 0;
+			end else begin
+				if (fifo_a_push) begin
+					fifo_a[wptr_a] <= data_in;
+					wptr_a <= wptr_a + 1'b1;
+				end
+				if (pop_a)
+					rptr_a <= rptr_a + 1'b1;
+				case ({fifo_a_push, pop_a})
+					2'b10: count_a <= count_a + 1'b1;
+					2'b01: count_a <= count_a - 1'b1;
+					default: ; // 00 / 11 → no net change
+				endcase
 			end
 
-			// FIFO B counter
-			case ({fifo_b_write, pop_b})
-				2'b10: if (count_b < 1024) count_b <= count_b + 1'b1;
-				2'b01: count_b <= count_b - 1'b1;
-				default: ;
-			endcase
-			if (fifo_b_write && count_b < 1024) begin
-				fifo_b[wptr_b] <= data_in;
-				wptr_b <= wptr_b + 1'b1;
-			end
-
-			// Register write
+			// Register writes. VERSION + FIFOSTAT are read-only; MODE/CONTROL/
+			// CLOCK/WTCONTROL are no-ops on the V8 but harmless to store.
 			if (reg_write) begin
 				case (addr[3:0])
 					4'h0: ; // Version RO
-					4'h4: ; // FIFO STAT RO
+					4'h4: ; // FIFOSTAT RO
 					default: regs[addr[3:0]] <= data_in;
 				endcase
 			end
 
-			// FIFO status (live fill levels)
-			fifo_stat[0] <= (count_a < 1024);
-			fifo_stat[1] <= (count_a == 1024);
-			fifo_stat[2] <= (count_b < 1024);
-			fifo_stat[3] <= (count_b == 1024);
-			fifo_stat[7:4] <= 4'h0;
-
-			// IRQ: assert when either FIFO drops below half full
-			if (reg_read && addr == 12'h804)
+			// IRQ: half-empty FIFO A. MAME re-evaluates this once per OUTPUT
+			// SAMPLE (in sound_stream_update), not every clock. Re-asserting every
+			// clock would re-interrupt the CPU before its ISR can RTE — an
+			// interrupt storm that hangs the boot once the chime driver unmasks
+			// the ASC IRQ. So only (re)assert on the sample tick; a FIFOSTAT read
+			// clears it and it then stays low until the next tick (~1460 clocks).
+			if (reg_read && addr[3:0] == 4'h4)
 				irq <= 1'b0;
-			else
-				irq <= (count_a < 512) || (count_b < 512);
+			else if (pop_tick && (count_a < 512))
+				irq <= 1'b1;
 		end
 	end
 
@@ -141,8 +160,8 @@ module asc(
 		data_out_reg = 8'h00;
 		if (addr >= 12'h800 && addr <= 12'h80F) begin
 			case (addr[3:0])
-				4'h0:    data_out_reg = 8'hE8;
-				4'h4:    data_out_reg = fifo_stat;
+				4'h0:    data_out_reg = 8'hE8;        // VERSION
+				4'h4:    data_out_reg = fifo_stat;    // FIFOSTAT (live)
 				default: data_out_reg = regs[addr[3:0]];
 			endcase
 		end
@@ -224,6 +243,52 @@ module asc(
 	end
 	assign data_out = data_out_reg;
 
+`endif
+
+`ifdef SIMULATION
+	// ------------------------------------------------------------------
+	// Diagnostic trace (sim only). One line per CPU register write (rising
+	// edge of cs&&we), decoding MODE/FIFOMODE/CLOCK, plus a running FIFO-A/B
+	// write count. Also tracks the peak output amplitude and non-zero sample
+	// count so we can confirm the chime is actually reaching AUDIO_L/R.
+	// ------------------------------------------------------------------
+	reg         dbg_armed;
+	reg  [31:0] dbg_fifo_a_cnt, dbg_fifo_b_cnt;
+	reg  [15:0] dbg_peak;
+	reg  [31:0] dbg_nonzero_samples;
+	wire [15:0] dbg_abs_l = sample_l[15] ? (~sample_l + 1'b1) : sample_l;
+	always @(posedge clk) begin
+		if (reset) begin
+			dbg_armed           <= 1'b1;
+			dbg_fifo_a_cnt      <= 0;
+			dbg_fifo_b_cnt      <= 0;
+			dbg_peak            <= 0;
+			dbg_nonzero_samples <= 0;
+		end else begin
+			if (cpu_as_n)      dbg_armed <= 1'b1;
+			else if (cs && we) dbg_armed <= 1'b0;
+			if (dbg_armed && cs && we && !cpu_as_n) begin
+				if (addr < 12'h400)
+					dbg_fifo_a_cnt <= dbg_fifo_a_cnt + 1'b1;
+				else if (addr < 12'h800)
+					dbg_fifo_b_cnt <= dbg_fifo_b_cnt + 1'b1;
+				else if (addr <= 12'h80F) begin
+					$display("ASC-WR off=%03h reg=%0d data=%02h  [fifoA_wr=%0d fifoB_wr=%0d] @%0t",
+						addr, addr[3:0], data_in, dbg_fifo_a_cnt, dbg_fifo_b_cnt, $time);
+					if (addr[3:0] == 4'h1) $display("ASC-MODE = %0d  (V8 ignores; always FIFO)", data_in[1:0]);
+					if (addr[3:0] == 4'h3) $display("ASC-FIFOMODE = %02h  (bit7=clear FIFO)", data_in);
+					if (addr[3:0] == 4'h7) $display("ASC-CLOCK = %0d  (0=22257 2=22050 3=44100)", data_in);
+				end
+			end
+			if (sample_tick) begin
+				if (sample_l != 0) dbg_nonzero_samples <= dbg_nonzero_samples + 1'b1;
+				if (dbg_abs_l > dbg_peak) begin
+					dbg_peak <= dbg_abs_l;
+					$display("ASC-AUDIO peak=%0d nonzero_samples=%0d @%0t", dbg_abs_l, dbg_nonzero_samples, $time);
+				end
+			end
+		end
+	end
 `endif
 
 endmodule

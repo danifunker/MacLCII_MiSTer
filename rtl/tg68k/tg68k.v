@@ -32,6 +32,7 @@ module tg68k (
 	input berr,
 	input [15:0] din,
 	output [15:0] dout,
+	output longword,        // 1 = current access is a 32-bit (longword) access
 	output reg [31:0] addr,
 
 	// Debug outputs
@@ -239,6 +240,7 @@ end
 		.nLDS           ( tg68_lds_n    ),
 		.nWr            ( tg68_rw       ),
 		.busstate       ( tg68_busstate ), // 00-> fetch code 10->read data 11->write data 01->no memaccess
+		.longword       ( longword      ),
 		.nResetOut      ( reset_n       ),
 		.FC             ( fc            )
 	);

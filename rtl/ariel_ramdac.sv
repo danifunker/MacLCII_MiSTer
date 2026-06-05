@@ -17,6 +17,7 @@ module ariel_ramdac(
     output reg [7:0] data_out,
     input we,
     input req,
+    input mem_latch,       // memoryLatch (busPhase==3): one pulse per bus transaction
 
     // Palette lookup interface
     input [7:0] pixel_index,
@@ -92,6 +93,16 @@ always @(posedge clk_sys) begin
     rgb_out <= palette[pixel_index];
 end
 
+// `req`/`we` (cpuBusControl) are a multi-clk level asserted across several bus
+// slots per CPU access. The palette data register AUTO-INCREMENTS on every
+// access, so firing on every clk advanced the DAC several times per write and
+// scrambled the whole CLUT load (the OS's R,G,B for one entry spread across
+// several entries) — the boot CLUT came out as a corrupted ramp and 1bpp
+// colours looked inverted. Qualify with memoryLatch (busPhase==3), the same
+// once-per-transaction commit strobe the dataController uses to latch read
+// data, so each CPU access advances the DAC exactly once.
+wire req_stb = req && mem_latch;
+
 // CPU register access (matching MAME ariel.cpp behavior)
 // byte_reg = {A1, ~LDS} selects register 0-3
 always @(posedge clk_sys) begin
@@ -112,7 +123,7 @@ always @(posedge clk_sys) begin
         if (init_addr == 9'd255)
             init_active <= 1'b0;
         init_addr <= init_addr + 9'd1;
-    end else if (req) begin
+    end else if (req_stb) begin
         if (we) begin
             ariel_written <= 1'b1;
             case (byte_reg)
