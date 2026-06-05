@@ -513,6 +513,7 @@ module emu
 		.data_out(ariel_reg_dout),
 		.we(selectAriel && !_cpuRW && cpuBusControl),
 		.req(selectAriel && cpuBusControl),
+		.mem_latch(memoryLatch),
 
 		.pixel_index(ariel_pixel_addr),
 		.rgb_out(ariel_palette_data),
