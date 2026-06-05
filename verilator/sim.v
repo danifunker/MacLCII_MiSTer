@@ -556,10 +556,14 @@ module emu
 		.clk(clk_sys),
 		.reset(~n_reset),
 		.cs(selectASC),
-		.addr(cpuAddr[11:0]),
+		// cpuAddr[0] is forced 0; reconstruct the real A0 (tg68_a[0]) so the
+		// odd ASC registers (MODE/FIFOMODE/CLOCK) don't alias onto the even reg
+		// below them. Same fix as the SWIM/IWM instance above.
+		.addr({cpuAddr[11:1], tg68_a[0]}),
 		.data_in(cpuDataOut[7:0]),
 		.data_out(asc_data_out),
 		.we(!_cpuRW && cpuBusControl),
+		.cpu_as_n(_cpuAS),
 		.sample_l(asc_sample_l),
 		.sample_r(asc_sample_r),
 		.sample_tick(asc_sample_tick),
