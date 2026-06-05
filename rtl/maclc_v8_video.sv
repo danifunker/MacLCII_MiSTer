@@ -29,7 +29,12 @@ module maclc_v8_video(
     output reg ce_pix,
 
     output [7:0] palette_addr,
-    input [23:0] palette_data
+    input [23:0] palette_data,
+
+    // Bandwidth request: high while the next scanline still needs words
+    // fetched. addrController grants video the idle "extra" bus slot when
+    // this is asserted (Phase 1b) so 4/8bpp have enough fetch bandwidth.
+    output video_req
 );
 
 localparam [21:0] VRAM_BASE = 22'h0;  // Outputs byte offset; SDRAM base added in addrController
@@ -213,6 +218,9 @@ always @(*) begin
 end
 
 assign video_addr = VRAM_BASE + fetch_row_start + {12'd0, fetch_idx, 1'b0};
+
+// Still hungry for this scanline's words → ask the arbiter for extra slots.
+assign video_req = (fetch_idx < words_per_line);
 
 always @(posedge clk_sys) begin
     if (reset)

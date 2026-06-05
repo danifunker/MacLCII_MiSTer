@@ -280,7 +280,8 @@ module emu
 	wire [15:0] memoryDataOut;
 	wire memoryLatch;
 	// Video latch: only pulse when memoryLatch AND in video bus cycle
-	wire v8_video_latch = memoryLatch && videoBusControl;
+	wire v8_video_latch;   // driven by addrController.v8_video_fetch (Phase 1b)
+	wire v8_video_req;     // v8_video → addrController: extra-slot fetch request
 	// peripherals
 	wire pds_slot_irq = 1'b0;  // PDS slot interrupt — single point for future PDS work
 	wire vid_alt;
@@ -471,6 +472,8 @@ module emu
 		.selectVRAM(selectVRAM),
 		.selectUnmapped(selectUnmapped),
 		.v8_video_addr(v8_video_addr),
+		.v8_video_req(v8_video_req),
+		.v8_video_fetch(v8_video_latch),
 		.v8_hblank(v8_hblank),
 		.v8_vblank(v8_vblank),
 		.memoryOverlayOn(memoryOverlayOn),
@@ -578,7 +581,9 @@ module emu
 
 		// Palette Interface (Connected to Ariel RAMDAC)
 		.palette_addr(ariel_pixel_addr),
-		.palette_data(ariel_palette_data)
+		.palette_data(ariel_palette_data),
+
+		.video_req(v8_video_req)
 	);
 
 	// ASC sample outputs (Commit C will route to AUDIO_L/R)

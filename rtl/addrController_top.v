@@ -64,6 +64,8 @@ module addrController_top(
 	input  [21:0] v8_video_addr,
 	input  v8_hblank,
 	input  v8_vblank,
+	input  v8_video_req,    // video wants extra fetch bandwidth (Phase 1b)
+	output v8_video_fetch,  // 1-clk strobe: latch v8_video_data this cycle
 
 	// misc
 	output memoryOverlayOn,
@@ -114,6 +116,15 @@ module addrController_top(
 	assign cpuBusControl = (busCycle == 2'b01) || (busCycle == 2'b11);
 	wire extraBusControl = (busCycle == 2'b10);
 
+	// Phase 1b: when video is still hungry for the next scanline AND the
+	// "extra" slot isn't doing a disk read this cycle, lend it to video.
+	// This gives 4/8bpp a 2nd fetch slot (and lets prefetch run during
+	// hblank/vblank). CPU's two slots (01/11) are never touched.
+	wire video_extra = extraBusControl && v8_video_req &&
+	                   !dskReadAckInt && !dskReadAckExt;
+	wire video_slot  = videoBusControl || video_extra;
+	assign v8_video_fetch = memoryLatch && video_slot;
+
 	// ============================================================
 	// Memory control signals
 	// ============================================================
@@ -122,7 +133,11 @@ module addrController_top(
 
 	assign _romOE = ~(cpuBusControl && selectROM && _cpuRW);
 
+	// Video read is enabled on its normal slot (gated to active display, as
+	// before) AND on a stolen extra slot (ungated, so the line buffer can
+	// prefetch the next line during hblank/vblank).
 	assign _ramOE = ~((videoBusControl && videoControlActive) ||
+						video_extra ||
 						(cpuBusControl && (selectRAM || selectVRAM) && _cpuRW));
 
 	// RAM Write Enable: Active for RAM or VRAM writes
@@ -205,8 +220,10 @@ module addrController_top(
 	                              selectRAM ? ram_sdram_word :
 	                              23'h0;
 
-	// Main address mux: priority among bus cycle types
-	wire [22:0] addr_mux = videoBusControl ? vid_sdram_word :
+	// Main address mux: priority among bus cycle types. The stolen extra
+	// slot (video_extra) also drives the video address so the prefetch reads
+	// VRAM, not whatever the CPU decode produced.
+	wire [22:0] addr_mux = video_slot ? vid_sdram_word :
 	                        cpu_sdram_word;
 
 	// ============================================================
