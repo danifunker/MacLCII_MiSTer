@@ -249,11 +249,17 @@ always @(posedge clk_sys) begin
                         end
 
                         3'b100: begin  // $10: Video Config
-                            data_out <= (video_config & 8'hC7) | ((monitor_id[2:0]) << 3);
+                            // MAME v8.cpp via2_video_config_r returns ONLY the
+                            // monitor sense (montype << 3) — the stored config
+                            // byte is write-only. Leaking the written depth bits
+                            // into the readback can make the ROM/Monitors
+                            // misclassify the display (grayscale-only / wrong
+                            // depth list).
+                            data_out <= {1'b0, monitor_id[3:0], 3'b000};  // montype << 3
                             pvia_reg10_reads <= pvia_reg10_reads + 1;
                             `ifdef VERBOSE_TRACE
                             $display("PVIA: READ Video Config -> %02x @%0t",
-                                     (video_config & 8'hC7) | ((monitor_id[2:0]) << 3), $time);
+                                     {1'b0, monitor_id[3:0], 3'b000}, $time);
                             `endif
                         end
 
