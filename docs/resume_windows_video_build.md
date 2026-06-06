@@ -31,9 +31,22 @@ has Quartus + a real MiSTer but no working Verilator — so the loop here is
   (the AUD probe is needed for the sound re-read below). Comment both out only
   for a final release build.
 
+## ⚠️ PRAM does NOT persist (depth resets every boot)
+The core has **no nvram/save mechanism**. `egret_wrapper.sv` inits PRAM via
+`$readmemh("rtl/egret/egret.pram", pram)` in an `initial` block — a SYNTHESIS-time
+init baked into the bitstream (default `egret.pram` = all zeros = 1bpp). The OS's
+depth/date writes land in live BRAM (`intram[0x70..0x16F]`) and are LOST on
+reset/power-off. The SCSI disk is writable & persists, but depth lives in PRAM,
+not on disk. So on HW you must re-set Monitors → N Colors **every boot**.
+Two fixes (future work):
+1. Quick: bake a color PRAM into `rtl/egret/egret.pram` before building (FPGA
+   always boots that depth; carries a stale RTC if sourced from MAME).
+2. Proper: HPS-backed PRAM save (save slot in CONF_STR + `ioctl` save/load +
+   save-on-change) so PRAM persists to SD like a normal core. NEW TASK.
+
 ## HW test plan (the point of this build)
 Color depth comes from **PRAM**, so set it natively on the Mac (instant on HW):
-**Apple menu → Control Panels → Monitors**.
+**Apple menu → Control Panels → Monitors** (re-set each boot — see warning above).
 
 1. **Default boot (B&W/1bpp):** confirm single sharp cursor, full-res, no
    regression vs the last build. Desktop dither clean to all four edges.
