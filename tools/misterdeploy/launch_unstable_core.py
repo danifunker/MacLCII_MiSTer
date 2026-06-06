@@ -181,23 +181,49 @@ def seed_nvram(args):
 
 
 # ------------------------------------------------------------------------ reboot
-def reboot_and_wait(host, port, wait):
+def _service_up(host, port):
+    """True iff the MiSTer Remote web service answers a menu listing."""
+    try:
+        menu_view(host, port, "")
+        return True
+    except Exception:
+        return False
+
+
+def reboot_and_wait(host, port, wait, down_wait=60):
+    """Reboot, then wait for the web service to cycle DOWN and back UP.
+
+    The old version slept a fixed 12s and polled only for UP, so a slow reboot could
+    let it drive the OSD of a menu that had not yet rebooted (this once mis-launched
+    the wrong core). We now confirm the service goes DOWN first, so a stale-but-up
+    menu can never be mistaken for the rebooted one, then wait for it to come back."""
     print("[reboot] POST /api/settings/system/reboot")
     try:
         api_post(host, port, "/settings/system/reboot", {}, parse=False, timeout=5)
     except Exception as e:
         print(f"[reboot] (request ended as expected while it reboots: {e})")
-    print("[reboot] waiting for it to go down, then polling for the web service...")
-    time.sleep(12)
     deadline = time.time() + wait
+    # Phase 1: confirm the service actually goes DOWN (reboot really started).
+    print("[reboot] waiting for the web service to go DOWN...")
+    went_down = False
+    down_deadline = min(time.time() + down_wait, deadline)
+    while time.time() < down_deadline:
+        if not _service_up(host, port):
+            went_down = True
+            print("[reboot] service is down; reboot confirmed")
+            break
+        time.sleep(2)
+    if not went_down:
+        print(f"[reboot] WARN: never saw the service go down within {down_wait}s; "
+              "the reboot may not have taken — proceeding to wait for UP anyway")
+    # Phase 2: wait for it to come back UP, then let the menu settle.
+    print("[reboot] polling for the web service to come back UP...")
     while time.time() < deadline:
-        try:
-            menu_view(host, port, "")
+        if _service_up(host, port):
             print("[reboot] web service back; letting the menu settle")
             time.sleep(6)
             return
-        except Exception:
-            time.sleep(4)
+        time.sleep(4)
     sys.exit(f"ERROR: MiSTer web service did not return within {wait}s")
 
 

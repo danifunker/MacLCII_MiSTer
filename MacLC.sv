@@ -198,7 +198,7 @@ module emu
 	reg        pram_load_pending, pram_flush_pending, pram_clr_pending;
 	reg        old_pack, old_osd, old_mnt2, old_rstpram;
 	reg        pram_ready;        // -> Egret: pram[] loaded (or no image / timed out)
-	reg [26:0] pram_rdy_cnt;      // ready timeout so a missing image never hangs boot
+	reg [31:0] pram_rdy_cnt;      // ready backstop so a missing image never hangs boot
 
 	localparam [3:0] P_IDLE=0, P_LD_RD=1, P_LD_DAT=2, P_LD_CPY=3,
 	                 P_FILL=4, P_SV_WR=5, P_SV_DAT=6, P_CLR=7, P_RST=8;
@@ -232,16 +232,24 @@ module emu
 			// event latches
 			if (img_mounted[VD_PRAM] && !old_mnt2) begin
 				pram_ena <= (img_size != 0);
-				if (img_size != 0) pram_load_pending <= 1'b1;
+				if (img_size != 0) pram_load_pending <= 1'b1;  // load runs -> P_LD_CPY sets pram_ready
+				else               pram_ready        <= 1'b1;  // no image: release the boot-copy now
 			end
 			if (OSD_STATUS && !old_osd && pram_dirty && pram_ena) pram_flush_pending <= 1'b1;
 			if (status[6] && !old_rstpram) pram_clr_pending <= 1'b1;
 
-			// PRAM-ready: asserted when the load completes (P_LD_CPY) or after a
-			// timeout if no image mounts. The Egret holds the 68k in reset until
-			// pram_loaded, which waits on this, so boot never hangs on a missing image.
+			// PRAM-ready gate. The Egret's boot-copy seeds the 68k's working PRAM from
+			// pram[] the instant this asserts (and the 68k is held in reset until then),
+			// so it must NOT assert until the slot-2 mount status is known: a real image
+			// releases it via the load FSM (P_LD_CPY); a no-image (size==0) report
+			// releases it in the mount handler above. MiSTer's auto-mount of the save
+			// image can take many seconds, so we do NOT use a short timeout: the OLD
+			// blind ~1.5s gate (mislabelled "3s @ 32MHz"; clk_sys is ~65MHz) fired before
+			// the mount and seeded the all-zero default -> ROM InitUtil wiped PRAM every
+			// boot. This long backstop only covers the impossible "no mount status ever"
+			// case so boot can't hang (~65MHz: 3.9e9 cyc ~= 60s).
 			if (!pram_ready) begin
-				if (pram_rdy_cnt >= 27'd100_000_000) pram_ready <= 1'b1;  // ~3s @ ~32MHz
+				if (pram_rdy_cnt >= 32'd3_900_000_000) pram_ready <= 1'b1;
 				else pram_rdy_cnt <= pram_rdy_cnt + 1'b1;
 			end
 
