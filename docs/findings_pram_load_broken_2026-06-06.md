@@ -114,7 +114,31 @@ needs a path that can SEE the 68k's PRAM reads:
 
 Net: the race fix (`MacLC.sv`) + valid `egret.pram` default are correct improvements
 and boot clean, but they are **not sufficient**; the persistence blocker is upstream
-in the ROM/Egret PRAM-validity path. Changes are uncommitted on `video-fixes`.
+in the ROM/Egret PRAM-validity path.
+
+## RESOLVED — fix #2: boot-copy on the post-clear reset-RELEASE (CONFIRMED on HW)
+MAME ground truth (`docs/mame_pram_findings.md`) cracked it: validity is gated by the
+`'NuMc'` signature **only** (no checksum/clock/status), and MAME injects the saved PRAM
+at the **post-clear reset-release** edge. Our bug: the HC05 firmware zeroes its PRAM
+region (`intram[0x70..0x16F]`) during startup; our boot-copy was gated on the reset
+**assert** edge (pre-clear, our `pc_out[3]=1`=RELEASE polarity is inverted vs MAME), so
+on a **fast** SD load the copy landed before/during the firmware clear and got wiped →
+68k reads zeroed PRAM (no `NuMc`) → `InitUtil` reinitializes every boot.
+
+**Fix** (`rtl/egret/egret_wrapper.sv`): gate the boot-copy on the firmware having
+RELEASED the 68k (`reset_680x0_latched==0`, which is post-clear) **and** `pram_ready`,
+so the copy is the LAST write to `intram[0x70..0x16F]` before the 68k runs (the 68k is
+already held until `pram_loaded`). Dropped the `pc_bit3_prev`/`pram_copy_pending` edge
+latch. Validity needs only `NuMc`; nothing else added.
+
+**HW result (CONFIRMED):** loaded `nvr3` (valid `NuMc` + `0xAA` in 21 reserved bytes)
+→ after reboot+flush, **16/21 reserved `0xAA` survived**; output ≠ `nvr0` (default) and
+≠ pure InitUtil result. The 5 that cleared (`0x48/0x50/0x60/0x68/0x70`) plus the
+volatile high bytes (`0xF0/F1/F3/F9/FB`) are **normal OS field writes** — MAME's Test A
+flagged byte `0x60 AA→00` and those exact high bytes as ground-truth OS behavior. Boots
+clean. So PRAM now persists, matching MAME. (Final user-facing confirmation would be a
+real OS setting round-trip, but the mechanism is proven.) Artifacts: `fix3_test.bin`,
+`fix3_boot.png`.
 
 ## Test artifacts
 `scratch/pram_test/`: `nvr0.bin` (2bpp baseline), `bak1bpp.bin`, `nvr1/3/6.bin`
