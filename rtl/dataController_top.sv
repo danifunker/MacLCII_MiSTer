@@ -100,6 +100,15 @@ module dataController_top(
 	output           [15:0] sd_buff_din[SCSI_DEVS],
 	input                   sd_buff_wr,
 
+	// ---- PRAM persistence pass-through (to the Egret's pram[]) ----
+	input             [7:0] pram_load_addr,
+	input             [7:0] pram_load_data,
+	input                   pram_load_wr,
+	input             [7:0] pram_save_addr,
+	output            [7:0] pram_save_data,
+	output                  pram_wr_stb,
+	input                   pram_ready,
+
 	// VIA SR debug outputs for on-screen indicator
 	output [2:0]  via_sr_dbg_bit_cnt,
 	output        via_sr_dbg_edge_pending,
@@ -735,6 +744,18 @@ module dataController_top(
 		// System control - Egret controls 68000 reset via Port C bit 3
 		.reset_680x0    (egret_reset_680x0),
 		.nmi_680x0      (),
+
+		// PRAM persistence (NVRAM save/restore). Active egret_wrapper path only —
+		// the dead egret_behavioral build (EGRET_BEHAVIORAL) lacks these ports.
+`ifndef EGRET_BEHAVIORAL
+		.pram_load_wr   (pram_load_wr),
+		.pram_load_addr (pram_load_addr),
+		.pram_load_data (pram_load_data),
+		.pram_save_addr (pram_save_addr),
+		.pram_save_data (pram_save_data),
+		.pram_wr_stb    (pram_wr_stb),
+		.pram_ready     (pram_ready),
+`endif
 
 		// Debug outputs
 		.dbg_cen            (),

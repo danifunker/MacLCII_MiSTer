@@ -237,7 +237,8 @@ module emu
 	wire [15:0] memoryDataOut;
 	wire memoryLatch;
 	// Video latch: only pulse when memoryLatch AND in video bus cycle
-	wire v8_video_latch = memoryLatch && videoBusControl;
+	wire v8_video_latch;   // driven by addrController.v8_video_fetch (Phase 1b)
+	wire v8_video_req;     // v8_video → addrController: extra-slot fetch request
 	// peripherals
 	wire pds_slot_irq = 1'b0;  // PDS slot interrupt — single point for future PDS work
 	wire vid_alt;
@@ -485,6 +486,8 @@ module emu
 		.selectVRAM(selectVRAM),
 		.selectUnmapped(selectUnmapped),
 		.v8_video_addr(v8_video_addr),
+		.v8_video_req(v8_video_req),
+		.v8_video_fetch(v8_video_latch),
 		.v8_hblank(v8_hblank),
 		.v8_vblank(v8_vblank),
 		.memoryOverlayOn(memoryOverlayOn),
@@ -603,7 +606,9 @@ module emu
 		.ce_pix(v8_ce_pix),  // drives CE_PIXEL so the sim samples one pixel per real pixel-clock
 
 		.palette_addr(ariel_pixel_addr),
-		.palette_data(ariel_palette_data)
+		.palette_data(ariel_palette_data),
+
+		.video_req(v8_video_req)
 	);
 
 	dataController_top #(SCSI_DEVS) dc0
@@ -681,7 +686,16 @@ module emu
 		.sd_buff_addr(sd_buff_addr),
 		.sd_buff_dout(sd_buff_dout),
 		.sd_buff_din(sd_buff_din),
-		.sd_buff_wr(sd_buff_wr)
+		.sd_buff_wr(sd_buff_wr),
+
+		// PRAM persistence — tied off (step 1); FSM wired in step 2
+		.pram_load_wr(1'b0),
+		.pram_load_addr(8'd0),
+		.pram_load_data(8'd0),
+		.pram_save_addr(8'd0),
+		.pram_save_data(),
+		.pram_wr_stb(),
+		.pram_ready(1'b1)
 	);
 
 	//////////////////////// DOWNLOADING ///////////////////////////

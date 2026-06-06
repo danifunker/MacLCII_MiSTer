@@ -29,7 +29,12 @@ module maclc_v8_video(
     output reg ce_pix,
 
     output [7:0] palette_addr,
-    input [23:0] palette_data
+    input [23:0] palette_data,
+
+    // Bandwidth request: high while the next scanline still needs words
+    // fetched. addrController grants video the idle "extra" bus slot when
+    // this is asserted (Phase 1b) so 4/8bpp have enough fetch bandwidth.
+    output video_req
 );
 
 localparam [21:0] VRAM_BASE = 22'h0;  // Outputs byte offset; SDRAM base added in addrController
@@ -167,6 +172,10 @@ always @(*) begin
     endcase
 end
 
+// Words (16-bit) of VRAM consumed per displayed scanline = h_active*bpp/16.
+// 640-wide: 1bpp=40, 2bpp=80, 4bpp=160, 8bpp=320, 16bpp=640.
+wire [10:0] words_per_line = (h_active * bits_per_pixel) >> 4;
+
 // Accumulate row start address (byte offset of current scanline)
 reg [21:0] row_start;
 always @(posedge clk_sys) begin
@@ -176,79 +185,96 @@ always @(posedge clk_sys) begin
         row_start <= row_start + {11'd0, row_bytes};
 end
 
-wire [10:0] row_offset = (h_count * bits_per_pixel) >> 3; // Convert pixels to bytes
-wire [10:0] fetch_addr = {row_offset[10:1], 1'b0};        // Align to 16-bit word boundary
+// ============================================================
+// Scanline line-buffer (ping-pong) — decouples the VRAM fetch
+// rate from the pixel display rate. While line L displays from
+// one buffer, the next line is prefetched into the other. Buffer
+// is chosen by scanline PARITY (no explicit swap): even lines ->
+// buffer 0, odd lines -> buffer 1. So disp_buf = v_count[0] and
+// the fetch fills ~v_count[0] (the next line). One word now feeds
+// exactly 16/bpp pixels — the old "shift distribution" stretching
+// and the 1bpp dedup hack are gone, so every depth renders its
+// true horizontal resolution. Async (combinational) read keeps the
+// first pixel of each line correct across the parity flip; the
+// 512-word/buffer array maps to MLAB/LUTRAM (simple dual port).
+// 16bpp@512 = 512 words exactly; 8bpp@640 = 320 (the 640-wide max).
+// ============================================================
+(* ramstyle = "MLAB,no_rw_check" *) reg [15:0] linebuf [0:1023];  // {buf, idx[8:0]}
 
-assign video_addr = VRAM_BASE + row_start + {11'd0, fetch_addr};
-
-reg [15:0] video_data;
-reg [15:0] pixel_shift;
-reg [3:0]  shift_count;
-
-// Latch data from VRAM - capture on any clock (video_latch is 1 clk_sys wide)
-// Must not be gated by pix_en or we miss 50% of latches
-reg video_latch_pending;
-reg [15:0] video_latch_data;
-
-// The bus grants one video fetch per 16 clk_sys (= one word per 8 pix_en).
-// That cadence only matches 2 bpp. At 1 bpp a word holds 16 pixels and
-// video_addr only advances every 16 pixels, so the SAME word address is
-// fetched twice per word — reloading pixel_shift mid-word made pixels 0-7
-// render twice (the doubled cursor / striped dither) and 8-15 never show.
-// Ignore a redundant re-fetch of the same address so the shift register runs
-// through all 16 bits. No-op for >=2 bpp (every fetch is a new address).
-// Reset the dedup tracker each blank so the first word of every line loads.
-reg [21:0] last_fetch_addr;
-always @(posedge clk_sys) begin
-    if (hblank || vblank) begin
-        last_fetch_addr <= 22'h3FFFFF;  // sentinel: force first fetch of next line to load
-        video_latch_pending <= 1'b0;
-    end else if (video_latch && video_addr != last_fetch_addr) begin
-        video_data <= video_data_in;
-        video_latch_data <= video_data_in;
-        video_latch_pending <= 1'b1;
-        last_fetch_addr <= video_addr;
+// --- Fetch side: prefetch the NEXT scanline into ~disp_buf ---
+// fetch_idx restarts each scanline; the whole line period (active +
+// blank) is available to fetch words_per_line words via video_latch.
+reg        fetch_buf;
+reg [21:0] fetch_row_start;
+reg [8:0]  fetch_idx;
+always @(*) begin
+    if (vblank) begin
+        fetch_buf       = 1'b0;          // prefetch line 0 into buffer 0
+        fetch_row_start = 22'd0;
+    end else begin
+        fetch_buf       = ~v_count[0];   // next line's parity
+        fetch_row_start = row_start + {11'd0, row_bytes};
     end
-    // Clear pending flag when consumed by shift register on pix_en
-    if (pix_en && video_latch_pending && !hblank && !vblank)
-        video_latch_pending <= 1'b0;
 end
 
-// --- Shift Register Logic ---
-// One VRAM word arrives every ~8 pix_en cycles (videoBusControl provides
-// memoryLatch at 1 fetch / 16 clk_sys; pix_div=2). Distribute the shifts
-// across that 8-cycle window so every pixel in the word becomes visible
-// instead of repeating only the top bits.
-//
-//   16bpp: 1 px/word — never shift (direct color from video_data)
-//    8bpp: 2 px/word — shift once at count==3 → 4:4 cycle split
-//    4bpp: 4 px/word — shift on odd counts (1,3,5,7) → 2:2:2:2 split
-//    2bpp: 8 px/word — shift every cycle → 1:1:1:1:1:1:1:1
-//    1bpp: 16 px/word, only 8 cycles → shift every cycle, renders 8 of 16
-//          pixels (every-other-pixel resolution; correct fix would require
-//          increasing fetch rate beyond what current bus arbitration allows).
-always @(posedge clk_sys) begin
-    if (pix_en) begin
-        if (hblank || vblank) begin
-            // Blank: clear the shift register. NOTE: a 0xFFFF fill was tried to turn
-            // the leading-edge startup pixels black, but index 0xFF is not reliably
-            // black across palette states and produced an intermittent left-edge line
-            // on hardware — reverted. A proper fix forces RGB=0 for the pre-first-word
-            // pixels (palette-independent); deferred to the video cosmetic pass.
-            pixel_shift <= 16'h0000;
-            shift_count <= 0;
-        end else if (video_latch_pending) begin
-            // Load new data when latch is pending
-            pixel_shift <= video_latch_data;
-            shift_count <= 1; // First pixel displays on this cycle
-        end else begin
-            shift_count <= shift_count + 1;
+assign video_addr = VRAM_BASE + fetch_row_start + {12'd0, fetch_idx, 1'b0};
 
+// Still hungry for this scanline's words → ask the arbiter for extra slots.
+assign video_req = (fetch_idx < words_per_line);
+
+always @(posedge clk_sys) begin
+    if (reset)
+        fetch_idx <= 0;
+    else if (pix_en && h_count == h_total - 1)
+        fetch_idx <= 0;                  // new scanline: restart prefetch
+    else if (video_latch && (fetch_idx < words_per_line)) begin
+        linebuf[{fetch_buf, fetch_idx}] <= video_data_in;
+        fetch_idx <= fetch_idx + 1'b1;
+    end
+end
+
+// --- Display side: read the current line from buffer v_count[0] at
+// the pixel rate. px_in_word counts down the pixels left in the word. ---
+reg [15:0] pixel_shift;
+reg [15:0] video_data;     // current word (for 16bpp direct color)
+reg [8:0]  disp_idx;       // next word to load from the line buffer
+reg [3:0]  px_in_word;     // pixels remaining in the loaded word
+
+wire [15:0] disp_word = linebuf[{v_count[0], disp_idx}];  // async read
+
+wire [3:0] px_per_word =
+    (bits_per_pixel == 5'd1)  ? 4'd15 :   // 16 px/word
+    (bits_per_pixel == 5'd2)  ? 4'd7  :   //  8
+    (bits_per_pixel == 5'd4)  ? 4'd3  :   //  4
+    (bits_per_pixel == 5'd8)  ? 4'd1  :   //  2
+                                4'd0;     // 16bpp: 1 px/word
+
+always @(posedge clk_sys) begin
+    if (reset) begin
+        disp_idx    <= 0;
+        px_in_word  <= 0;
+        pixel_shift <= 16'h0000;
+        video_data  <= 16'h0000;
+    end else if (pix_en) begin
+        if (hblank || vblank) begin
+            // Prime for the first pixel of the next line.
+            disp_idx    <= 0;
+            px_in_word  <= 0;
+            pixel_shift <= 16'h0000;
+            video_data  <= 16'h0000;
+        end else if (px_in_word == 0) begin
+            // Load a fresh word (async read of word disp_idx), advance pointer.
+            pixel_shift <= disp_word;
+            video_data  <= disp_word;
+            disp_idx    <= disp_idx + 1'b1;
+            px_in_word  <= px_per_word;
+        end else begin
+            px_in_word <= px_in_word - 1'b1;
             case (bits_per_pixel)
                 5'd1:  pixel_shift <= {pixel_shift[14:0], 1'b0};
                 5'd2:  pixel_shift <= {pixel_shift[13:0], 2'b0};
-                5'd4:  if (shift_count[0])      pixel_shift <= {pixel_shift[11:0], 4'b0};
-                5'd8:  if (shift_count == 4'd3) pixel_shift <= {pixel_shift[7:0],  8'b0};
+                5'd4:  pixel_shift <= {pixel_shift[11:0], 4'b0};
+                5'd8:  pixel_shift <= {pixel_shift[7:0],  8'b0};
                 5'd16: ;
             endcase
         end

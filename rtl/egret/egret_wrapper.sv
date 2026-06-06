@@ -47,6 +47,18 @@ module egret_wrapper (
     output reg         reset_680x0,
     output reg         nmi_680x0,
 
+    // ---- PRAM persistence (additive: NVRAM save/restore via top-level SD DMA) ----
+    // pram[] (below) is the canonical 256-byte PRAM: seeded into the HC05 RAM at
+    // boot and kept in sync with firmware PRAM-region writes, so the top level can
+    // snapshot/restore it. The Egret boot/SR logic is unchanged by these ports.
+    input  wire        pram_load_wr,    // SD -> pram[]: write one byte
+    input  wire  [7:0] pram_load_addr,
+    input  wire  [7:0] pram_load_data,
+    input  wire  [7:0] pram_save_addr,  // pram[] -> SD: read one byte (async)
+    output wire  [7:0] pram_save_data,
+    output wire        pram_wr_stb,      // 1-cyc strobe: firmware wrote a PRAM byte
+    input  wire        pram_ready,       // top: SD load of pram[] complete (or no image / timeout)
+
     // Debug outputs for on-screen indicators
     output wire        dbg_cen,              // HC05 clock enable (pulse)
     output wire        dbg_port_test_done,   // Port test phase complete
@@ -115,6 +127,7 @@ reg  [7:0] rom_dout;
 // PRAM storage (256 bytes loaded from disk)
 reg  [7:0] pram[0:255];
 reg        pram_loaded;
+reg        pram_copy_pending;   // boot-copy requested (PC3 edge), waiting for pram_ready
 reg        pc_bit3_prev;
 
 // Initialize ROM and PRAM from hex files
@@ -544,7 +557,10 @@ always @(posedge clk) begin
 end
 
 always @(*) begin
-    reset_680x0 = reset_680x0_latched;
+    // Also hold the 68020 in reset until the saved PRAM has been copied into the
+    // Egret's working RAM (pram_loaded) — so the CPU never starts executing on
+    // pre-load PRAM, no matter how late the SD load of pram[] completes.
+    reset_680x0 = reset_680x0_latched | ~pram_loaded;
     nmi_680x0 = 1'b0;
 end
 
@@ -557,23 +573,14 @@ always @(posedge clk) begin
         pb_out <= 8'h00;
         pc_out <= 8'h08;  // Bit 3 = 1: hold 68020 in reset initially (MAME behavior)
         pc_bit3_prev <= 1'b1;  // Match initial pc_out[3]
-        pram_loaded <= 1'b0;
     end else if (cen) begin
         pa_out <= (pa_latch & pa_ddr) | (pa_in & ~pa_ddr);
         pb_out <= (pb_latch & pb_ddr) | (pb_in & ~pb_ddr);
         pc_out <= (pc_latch & pc_ddr) | (pc_in & ~pc_ddr);
 
-        // Track Port C bit 3 for falling edge detection
+        // Track Port C bit 3 (the PRAM boot-copy block below latches the 1->0
+        // edge and waits for pram_ready before copying / setting pram_loaded)
         pc_bit3_prev <= pc_out[3];
-
-        // Load PRAM when Egret asserts 680x0 reset (PC bit 3: 1->0 transition)
-        // This mimics MAME behavior where PRAM is loaded when reset is asserted
-        if (pc_bit3_prev && !pc_out[3] && !pram_loaded) begin
-            pram_loaded <= 1'b1;
-            `ifdef SIMULATION
-            $display("EGRET_PRAM[%0d]: Loading PRAM and RTC time on 680x0 reset assertion (PC3: 1->0)", cycle_count);
-            `endif
-        end
     end
 end
 
@@ -710,28 +717,38 @@ end
 // So PRAM goes to intram[0x70-0x16F] = CPU addresses 0x100-0x1FF
 integer pram_idx;
 always @(posedge clk) begin
-    if (pc_bit3_prev && !pc_out[3] && !pram_loaded && cen) begin
-        // Copy PRAM to internal RAM: PRAM[0-255] -> CPU 0x100-0x1FF
-        // Offset 0x70 = (0x100 - 0x90) to convert CPU address to intram index
-        // NOTE: blocking `=` (not `<=`) inside the for-loop is required for
-        // the sim build's BLKLOOPINIT lint (BLKLOOPINIT — non-delayed array-write-in-loop is ok,
-        // delayed is not). Quartus accepts both; the effective behavior is
-        // the same here because every iteration writes a DIFFERENT index
-        // and there's no read-modify-write within the loop.
-        for (pram_idx = 0; pram_idx < 256; pram_idx = pram_idx + 1) begin
-            intram[pram_idx + 16'h70] = pram[pram_idx];
-        end
-        // Initialize RTC time (use timestamp input)
-        // RTC seconds at CPU addresses 0xAB-0xAE -> intram[0x1B-0x1E]
-        intram[16'hAB - 16'h90] <= timestamp[31:24];
-        intram[16'hAC - 16'h90] <= timestamp[23:16];
-        intram[16'hAD - 16'h90] <= timestamp[15:8];
-        intram[16'hAE - 16'h90] <= timestamp[7:0];
-        `ifdef SIMULATION
-        $display("EGRET_PRAM: Loading PRAM and RTC time");
-        `endif
-    end else if (ram_cs && !cpu_wr && cen) begin  // !cpu_wr means write
-        intram[ram_addr] <= cpu_dout;
+    if (reset) begin
+        pram_loaded       <= 1'b0;
+        pram_copy_pending <= 1'b0;
+    end else begin
+        // Latch the boot-copy request on the Egret's 680x0-reset assertion
+        // (PC3 1->0), but DEFER the copy until pram_ready — i.e. until the top
+        // level has loaded the saved image into pram[] (or no image/timeout).
+        // The 68020 is held in reset until pram_loaded (see reset_680x0 above),
+        // so the CPU can't run on pre-load PRAM even if the load is slow.
+        if (cen && pc_bit3_prev && !pc_out[3] && !pram_loaded)
+            pram_copy_pending <= 1'b1;
+
+        if (pram_copy_pending && pram_ready && !pram_loaded) begin
+            // Copy PRAM to internal RAM: PRAM[0-255] -> CPU 0x100-0x1FF
+            // Offset 0x70 = (0x100 - 0x90) to convert CPU address to intram index.
+            // Blocking `=` in the loop (per the sim BLKLOOPINIT lint); each
+            // iteration writes a different index, so behavior matches `<=`.
+            for (pram_idx = 0; pram_idx < 256; pram_idx = pram_idx + 1) begin
+                intram[pram_idx + 16'h70] = pram[pram_idx];
+            end
+            // Seed RTC seconds (CPU 0xAB-0xAE -> intram[0x1B-0x1E]) from the host
+            intram[16'hAB - 16'h90] <= timestamp[31:24];
+            intram[16'hAC - 16'h90] <= timestamp[23:16];
+            intram[16'hAD - 16'h90] <= timestamp[15:8];
+            intram[16'hAE - 16'h90] <= timestamp[7:0];
+            pram_loaded       <= 1'b1;
+            pram_copy_pending <= 1'b0;
+            `ifdef SIMULATION
+            $display("EGRET_PRAM: Loading PRAM and RTC time (pram_ready)");
+            `endif
+        end else if (ram_cs && !cpu_wr && cen) begin  // !cpu_wr means write
+            intram[ram_addr] <= cpu_dout;
         `ifdef VERBOSE_TRACE
         if (ram_addr == 9'h04) begin
             $display("EGRET_RAM_WRITE[%0d]: PC=%04x addr=$94 data=%02x",
@@ -746,8 +763,31 @@ always @(posedge clk) begin
                      cycle_count, last_pc, cpu_dout, cpu_dout[7]);
         end
         `endif
-    end
+        end   // close: else if (ram_cs ... write)
+    end       // close: else (not in reset)
 end
+
+// ============================================================================
+// PRAM persistence: keep pram[] (the canonical NVRAM image) in sync
+// ============================================================================
+// pram[] is seeded from egret.pram ($readmemh) and copied into intram by the
+// boot-copy block above. AFTER that copy (pram_loaded), we mirror every firmware
+// write to the PRAM region (intram 0x70..0x16F = CPU 0x100..0x1FF) into pram[],
+// so the top level can snapshot it; the top level can also overwrite pram[] from
+// a save file via pram_load_*. ONE always block (load wins over mirror) keeps
+// Quartus to a single driver on pram[]. Gating the mirror on pram_loaded means
+// the boot-copy still sees exactly the loaded image (boot behavior unchanged).
+wire        pram_region_wr = ram_cs && !cpu_wr && cen && pram_loaded
+                             && (ram_addr >= 9'h070) && (ram_addr < 9'h170);
+wire  [7:0] pram_wr_idx    = ram_addr - 9'h070;   // 0..255 within the region
+always @(posedge clk) begin
+    if (pram_load_wr)
+        pram[pram_load_addr] <= pram_load_data;
+    else if (pram_region_wr)
+        pram[pram_wr_idx]    <= cpu_dout;
+end
+assign pram_save_data = pram[pram_save_addr];
+assign pram_wr_stb    = pram_region_wr;
 
 `ifdef VERBOSE_TRACE
 // Debug stack reads around RTS execution
