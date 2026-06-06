@@ -1,9 +1,11 @@
 # Handoff: PRAM persistence (Mac LC) — 2026-06-06
 
-Branch: `video-fixes`. **All changes are uncommitted in the working tree** (user commits/merges
-themselves — do NOT commit without asking). This doc is self-contained so a fresh session can
-**build → deploy → test fully autonomously** (no Verilator on this Windows box; verify via Quartus
-+ live MiSTer screenshots). See also memory `[[pram-persistence]]` and `[[mister-remote-osd-deploy]]`.
+Branch: `video-fixes`. The PRAM work is **committed** (latest `pram:` commit) but **NOT merged to
+master** (user merges themselves — don't merge without an explicit ask). `MacLC.qsf` has an unstaged
+Quartus auto-add (`adb_device.sv`/`v8_clocks.sv`) deliberately left in the working tree. This doc is
+self-contained so a fresh session can **build → deploy → test fully autonomously** (no Verilator on
+this Windows box; verify via Quartus + live MiSTer screenshots). See also memory `[[pram-persistence]]`
+and `[[mister-remote-osd-deploy]]`.
 
 ## Goal
 Persist Mac LC PRAM across reboots "like a real Mac": auto-load at boot, auto-save on change, plus
