@@ -51,7 +51,20 @@ python launch_unstable_core.py --core MacLC.rbf --dry-run
 | `--delay` | — | `0.3` | seconds between key presses |
 | `--updir-rows` | `MISTER_OSD_UPDIR_ROWS` | auto | override the `<UP-DIR>` row offset |
 | `--no-verify` | — | verifies | skip the post-launch `coreRunning` check |
+| `--max-tries` | — | `2` | reboot+select attempts; auto-retries if `coreRunning` misses (blind OSD nav is timing-sensitive) |
 | `--dry-run` | — | off | print keystrokes; push/reboot/send nothing |
+| `--seed-file FILE` | — | off | local file to seed a save image, **create-only-if-missing** |
+| `--seed-remote PATH` | — | — | absolute remote path for `--seed-file` |
+| `--seed-mount-cfg PATH` | — | — | absolute remote `.s<N>` mount-memory file to create-if-missing |
+| `--seed-mount-rel REL` | — | — | relative path stored in the `.s<N>` file (e.g. `games/MACLC/MacLC.nvr`) |
+| `--seed-mount-size N` | — | `1024` | size of the `.s<N>` file (NUL-padded; MiSTer uses 1024) |
+
+**Seeding a save image (zero-touch NVRAM).** `--seed-*` drops a default save file and
+pre-writes MiSTer's per-slot mount-memory (`config/<core>.s<N>`) so a save image is
+auto-mounted from the first boot with no manual OSD mount. Both are **create-only-if-missing**,
+so an existing (saved) file and the user's mount are never overwritten — only the core
+itself is always re-pushed. Under git-bash, set `MSYS_NO_PATHCONV=1` so absolute
+`/media/fat/...` args aren't rewritten to Windows paths.
 
 Requires `scp`/`ssh` on `PATH` (for `--push`) and the `websockets` Python package.
 

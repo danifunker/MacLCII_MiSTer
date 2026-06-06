@@ -62,6 +62,7 @@ module emu
 		"-;",
 		"SC0,IMGVHDHDA,Mount SCSI-6;",
 		"SC1,IMGVHDHDA,Mount SCSI-5;",
+		"SC2,NVR,Mount PRAM;",
 		"-;",
 		"O78,Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 		"OCD,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
@@ -69,6 +70,7 @@ module emu
 		"-;",
 		"O4,Memory,2MB,10MB;",
 		"-;",
+		"R6,Reset PRAM & Core;",
 		"R0,Reset & Apply CPU+Memory;",
 		"V,v",`BUILD_DATE
 	};
@@ -89,6 +91,7 @@ module emu
 	reg       status_mem = 1'b1;
 	localparam [1:0] status_cpu = 2'b10; // 68020
 	reg       n_reset = 0;
+	reg       pram_force_reset = 1'b0;  // "Reset PRAM & Core" -> system reset pulse
 	// Mac LC always runs at C15M (~15.67 MHz) - use 16 MHz clock enables
 	always @(posedge clk_sys) begin
 		reg [15:0] rst_cnt;
@@ -103,7 +106,7 @@ module emu
 			// stream into SDRAM on the separate `dioBusControl` slot while the CPU
 			// keeps running, so they must NOT reboot the core (hot-insert, like real
 			// hardware / lbmactwo). Gating on dio_index==0 fixes the insert-disk reboot.
-			if(~pll_locked || status[0] || buttons[1] || RESET || (dio_download && dio_index == 0)) begin
+			if(~pll_locked || status[0] || buttons[1] || RESET || pram_force_reset || (dio_download && dio_index == 0)) begin
 				rst_cnt <= '1;
 				n_reset <= 0;
 			end
@@ -119,21 +122,38 @@ module emu
 
 	///////////////////////////////////////////////////
 
-	localparam SCSI_DEVS = 2;
+	localparam SCSI_DEVS = 2;          // SCSI block devices -> hps_io slots 0,1
+	localparam VD_PRAM   = 2;          // PRAM NVRAM save image -> hps_io slot 2
+	localparam VDNUM     = 3;          // total hps_io block devices
 
 	// the status register is controlled by the on screen display (OSD)
 	wire [31:0] status;
 	wire  [1:0] buttons;
-	wire [31:0] sd_lba[SCSI_DEVS];
-	wire  [SCSI_DEVS-1:0] sd_rd;
-	wire  [SCSI_DEVS-1:0] sd_wr;
-	wire  [SCSI_DEVS-1:0] sd_ack;
+
+	// hps_io block-device buses (all VDNUM devices)
+	wire [31:0] sd_lba[VDNUM];
+	wire  [VDNUM-1:0] sd_rd;
+	wire  [VDNUM-1:0] sd_wr;
+	wire  [VDNUM-1:0] sd_ack;
 	wire            [7:0] sd_buff_addr;
 	wire           [15:0] sd_buff_dout;
-	wire           [15:0] sd_buff_din[SCSI_DEVS];
+	wire           [15:0] sd_buff_din[VDNUM];
 	wire                  sd_buff_wr;
-	wire  [SCSI_DEVS-1:0] img_mounted;
+	wire  [VDNUM-1:0] img_mounted;
 	wire           [63:0] img_size;
+
+	// SCSI side (slots 0,1): separate buses driven by dataController, stitched into
+	// the shared hps_io buses so the PRAM save image (slot 2) can coexist.
+	wire [31:0] scsi_lba[SCSI_DEVS];
+	wire  [SCSI_DEVS-1:0] scsi_rd, scsi_wr;
+	wire  [SCSI_DEVS-1:0] scsi_ack = sd_ack[SCSI_DEVS-1:0];
+	wire           [15:0] scsi_buff_din[SCSI_DEVS];
+	assign sd_lba[0]      = scsi_lba[0];
+	assign sd_lba[1]      = scsi_lba[1];
+	assign sd_rd[1:0]     = scsi_rd;
+	assign sd_wr[1:0]     = scsi_wr;
+	assign sd_buff_din[0] = scsi_buff_din[0];
+	assign sd_buff_din[1] = scsi_buff_din[1];
 	wire        ioctl_write;
 	reg         ioctl_wait = 0;
 	wire [10:0] ps2_key;
@@ -145,7 +165,151 @@ module emu
 
 	wire [32:0] TIMESTAMP;
 
-	hps_io #(.CONF_STR(CONF_STR), .VDNUM(SCSI_DEVS), .WIDE(1)) hps_io
+	// =====================================================================
+	// PRAM persistence (NVRAM) — autosave to a mounted save image (slot 2).
+	//   load  : when the PRAM image mounts (img_mounted[VD_PRAM], size>0)
+	//   flush : when the OSD opens and PRAM changed since the last save
+	//   R6    : "Reset PRAM & Core" — zero PRAM, flush zeros, reboot the machine
+	// One 512-byte sector at LBA 0 holds the 256 PRAM bytes (rest padded). The
+	// Egret owns the canonical pram[]; we shuttle it through pram_buf via the
+	// pram_load_*/pram_save_* ports (see egret_wrapper.sv). SD handshake mirrors
+	// scsi.v: drop rd/wr on io_ack rising, sector done on io_ack falling.
+	// =====================================================================
+	reg        pram_load_wr;
+	reg  [7:0] pram_load_addr, pram_load_data, pram_save_addr;
+	wire [7:0] pram_save_data;
+	wire       pram_wr_stb;
+
+	reg        pram_rd, pram_wr_req;
+	wire       pram_ack = sd_ack[VD_PRAM];
+	assign sd_lba[VD_PRAM] = 32'd0;             // single 512B sector at LBA 0
+	assign sd_rd [VD_PRAM] = pram_rd;
+	assign sd_wr [VD_PRAM] = pram_wr_req;
+
+	reg  [7:0] pram_buf[0:255];                 // staging buffer <-> SD sector
+	// FPGA->HPS readback during save: 16-bit word = {odd byte, even byte}; pad.
+	assign sd_buff_din[VD_PRAM] = (sd_buff_addr < 8'd128)
+	        ? {pram_buf[{sd_buff_addr[6:0],1'b1}], pram_buf[{sd_buff_addr[6:0],1'b0}]}
+	        : 16'h0000;
+
+	reg        pram_ena;                        // a save image is mounted (size>0)
+	reg        pram_dirty;                      // PRAM changed since last save
+	reg        pram_rst_after;                  // pulse reset after the current save
+	reg        pram_load_pending, pram_flush_pending, pram_clr_pending;
+	reg        old_pack, old_osd, old_mnt2, old_rstpram;
+	reg        pram_ready;        // -> Egret: pram[] loaded (or no image / timed out)
+	reg [26:0] pram_rdy_cnt;      // ready timeout so a missing image never hangs boot
+
+	localparam [3:0] P_IDLE=0, P_LD_RD=1, P_LD_DAT=2, P_LD_CPY=3,
+	                 P_FILL=4, P_SV_WR=5, P_SV_DAT=6, P_CLR=7, P_RST=8;
+	reg  [3:0] pst;
+	reg  [8:0] pcnt;
+	reg  [6:0] rst_hold;
+
+	always @(posedge clk_sys) begin
+		if (~pll_locked) begin
+			pst <= P_IDLE; pram_rd <= 0; pram_wr_req <= 0; pram_load_wr <= 0;
+			pram_ena <= 0; pram_dirty <= 0; pram_force_reset <= 0; pram_rst_after <= 0;
+			pram_load_pending <= 0; pram_flush_pending <= 0; pram_clr_pending <= 0;
+			old_pack <= 0; old_osd <= 0; old_mnt2 <= 0; old_rstpram <= 0; rst_hold <= 0;
+			pram_ready <= 0; pram_rdy_cnt <= 0;
+		end else begin
+			old_pack    <= pram_ack;
+			old_osd     <= OSD_STATUS;
+			old_mnt2    <= img_mounted[VD_PRAM];
+			old_rstpram <= status[6];
+			pram_load_wr <= 1'b0;                  // default low; pulsed in copy/clear
+
+			// PRAM SD-read capture (only while HPS services our slot)
+			if (pram_ack && sd_buff_wr && sd_buff_addr < 8'd128) begin
+				pram_buf[{sd_buff_addr[6:0],1'b0}] <= sd_buff_dout[7:0];
+				pram_buf[{sd_buff_addr[6:0],1'b1}] <= sd_buff_dout[15:8];
+			end
+
+			// firmware PRAM writes mark the image dirty
+			if (pram_wr_stb) pram_dirty <= 1'b1;
+
+			// event latches
+			if (img_mounted[VD_PRAM] && !old_mnt2) begin
+				pram_ena <= (img_size != 0);
+				if (img_size != 0) pram_load_pending <= 1'b1;
+			end
+			if (OSD_STATUS && !old_osd && pram_dirty && pram_ena) pram_flush_pending <= 1'b1;
+			if (status[6] && !old_rstpram) pram_clr_pending <= 1'b1;
+
+			// PRAM-ready: asserted when the load completes (P_LD_CPY) or after a
+			// timeout if no image mounts. The Egret holds the 68k in reset until
+			// pram_loaded, which waits on this, so boot never hangs on a missing image.
+			if (!pram_ready) begin
+				if (pram_rdy_cnt >= 27'd100_000_000) pram_ready <= 1'b1;  // ~3s @ ~32MHz
+				else pram_rdy_cnt <= pram_rdy_cnt + 1'b1;
+			end
+
+			// hold the reset pulse long enough for the clk8_en_p reset block to latch
+			if (pram_force_reset) begin
+				if (rst_hold == 0) pram_force_reset <= 1'b0;
+				else rst_hold <= rst_hold - 1'b1;
+			end
+
+			case (pst)
+			P_IDLE: begin
+				if (pram_clr_pending) begin
+					pram_clr_pending <= 0; pcnt <= 0; pst <= P_CLR;
+				end else if (pram_load_pending) begin
+					pram_load_pending <= 0; pram_rd <= 1'b1; pst <= P_LD_RD;
+				end else if (pram_flush_pending) begin
+					pram_flush_pending <= 0; pram_rst_after <= 0; pcnt <= 0; pst <= P_FILL;
+				end
+			end
+
+			// ---- LOAD: SD sector -> pram_buf -> Egret pram[] ----
+			P_LD_RD:  if (pram_ack) begin pram_rd <= 1'b0; pst <= P_LD_DAT; end
+			P_LD_DAT: if (old_pack && !pram_ack) begin pcnt <= 0; pst <= P_LD_CPY; end
+			P_LD_CPY: begin
+				pram_load_wr   <= 1'b1;
+				pram_load_addr <= pcnt[7:0];
+				pram_load_data <= pram_buf[pcnt[7:0]];
+				if (pcnt == 9'd255) begin pram_dirty <= 0; pram_ena <= 1; pram_ready <= 1'b1; pst <= P_IDLE; end
+				else pcnt <= pcnt + 1'b1;
+			end
+
+			// ---- SAVE: Egret pram[] -> pram_buf -> SD sector ----
+			P_FILL: begin
+				pram_save_addr <= pcnt[7:0];               // addr for capture next cycle
+				if (pcnt != 0) pram_buf[pcnt[7:0] - 8'd1] <= pram_save_data;
+				if (pcnt == 9'd256) pst <= P_SV_WR;
+				else pcnt <= pcnt + 1'b1;
+			end
+			P_SV_WR: begin
+				pram_wr_req <= 1'b1;
+				if (pram_ack) begin pram_wr_req <= 1'b0; pst <= P_SV_DAT; end
+			end
+			P_SV_DAT: if (old_pack && !pram_ack) begin
+				pram_dirty <= 0;
+				if (pram_rst_after) begin pram_rst_after <= 0; pst <= P_RST; end
+				else pst <= P_IDLE;
+			end
+
+			// ---- Reset PRAM & Core ----
+			P_CLR: begin                                   // zero Egret pram[] + pram_buf
+				pram_load_wr   <= 1'b1;
+				pram_load_addr <= pcnt[7:0];
+				pram_load_data <= 8'h00;
+				pram_buf[pcnt[7:0]] <= 8'h00;
+				if (pcnt == 9'd255) begin
+					if (pram_ena) begin pram_rst_after <= 1; pst <= P_SV_WR; end
+					else pst <= P_RST;
+				end else pcnt <= pcnt + 1'b1;
+			end
+			P_RST: begin
+				pram_force_reset <= 1'b1; rst_hold <= 7'd127; pst <= P_IDLE;
+			end
+			default: pst <= P_IDLE;
+			endcase
+		end
+	end
+
+	hps_io #(.CONF_STR(CONF_STR), .VDNUM(VDNUM), .WIDE(1)) hps_io
 	(
 		.clk_sys(clk_sys),
 		.HPS_BUS(HPS_BUS),
@@ -741,18 +905,27 @@ module emu
 		.diskMotor(diskMotor),
 		.diskAct(diskAct),
 
-		// block device interface for scsi disk
-		.img_mounted(img_mounted),
+		// block device interface for scsi disk (slots 0,1)
+		.img_mounted(img_mounted[SCSI_DEVS-1:0]),
 		.img_size(img_size[40:9]),
-		.io_lba(sd_lba),
-		.io_rd(sd_rd),
-		.io_wr(sd_wr),
-		.io_ack(sd_ack),
+		.io_lba(scsi_lba),
+		.io_rd(scsi_rd),
+		.io_wr(scsi_wr),
+		.io_ack(scsi_ack),
 
 		.sd_buff_addr(sd_buff_addr),
 		.sd_buff_dout(sd_buff_dout),
-		.sd_buff_din(sd_buff_din),
-		.sd_buff_wr(sd_buff_wr)
+		.sd_buff_din(scsi_buff_din),
+		.sd_buff_wr(sd_buff_wr),
+
+		// PRAM persistence (NVRAM) — driven by the FSM above
+		.pram_load_wr(pram_load_wr),
+		.pram_load_addr(pram_load_addr),
+		.pram_load_data(pram_load_data),
+		.pram_save_addr(pram_save_addr),
+		.pram_save_data(pram_save_data),
+		.pram_wr_stb(pram_wr_stb),
+		.pram_ready(pram_ready)
 	);
 
 	reg disk_act;

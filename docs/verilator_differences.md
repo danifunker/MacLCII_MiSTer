@@ -12,7 +12,7 @@ CPU-glue or top-level wiring fix must be made in **both** files or sim and FPGA
 silently diverge. (This has bitten us before — e.g. sim once hardwired
 `.berr(1'b0)`, masking the MOVES bus-error fix.)
 
-Last audited: 2026-06-04 (commit `2f96afa`).
+Last audited: 2026-06-06 (PRAM NVRAM persistence added — see the PRAM row below).
 
 ---
 
@@ -45,6 +45,7 @@ These must stay identical; they were checked and match today.
 | `clk_sys` | 32 MHz from the testbench | PLL `outclk_1` | same frequency; no functional diff |
 | Debug HUD / ports | absent | Row-M overlay, `*_dbg_*`, `selectUnmapped`, `synthesis keep` taps | FPGA-only observability; harmless |
 | Framework | bespoke C++ harness (`sim_main.cpp`) | `sys/` (HPS I/O, HDMI/scaler, OSD, audio out) | sim has no HPS/HDMI/scaler |
+| PRAM NVRAM persistence | `dataController_top` `pram_*` ports tied off (`pram_load_wr=0`, `pram_save_addr=0`, outputs open) | FSM in `MacLC.sv` (SD slot 2 save image, load-on-mount / flush-on-OSD / Reset PRAM&Core) drives them | **PRAM save/restore is FPGA-only**; sim still boots with `egret.pram` (zeros). The Egret `pram[]` mirror + `pram_load_*/save_*` ports in `egret_wrapper.sv` are shared and identical. |
 
 ## 🔴 Inherent gap — keep in mind
 

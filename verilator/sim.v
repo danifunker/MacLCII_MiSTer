@@ -686,7 +686,16 @@ module emu
 		.sd_buff_addr(sd_buff_addr),
 		.sd_buff_dout(sd_buff_dout),
 		.sd_buff_din(sd_buff_din),
-		.sd_buff_wr(sd_buff_wr)
+		.sd_buff_wr(sd_buff_wr),
+
+		// PRAM persistence — tied off (step 1); FSM wired in step 2
+		.pram_load_wr(1'b0),
+		.pram_load_addr(8'd0),
+		.pram_load_data(8'd0),
+		.pram_save_addr(8'd0),
+		.pram_save_data(),
+		.pram_wr_stb(),
+		.pram_ready(1'b1)
 	);
 
 	//////////////////////// DOWNLOADING ///////////////////////////

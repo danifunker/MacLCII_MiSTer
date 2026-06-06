@@ -134,6 +134,52 @@ def push_rbf(local_path, host, user, key, remote_path):
     print(f"[push] md5 verified: {local}")
 
 
+# -------------------------------------------------------------------------- seed
+def _remote_exists(host, user, key, path):
+    r = subprocess.run(["ssh", *_ssh_opts(key), f"{user}@{host}",
+                        f"test -e {shlex.quote(path)} && echo Y || echo N"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() == "Y"
+
+
+def _scp_file(local, host, user, key, remote):
+    subprocess.run(["scp", "-q", *_ssh_opts(key), local, f"{user}@{host}:{remote}"], check=True)
+
+
+def seed_nvram(args):
+    """Seed a save image and its mount-memory file, CREATE-ONLY-IF-MISSING so an
+    existing (saved) NVRAM and the user's mount are never overwritten."""
+    if not args.seed_file:
+        return
+    if not os.path.isfile(args.seed_file):
+        sys.exit(f"ERROR: --seed-file not found: {args.seed_file}")
+    # 1. the data file (e.g. games/<core>/<name>.nvr)
+    if args.seed_remote:
+        if _remote_exists(args.host, args.ssh_user, args.ssh_key, args.seed_remote):
+            print(f"[seed] {args.seed_remote} already present - leaving saved data intact")
+        else:
+            print(f"[seed] creating {args.seed_remote} from {args.seed_file}")
+            _scp_file(args.seed_file, args.host, args.ssh_user, args.ssh_key, args.seed_remote)
+    # 2. the MiSTer .s<N> mount-memory file (fixed-size, NUL-padded relative path)
+    if args.seed_mount_cfg and args.seed_mount_rel:
+        if _remote_exists(args.host, args.ssh_user, args.ssh_key, args.seed_mount_cfg):
+            print(f"[seed] {args.seed_mount_cfg} already present - leaving mount intact")
+        else:
+            rel = args.seed_mount_rel.encode()
+            if len(rel) > args.seed_mount_size:
+                sys.exit("ERROR: --seed-mount-rel longer than --seed-mount-size")
+            blob = rel + b"\x00" * (args.seed_mount_size - len(rel))
+            import tempfile
+            tf = tempfile.NamedTemporaryFile(delete=False)
+            try:
+                tf.write(blob)
+                tf.close()
+                print(f"[seed] writing mount memory {args.seed_mount_cfg} -> {args.seed_mount_rel}")
+                _scp_file(tf.name, args.host, args.ssh_user, args.ssh_key, args.seed_mount_cfg)
+            finally:
+                os.unlink(tf.name)
+
+
 # ------------------------------------------------------------------------ reboot
 def reboot_and_wait(host, port, wait):
     print("[reboot] POST /api/settings/system/reboot")
@@ -201,27 +247,27 @@ async def read_running(host, port):
 
 
 def verify(host, port, expect):
+    """Return True iff coreRunning confirms the expected core launched. None/no
+    broadcast counts as True (can't tell — don't trigger a needless retry)."""
     print("[osd] keys sent; waiting for the core to come up...")
     time.sleep(7)
     try:
         running = asyncio.run(read_running(host, port))
     except Exception as e:
         print(f"[osd] WARN: could not reconnect to verify launch: {e}")
-        return 0
+        return True
     if running is None:
         print("[osd] WARN: no coreRunning broadcast seen - could not verify launch")
-        return 0
+        return True
     if running == "":
-        print("[osd] FAIL: coreRunning is empty - still at the menu, the selection "
-              "missed the core. Re-check --updir-rows or the folder listing.")
-        return 1
+        print("[osd] MISS: coreRunning empty - still at the menu (selection missed)")
+        return False
     exp, r = expect.lower(), running.lower()
     if exp == r or exp in r or r in exp:
         print(f"[osd] OK: coreRunning='{running}' - {expect} launched")
-        return 0
-    print(f"[osd] launched coreRunning='{running}', but expected '{expect}'. Core "
-          f"names can differ from filenames; confirm on screen (or pass --no-verify).")
-    return 0
+        return True
+    print(f"[osd] MISS: launched coreRunning='{running}', expected '{expect}'")
+    return False
 
 
 # -------------------------------------------------------------------------- main
@@ -244,6 +290,16 @@ def main():
                     help="ssh identity for --push (env MISTER_SSH_KEY)")
     ap.add_argument("--ssh-user", default=os.environ.get("MISTER_SSH_USER", "root"),
                     help="ssh user for --push (default root)")
+    ap.add_argument("--seed-file",
+                    help="local file to seed a save image (create-only-if-missing)")
+    ap.add_argument("--seed-remote",
+                    help="absolute remote path for --seed-file")
+    ap.add_argument("--seed-mount-cfg",
+                    help="absolute remote .s<N> mount-memory file to create-if-missing")
+    ap.add_argument("--seed-mount-rel",
+                    help="relative path stored in --seed-mount-cfg (e.g. games/MACLC/MacLC.nvr)")
+    ap.add_argument("--seed-mount-size", type=int, default=1024,
+                    help="size of the .s<N> mount file (NUL-padded; MiSTer uses 1024)")
     ap.add_argument("--no-reboot", action="store_true",
                     help="don't reboot first (default reboots for a clean menu state)")
     ap.add_argument("--reboot-wait", type=int, default=180,
@@ -255,6 +311,8 @@ def main():
                     help="override the auto-derived <UP-DIR> row offset for subfolders")
     ap.add_argument("--no-verify", action="store_true",
                     help="skip the post-launch coreRunning check")
+    ap.add_argument("--max-tries", type=int, default=2,
+                    help="reboot+select attempts before giving up (blind OSD nav can miss)")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the generated keystrokes; push/reboot/send nothing")
     args = ap.parse_args()
@@ -267,6 +325,13 @@ def main():
     entry = folder_entry(args.host, args.port, args.folder)
     folder_path = entry["path"]
 
+    # 0. seed NVRAM save image + mount memory (create-only-if-missing)
+    if args.seed_file and not args.dry_run:
+        seed_nvram(args)
+    elif args.seed_file:
+        print(f"[seed] (dry-run) would ensure {args.seed_remote} and "
+              f"{args.seed_mount_cfg} exist (create-only-if-missing)")
+
     # 1. push (skipped on dry-run)
     if args.push and not args.dry_run:
         remote = posixpath.join(folder_path, args.core)
@@ -275,11 +340,7 @@ def main():
         print(f"[push] (dry-run) would scp {args.push} -> "
               f"{args.ssh_user}@{args.host}:{posixpath.join(folder_path, args.core)}")
 
-    # 2. reboot (skipped on dry-run)
-    if not args.no_reboot and not args.dry_run:
-        reboot_and_wait(args.host, args.port, args.reboot_wait)
-
-    # 3. plan from the (post-reboot) live listing
+    # 2. plan the OSD keystrokes from the live menu listing
     f_row, f_total, f_updir = plan(args.host, args.port, "", args.folder)
     c_row, c_total, c_updir = plan(args.host, args.port, folder_path, args.core)
     f_steps = f_row + updir_for(f_updir, args.updir_rows)
@@ -296,11 +357,20 @@ def main():
     if args.dry_run:
         return 0
 
-    # 4. send + verify
-    asyncio.run(send_keys(args.host, args.port, keys, args.delay))
-    if args.no_verify:
-        return 0
-    return verify(args.host, args.port, os.path.splitext(args.core)[0])
+    # 3. reboot + select + verify, auto-retrying (blind OSD nav is timing-sensitive,
+    # so the coreRunning check occasionally catches a missed selection)
+    tries = args.max_tries if not args.no_reboot else 1
+    for attempt in range(1, tries + 1):
+        if not args.no_reboot:
+            reboot_and_wait(args.host, args.port, args.reboot_wait)
+        asyncio.run(send_keys(args.host, args.port, keys, args.delay))
+        if args.no_verify:
+            return 0
+        if verify(args.host, args.port, os.path.splitext(args.core)[0]):
+            return 0
+        if attempt < tries:
+            print(f"[osd] verification failed - retrying ({attempt}/{tries})")
+    return 1
 
 
 if __name__ == "__main__":
