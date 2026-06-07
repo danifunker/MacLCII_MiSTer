@@ -127,8 +127,7 @@ reg  [7:0] rom_dout;
 // PRAM storage (256 bytes loaded from disk)
 reg  [7:0] pram[0:255];
 reg        pram_loaded;
-reg        pram_copy_pending;   // boot-copy requested (PC3 edge), waiting for pram_ready
-reg        pc_bit3_prev;
+reg        pc_bit3_prev;        // (legacy; PC3 edge no longer gates the boot-copy)
 
 // Initialize ROM and PRAM from hex files
 integer init_i;
@@ -718,18 +717,19 @@ end
 integer pram_idx;
 always @(posedge clk) begin
     if (reset) begin
-        pram_loaded       <= 1'b0;
-        pram_copy_pending <= 1'b0;
+        pram_loaded <= 1'b0;
     end else begin
-        // Latch the boot-copy request on the Egret's 680x0-reset assertion
-        // (PC3 1->0), but DEFER the copy until pram_ready — i.e. until the top
-        // level has loaded the saved image into pram[] (or no image/timeout).
-        // The 68020 is held in reset until pram_loaded (see reset_680x0 above),
-        // so the CPU can't run on pre-load PRAM even if the load is slow.
-        if (cen && pc_bit3_prev && !pc_out[3] && !pram_loaded)
-            pram_copy_pending <= 1'b1;
-
-        if (pram_copy_pending && pram_ready && !pram_loaded) begin
+        // Boot-copy the saved PRAM into the Egret's working RAM as the LAST write
+        // before the 68k runs. Gate it on the HC05 firmware having RELEASED the 68k
+        // (reset_680x0_latched==0) — which is AFTER the firmware's own startup
+        // PRAM-clear. Our previous trigger fired on the reset-ASSERT edge (PC3 1->0,
+        // pre-clear), so on a fast SD load the firmware's clear then wiped the loaded
+        // image and the ROM ran InitUtil every boot (MAME ground truth: it injects
+        // PRAM at the post-clear reset-release; see docs/mame_pram_findings.md). Also
+        // require pram_ready (the SD image is in pram[], or no image/timeout). The
+        // 68020 is held in reset until pram_loaded (see reset_680x0 above), so it
+        // never reads pre-copy PRAM.
+        if (!pram_loaded && !reset_680x0_latched && pram_ready) begin
             // Copy PRAM to internal RAM: PRAM[0-255] -> CPU 0x100-0x1FF
             // Offset 0x70 = (0x100 - 0x90) to convert CPU address to intram index.
             // Blocking `=` in the loop (per the sim BLKLOOPINIT lint); each
@@ -742,10 +742,9 @@ always @(posedge clk) begin
             intram[16'hAC - 16'h90] <= timestamp[23:16];
             intram[16'hAD - 16'h90] <= timestamp[15:8];
             intram[16'hAE - 16'h90] <= timestamp[7:0];
-            pram_loaded       <= 1'b1;
-            pram_copy_pending <= 1'b0;
+            pram_loaded <= 1'b1;
             `ifdef SIMULATION
-            $display("EGRET_PRAM: Loading PRAM and RTC time (pram_ready)");
+            $display("EGRET_PRAM: Loading PRAM and RTC time (post-clear release)");
             `endif
         end else if (ram_cs && !cpu_wr && cen) begin  // !cpu_wr means write
             intram[ram_addr] <= cpu_dout;
