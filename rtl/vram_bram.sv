@@ -44,14 +44,18 @@ module vram_bram #(
     (* ramstyle = "M10K, no_rw_check" *)
     reg [15:0] mem [0:DEPTH-1];
 
-    // Port A: byte-masked write + registered read (read-before-write).
+    // Simple dual-port: port A WRITE-ONLY (byte-masked), port B READ-ONLY. This
+    // is the canonical template Quartus reliably maps to M10K. A read-during-write
+    // on port A (a_dout <= mem[a_addr]) defeats clean inference and makes Quartus
+    // try to build the 3.1 Mbit array in logic. a_dout is unused for now (CPU VRAM
+    // reads still come from SDRAM); it's reserved for a later phase, tied off here.
     always @(posedge clk) begin
         if (a_we) begin
             if (a_be[0]) mem[a_addr][7:0]  <= a_din[7:0];
             if (a_be[1]) mem[a_addr][15:8] <= a_din[15:8];
         end
-        a_dout <= mem[a_addr];
     end
+    always @(posedge clk) a_dout <= 16'h0000;  // reserved; not read in Phase 1/2
 
     // Port B: registered read (video).
     always @(posedge clk) begin
