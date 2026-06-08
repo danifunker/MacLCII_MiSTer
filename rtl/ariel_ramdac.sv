@@ -107,13 +107,22 @@ end
 // CPU access. This is the same proven pattern the ASC uses (rtl/asc.sv) and it
 // directly fixes the auto-increment over-advance. Data is still captured at
 // mem_latch, where it is stable; only the COUNT of advances changes.
+// Fire only when a data strobe is actually asserted (~uds_n | ~lds_n). On a 68k
+// WRITE, _LDS/_UDS assert LATER than _AS; without this gate the one-shot could
+// capture at a mem_latch before the strobe settled and misdecode byte_reg =
+// {reg_addr[0],~lds_n} — REG_PALETTE (lds) writes would alias to REG_ADDR (uds),
+// so the CLUT fill lands in the address register and the palette is never written
+// (uniform color cast). This was latent until the SDRAM slot-00 reclaim (commit
+// 90c7696) gave the CPU an earlier DTACK slot, firing the one-shot before _LDS.
+// The one-shot must DISARM on the same gated condition it fires on, else it could
+// disarm on an early strobe-less mem_latch and drop the access entirely.
 reg ariel_armed;
+wire req_stb = ariel_armed && req && mem_latch && (~uds_n | ~lds_n);
 always @(posedge clk_sys) begin
-    if (reset)                 ariel_armed <= 1'b1;
-    else if (cpu_as_n)         ariel_armed <= 1'b1; // access ended -> re-arm
-    else if (req && mem_latch) ariel_armed <= 1'b0; // captured this access
+    if (reset)         ariel_armed <= 1'b1;
+    else if (cpu_as_n) ariel_armed <= 1'b1; // access ended -> re-arm
+    else if (req_stb)  ariel_armed <= 1'b0; // captured this access (strobe valid)
 end
-wire req_stb = ariel_armed && req && mem_latch;
 
 // CPU register access (matching MAME ariel.cpp behavior)
 // byte_reg = {A1, ~LDS} selects register 0-3
