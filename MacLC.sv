@@ -411,9 +411,12 @@ module emu
 	wire [7:0] pseudovia_dout;
 	wire pseudovia_irq;
 
-	// GEMINI: Force serialIn to 1 (Idle) to prevent SCC Break detection loop in ROM
-	// assign serialIn =  UART_RXD;
-	assign serialIn = 1'b1; 
+	// SCC Channel A RX is wired to the physical MiSTer UART pin so the serial
+	// port is usable for PPP / dial-up (and as the basis for AppleTalk work).
+	// (Previously forced to 1'b1 to dodge a suspected ROM "Break detection loop";
+	// that was a symptom of earlier boot issues, since resolved, not the RX path.)
+	// The line idles high; rxuart double-syncs UART_RXD internally.
+	assign serialIn = UART_RXD;
 	assign UART_TXD = serialOut;
 	assign UART_RTS = serialRTS ;
 	assign UART_DTR = UART_DSR;
@@ -602,6 +605,14 @@ module emu
 				.addr       ( tg68_a )
 			);
 	
+	// On-chip framebuffer (BRAM): packed CPU VRAM write mirror (port A) +
+	// video scanline read (port B).
+	wire [10:0] v8_words_per_line;
+	wire [17:0] vram_bram_waddr;
+	wire        vram_bram_we;
+	wire [17:0] v8_vram_raddr;
+	wire [15:0] v8_vram_rdata;
+
 	addrController_top ac0
 	(
 		.clk(clk_sys),
@@ -648,6 +659,9 @@ module emu
 		.v8_video_fetch(v8_video_latch),
 		.v8_hblank(v8_hblank),
 		.v8_vblank(v8_vblank),
+		.words_per_line(v8_words_per_line),
+		.vram_waddr(vram_bram_waddr),
+		.vram_we(vram_bram_we),
 		.memoryOverlayOn(memoryOverlayOn),
 		.overlay_trigger_addr(overlay_trigger_addr),
 
@@ -755,7 +769,23 @@ module emu
 		.palette_addr(ariel_pixel_addr),
 		.palette_data(ariel_palette_data),
 
-		.video_req(v8_video_req)
+		.video_req(v8_video_req),
+		.words_per_line(v8_words_per_line),
+		.vram_raddr(v8_vram_raddr),
+		.vram_rdata(v8_vram_rdata)
+	);
+
+	// On-chip framebuffer (BRAM). Video reads port B (Phase 2); CPU VRAM writes
+	// are mirrored into port A. Single clk_sys domain => coherent, no CDC.
+	vram_bram vram_fb(
+		.clk(clk_sys),
+		.a_addr(vram_bram_waddr),
+		.a_din(memoryDataOut),
+		.a_be({~_cpuUDS, ~_cpuLDS}),
+		.a_we(vram_bram_we),
+		.a_dout(),                 // CPU reads still come from SDRAM (dropped later)
+		.b_addr(v8_vram_raddr),    // video scanline prefetch
+		.b_dout(v8_vram_rdata)
 	);
 
 	// ASC sample outputs (Commit C will route to AUDIO_L/R)

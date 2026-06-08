@@ -71,6 +71,7 @@ V_SRC = \
 	$(RTL)/addrDecoder.v \
 	$(RTL)/dataController_top.sv \
 	$(RTL)/maclc_v8_video.sv \
+	$(RTL)/vram_bram.sv \
 	$(RTL)/ariel_ramdac.sv \
 	$(RTL)/pseudovia.sv \
 	$(RTL)/via6522.sv \

@@ -67,6 +67,11 @@ module addrController_top(
 	input  v8_video_req,    // video wants extra fetch bandwidth (Phase 1b)
 	output v8_video_fetch,  // 1-clk strobe: latch v8_video_data this cycle
 
+	// On-chip framebuffer (BRAM) write mirror — Phase 1 of the VRAM-in-BRAM plan.
+	input  [10:0] words_per_line, // active words/line (from v8_video) for packing
+	output [17:0] vram_waddr,     // packed BRAM word address for a CPU VRAM write
+	output        vram_we,        // 1-cyc strobe: commit the CPU VRAM write to BRAM
+
 	// misc
 	output memoryOverlayOn,
 	output [23:0] overlay_trigger_addr,  // debug: address that caused overlay disable
@@ -206,6 +211,20 @@ module addrController_top(
 	// Offset from VRAM start = cpuAddr[19:0] - $40000
 	wire [19:0] vram_cpu_offset = cpuAddr[19:0] - 20'h40000;
 	wire [22:0] vram_sdram_word = 23'h580000 + {5'b0, vram_cpu_offset[18:1]};
+
+	// ---- On-chip framebuffer (BRAM) write mirror (Phase 1) ----
+	// The V8 scans 1-8bpp at a fixed 1024-byte (512-word) stride, but only the
+	// first words_per_line words of each line are visible. Pack out the stride gap
+	// (packed = line*words_per_line + col) so 640-wide modes fit the 384KB BRAM;
+	// for 16bpp@512 (words_per_line=512) packing == the natural word offset.
+	wire [9:0]  vram_line = vram_cpu_offset[19:10];   // scanline (stride 1024B)
+	wire [8:0]  vram_colw = vram_cpu_offset[9:1];     // word within the line (0..511)
+	wire [18:0] vram_packed = vram_line * words_per_line + {10'd0, vram_colw};
+	wire        vram_col_visible = ({2'b0, vram_colw} < words_per_line);
+	assign vram_waddr = vram_packed[17:0];
+	// One write per CPU VRAM bus cycle (memoryLatch), only for visible columns
+	// (off-screen stride padding is dropped so it can't corrupt the next line).
+	assign vram_we = selectVRAM && !_cpuRW && cpuBusControl && memoryLatch && vram_col_visible;
 
 	// Video fetch: v8_video_addr is byte offset from VRAM start → SDRAM word $580000+
 	wire [22:0] vid_sdram_word = 23'h580000 + {2'b0, v8_video_addr[21:1]};
