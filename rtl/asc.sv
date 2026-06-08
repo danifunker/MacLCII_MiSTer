@@ -29,6 +29,8 @@ module asc(
 	output  [7:0] data_out,
 	input         we,      // Write Enable (!_cpuRW && cpuBusControl)
 	input         cpu_as_n,// 68k _AS: low during a bus cycle, high between
+	input         uds_n,   // 68k _UDS \ data strobes — assert LATER than _AS on a
+	input         lds_n,   // 68k _LDS / write; gate capture on (~uds_n|~lds_n)
 
 	// Sample output (routed to AUDIO_L/R)
 	output reg signed [15:0] sample_l,
@@ -61,13 +63,22 @@ module asc(
 	// (stretching FIFO playback). Arm a one-shot per bus cycle using _AS, which
 	// deasserts between every access (even back-to-back ones), so exactly one
 	// byte is pushed / one register write happens per CPU access.
+	// Fire only when a data strobe is asserted (~uds_n | ~lds_n). On a 68k WRITE
+	// the data strobes assert LATER than _AS, and this one-shot captures at the
+	// FIRST cs&&we cycle (busPhase 0 of the cpu slot) — earlier than Ariel's
+	// mem_latch. Without the gate it can latch data_in before the CPU drives it,
+	// pushing a stale/zero byte into the FIFO (silent or garbled playback). Same
+	// class as the Ariel CLUT bug (commit 6f79571); aggravated by the slot-00
+	// reclaim (90c7696) which gave the CPU an earlier DTACK slot. The one-shot
+	// disarms on we_stb (the SAME gated condition) so an early strobe-less cycle
+	// can't disarm-without-firing and drop the write.
 	reg  asc_armed;
+	wire we_stb = asc_armed && cs && we && !cpu_as_n && (~uds_n | ~lds_n);
 	always @(posedge clk) begin
 		if (reset)         asc_armed <= 1'b1;
 		else if (cpu_as_n) asc_armed <= 1'b1; // bus cycle ended → re-arm
-		else if (cs && we) asc_armed <= 1'b0; // captured this cycle's write
+		else if (we_stb)   asc_armed <= 1'b0; // captured this cycle's write
 	end
-	wire we_stb = asc_armed && cs && we && !cpu_as_n;
 
 	wire fifo_a_write = we_stb && (addr < 12'h400);
 	// FIFO B ($400-$7FF) writes are ignored on the V8.

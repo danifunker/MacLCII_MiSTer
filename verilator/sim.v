@@ -588,6 +588,8 @@ module emu
 		.data_out(asc_data_out),
 		.we(!_cpuRW && cpuBusControl),
 		.cpu_as_n(_cpuAS),
+		.uds_n(_cpuUDS),
+		.lds_n(_cpuLDS),
 		.sample_l(asc_sample_l),
 		.sample_r(asc_sample_r),
 		.sample_tick(asc_sample_tick),
