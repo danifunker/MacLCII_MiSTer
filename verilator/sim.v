@@ -612,14 +612,18 @@ module emu
 		.palette_data(ariel_palette_data),
 
 		.video_req(v8_video_req),
-		.words_per_line(v8_words_per_line)
+		.words_per_line(v8_words_per_line),
+		.vram_raddr(v8_vram_raddr),
+		.vram_rdata(v8_vram_rdata)
 	);
 
-	// On-chip framebuffer (BRAM). Phase 1: mirror CPU VRAM writes here while the
-	// display still reads SDRAM (pure, non-regressing addition). Must match MacLC.sv.
+	// On-chip framebuffer (BRAM). Video reads port B (Phase 2); CPU VRAM writes
+	// are mirrored into port A. Single clk_sys domain => coherent. Must match MacLC.sv.
 	wire [10:0] v8_words_per_line;
 	wire [17:0] vram_bram_waddr;
 	wire        vram_bram_we;
+	wire [17:0] v8_vram_raddr;
+	wire [15:0] v8_vram_rdata;
 
 	vram_bram vram_fb(
 		.clk(clk_sys),
@@ -627,9 +631,9 @@ module emu
 		.a_din(memoryDataOut),
 		.a_be({~_cpuUDS, ~_cpuLDS}),
 		.a_we(vram_bram_we),
-		.a_dout(),            // Phase 1: CPU reads still from SDRAM
-		.b_addr(18'd0),       // Phase 1: video still reads SDRAM
-		.b_dout()
+		.a_dout(),                 // CPU reads still from SDRAM (dropped later)
+		.b_addr(v8_vram_raddr),    // video scanline prefetch
+		.b_dout(v8_vram_rdata)
 	);
 
 `ifdef SIMULATION

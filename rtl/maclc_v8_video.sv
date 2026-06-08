@@ -38,7 +38,12 @@ module maclc_v8_video(
 
     // Active words per scanline (= h_active*bpp/16). Exported so addrController
     // can pack CPU VRAM writes into the on-chip framebuffer (stride-gap removed).
-    output [10:0] words_per_line
+    output [10:0] words_per_line,
+
+    // On-chip framebuffer (BRAM) read port (Phase 2): the scanline prefetch now
+    // reads from vram_bram instead of the shared SDRAM slot. Registered read.
+    output [17:0] vram_raddr,
+    input  [15:0] vram_rdata
 );
 
 localparam [21:0] VRAM_BASE = 22'h0;  // Outputs byte offset; SDRAM base added in addrController
@@ -153,40 +158,23 @@ always @(posedge clk_sys) begin
 end
 `endif
 
-// --- Video Address Generation ---
-// Row stride (bytes per scanline) depends on resolution and bpp.
-// For 512-wide modes, strides are powers of 2 (64..1024).
-// For 640-wide modes, strides are multiples of 80 (80..1280).
-// We accumulate row_start each scanline to avoid a large multiply.
+// --- Video Address Generation (packed on-chip framebuffer) ---
+// vram_bram stores each scanline as words_per_line CONTIGUOUS words (the V8's
+// 1024-byte stride gap is removed by the packing in addrController). Display
+// line L therefore lives at packed word offset L*words_per_line, which we
+// accumulate per scanline to avoid a per-pixel multiply.
 
-// MAME v8.cpp screen_update uses a FIXED stride of 1024 bytes/scanline for
-// modes 0-3 (1/2/4/8 bpp) regardless of horizontal resolution. Only 16 bpp
-// uses (hres * 2). This matters because the ROM lays out the framebuffer at
-// 1024 bytes/scanline — fetching at a smaller stride would skew rows.
-reg [10:0] row_bytes;
-always @(*) begin
-    case (video_mode)
-        3'd4: begin // 16bpp: stride = hres * 2 bytes
-            case (monitor_id)
-                4'h2: row_bytes = 11'd1024; // 512x384: 512*2 = 1024
-                default: row_bytes = 11'd1280; // 640x480 (or 640x870 portrait): 640*2 = 1280
-            endcase
-        end
-        default: row_bytes = 11'd1024; // 1/2/4/8 bpp: fixed 1024 (MAME v8.cpp:528,552,573,592)
-    endcase
-end
-
-// Words (16-bit) of VRAM consumed per displayed scanline = h_active*bpp/16.
-// 640-wide: 1bpp=40, 2bpp=80, 4bpp=160, 8bpp=320, 16bpp=640.
+// Words (16-bit) per displayed scanline = h_active*bpp/16.
+// 640-wide: 1bpp=40, 2bpp=80, 4bpp=160, 8bpp=320. 512-wide 16bpp=512.
 assign words_per_line = (h_active * bits_per_pixel) >> 4;
 
-// Accumulate row start address (byte offset of current scanline)
-reg [21:0] row_start;
+// Packed word base of the current (display) scanline.
+reg [17:0] packed_row_start;
 always @(posedge clk_sys) begin
     if (reset || (pix_en && h_count == h_total - 1 && v_count == v_total - 1))
-        row_start <= 22'd0;
+        packed_row_start <= 18'd0;
     else if (pix_en && h_count == h_total - 1 && v_count < v_active)
-        row_start <= row_start + {11'd0, row_bytes};
+        packed_row_start <= packed_row_start + {7'd0, words_per_line};
 end
 
 // ============================================================
@@ -205,35 +193,53 @@ end
 // ============================================================
 (* ramstyle = "MLAB,no_rw_check" *) reg [15:0] linebuf [0:1023];  // {buf, idx[8:0]}
 
-// --- Fetch side: prefetch the NEXT scanline into ~disp_buf ---
-// fetch_idx restarts each scanline; the whole line period (active +
-// blank) is available to fetch words_per_line words via video_latch.
+// --- Fetch side: prefetch the NEXT scanline into ~disp_buf from vram_bram ---
+// One word per clk_sys, no bus arbitration: the whole line fills in
+// <= words_per_line clocks of the ~1600-clock line, always completing before it
+// displays. vram_bram reads are registered, so the linebuf write lags the issued
+// address by one cycle (fetch_pend / fetch_wr_idx / fetch_buf_d).
 reg        fetch_buf;
-reg [21:0] fetch_row_start;
-reg [8:0]  fetch_idx;
+reg [17:0] fetch_packed_base;
 always @(*) begin
     if (vblank) begin
-        fetch_buf       = 1'b0;          // prefetch line 0 into buffer 0
-        fetch_row_start = 22'd0;
+        fetch_buf         = 1'b0;        // prefetch line 0 into buffer 0
+        fetch_packed_base = 18'd0;
     end else begin
-        fetch_buf       = ~v_count[0];   // next line's parity
-        fetch_row_start = row_start + {11'd0, row_bytes};
+        fetch_buf         = ~v_count[0]; // next line's parity
+        fetch_packed_base = packed_row_start + {7'd0, words_per_line};
     end
 end
 
-assign video_addr = VRAM_BASE + fetch_row_start + {12'd0, fetch_idx, 1'b0};
+reg [9:0] fetch_idx;      // address-phase word index
+reg [9:0] fetch_wr_idx;   // write-phase index (1 cycle behind = BRAM read latency)
+reg       fetch_pend;     // a read was issued last cycle (its data is valid now)
+reg       fetch_buf_d;    // fetch_buf aligned to the write phase
 
-// Still hungry for this scanline's words → ask the arbiter for extra slots.
-assign video_req = (fetch_idx < words_per_line);
+assign vram_raddr = fetch_packed_base + {8'd0, fetch_idx};
+
+// SDRAM video path retired in Phase 2 — video now reads the on-chip framebuffer.
+assign video_addr = 22'd0;
+assign video_req  = 1'b0;
 
 always @(posedge clk_sys) begin
-    if (reset)
-        fetch_idx <= 0;
-    else if (pix_en && h_count == h_total - 1)
-        fetch_idx <= 0;                  // new scanline: restart prefetch
-    else if (video_latch && (fetch_idx < words_per_line)) begin
-        linebuf[{fetch_buf, fetch_idx}] <= video_data_in;
-        fetch_idx <= fetch_idx + 1'b1;
+    if (reset) begin
+        fetch_idx    <= 10'd0; fetch_pend  <= 1'b0;
+        fetch_wr_idx <= 10'd0; fetch_buf_d <= 1'b0;
+    end else if (pix_en && h_count == h_total - 1) begin
+        fetch_idx <= 10'd0; fetch_pend <= 1'b0;   // restart prefetch each scanline
+    end else begin
+        // Address phase: issue one BRAM read per clk while words remain.
+        if (fetch_idx < words_per_line) begin
+            fetch_pend   <= 1'b1;
+            fetch_wr_idx <= fetch_idx;
+            fetch_buf_d  <= fetch_buf;
+            fetch_idx    <= fetch_idx + 1'b1;
+        end else begin
+            fetch_pend <= 1'b0;
+        end
+        // Write phase: commit the word whose read was issued last cycle.
+        if (fetch_pend)
+            linebuf[{fetch_buf_d, fetch_wr_idx[8:0]}] <= vram_rdata;
     end
 end
 
