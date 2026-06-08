@@ -1081,7 +1081,7 @@ module emu
 	                                          (!_ramOE || !_romOE || dskReadAckInt || dskReadAckExt);
 	wire [15:0] sdram_do   = download_cycle ? 16'hffff :
 	                         (dskReadAckInt || dskReadAckExt) ? extra_rom_data_demux :
-	                                                            sdram_out;
+	                                                            sdram_out_patched;
 	// during rom/disk download ffff is returned so the screen is black during download
 	// "extra rom" is used to hold the disk image. It's expected to be byte wide and
 	// we thus need to properly demultiplex the word returned from sdram in that case
@@ -1089,26 +1089,36 @@ module emu
 							 {sdram_out[7:0],sdram_out[7:0]}:{sdram_out[15:8],sdram_out[15:8]};
 	wire [15:0] sdram_out;
 
+	// --- Force cold-boot path (warm-reset hang workaround) -----------------------
+	// The boot ROM chooses warm-vs-cold start with a `bne.w` at ROM byte $4655E
+	// (SDRAM word $52322F): d3 != 'WLSC' takes the FULL RAM march (cold path). On a
+	// warm reset RAM stays refreshed, so d3 == 'WLSC' and the core hangs on the warm
+	// path (only a full reconfig, which decays RAM, recovers). Force that one branch
+	// UNCONDITIONAL as it is fetched (`bne.w` 0x6600 -> `bra.w` 0x6000) so EVERY boot
+	// runs the cold march. No-op on a cold boot (the branch is taken anyway, d3 !=
+	// 'WLSC'). Guarded on the address AND the live opcode, so a different ROM is left
+	// untouched; catches both overlay and direct-ROM fetches (both selectROM->$52322F).
+	// Replaces the reverted sdram.init warm-reset hacks (d88c098 / 50d0c32), which
+	// broke cold boot. Keep in sync with verilator/sim.v.
+	wire [15:0] sdram_out_patched =
+		(!_romOE && memoryAddr == 23'h52322F && sdram_out == 16'h6600) ? 16'h6000 : sdram_out;
+
 	assign SDRAM_CKE = 1;
 
 	sdram sdram
 	(
 		// system interface
-		// Re-init the SDRAM controller on the R0 warm reset (status[0]), not just at
-		// config (`!pll_locked`). A warm reset otherwise leaves the controller in its
-		// prior state — only a full FPGA reconfig resynced it — which is the suspected
-		// cause of the warm-boot hang (the CPU reboots but the un-resynced controller
-		// mis-serves the first ROM reads -> stuck grey).
-		//
-		// MUST be `status[0]`, NOT `~n_reset`: the cold-boot ROM download holds n_reset
-		// low (`dio_download && dio_index==0`), so `~n_reset` would force init=1 DURING
-		// the download and the ROM writes would never land -> black screen. status[0]
-		// is the user's "Reset & Apply" OSD action and is never asserted during the
-		// download. The init sequence (precharge + load-mode) does NOT erase ROM/RAM,
-		// and is timing-safe: when status[0] clears, init runs (~16 cycles) while the
-		// CPU stays held for ~resetDelay (~1M) more cycles. (Covers R0; an Egret/OS
-		// restart that doesn't pull status[0] would need a separate CPU-hold — follow-up.)
-		.init           ( !pll_locked || status[0] ),
+		// Re-init the SDRAM controller ONLY at config (`!pll_locked`). Two attempts to
+		// ALSO re-init on a warm reset both regressed COLD boot to a grey/black screen,
+		// because the ROM download writes get swallowed while init is held high:
+		//   d88c098  .init(!pll_locked || ~n_reset)   -- ~n_reset is held during download
+		//   50d0c32  .init(!pll_locked || status[0])  -- status[0] also overlaps the load
+		// (HW-confirmed 2026-06-08: both broke cold boot.) Reverted to the known-good
+		// baseline. A warm-boot SDRAM resync — IF that is even the cause of the warm-boot
+		// hang — must be driven by a dedicated pulse that is gated OFF during the ROM
+		// download AND holds _cpuReset until init completes (handoff §5 follow-up), not by
+		// piggy-backing on a system-reset signal that is also active during cold load.
+		.init           ( !pll_locked ),
 		.clk_64         ( clk_mem                  ),
 		.clk_8          ( clk8                     ),
 

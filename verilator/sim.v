@@ -827,7 +827,14 @@ module emu
 	wire        ram_we   = download_cycle ? 1'b1                  : !_ramWE;
 	wire        ram_oe   = download_cycle ? 1'b0                  : (!_ramOE || !_romOE || dskReadAckInt || dskReadAckExt);
 	wire [15:0] ram_do_raw;
-	wire [15:0] ram_do   = download_cycle ? 16'hffff : (dskReadAckInt || dskReadAckExt) ? extra_rom_data_demux : ram_do_raw;
+	// --- Force cold-boot path (warm-reset hang workaround) — keep in sync with MacLC.sv.
+	// Patch the boot ROM's warm-vs-cold `bne.w` at ROM byte $4655E (SDRAM word
+	// $52322F) to UNCONDITIONAL (0x6600 -> 0x6000) as it is fetched, so every boot
+	// runs the full cold RAM march. No-op on a cold boot (branch already taken);
+	// guarded on the address AND opcode so other ROMs are untouched.
+	wire [15:0] ram_do_patched =
+		(!_romOE && memoryAddr == 23'h52322F && ram_do_raw == 16'h6600) ? 16'h6000 : ram_do_raw;
+	wire [15:0] ram_do   = download_cycle ? 16'hffff : (dskReadAckInt || dskReadAckExt) ? extra_rom_data_demux : ram_do_patched;
 	wire [15:0] extra_rom_data_demux = memoryAddr[0] ?
 						   {ram_do_raw[7:0],ram_do_raw[7:0]}:{ram_do_raw[15:8],ram_do_raw[15:8]};
 
