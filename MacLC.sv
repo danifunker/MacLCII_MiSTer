@@ -1094,7 +1094,17 @@ module emu
 	sdram sdram
 	(
 		// system interface
-		.init           ( !pll_locked              ),
+		// Re-init the SDRAM controller on EVERY system reset, not just at config
+		// (`!pll_locked`). A warm reset (R0 / "Reset & Apply") otherwise leaves the
+		// controller in its prior state — only a full FPGA reconfig resynced it —
+		// which is the suspected cause of the warm-boot hang (the CPU reboots but
+		// the un-resynced controller mis-serves the first ROM reads -> stuck grey).
+		// The init sequence is precharge + load-mode-register: it does NOT erase
+		// the ROM/RAM. Timing is safe: n_reset releases ~resetDelay (~1M) cycles
+		// before the CPU does, so the ~16-cycle init finishes long before any CPU
+		// access. (Tied to n_reset, which R0 asserts; an Egret/OS-restart that does
+		// not pull n_reset would need a separate CPU-hold and is a follow-up.)
+		.init           ( !pll_locked || ~n_reset  ),
 		.clk_64         ( clk_mem                  ),
 		.clk_8          ( clk8                     ),
 
