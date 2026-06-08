@@ -117,8 +117,15 @@ module addrController_top(
 		end
 	end
 
-	assign videoBusControl = (busCycle == 2'b00);
-	assign cpuBusControl = (busCycle == 2'b01) || (busCycle == 2'b11);
+	// H1 (perf): video moved to on-chip BRAM (vram_bram), so it no longer needs
+	// an SDRAM slot — its read here was DEAD (a stale fetch every round). Reclaim
+	// slot 00 for the CPU: cpuBusControl now owns 00/01/11 (3 of 4 slots, +50% CPU
+	// SDRAM bandwidth). videoBusControl is forced 0 so the dead video read drops
+	// out of _ramOE/addr_mux. NOTE: the dtack glue in MacLC.sv/sim.v must assert
+	// per-cpu-slot (the 3 slots 11,00,01 are CONTIGUOUS, so the old rising-edge
+	// detector would see only one edge per round and HALVE throughput).
+	assign videoBusControl = 1'b0;
+	assign cpuBusControl = (busCycle == 2'b00) || (busCycle == 2'b01) || (busCycle == 2'b11);
 	wire extraBusControl = (busCycle == 2'b10);
 
 	// Phase 1b: when video is still hungry for the next scanline AND the

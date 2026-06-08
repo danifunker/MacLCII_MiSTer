@@ -473,21 +473,28 @@ module emu
 	wire [21:0] dskReadAddrExt;
 
 	// dtack generation for 16 MHz mode
-	reg  dtack_en, cpuBusControl_d;
+	reg  dtack_en, mem_latch_d;
 	always @(posedge clk_sys) begin
 		if (!_cpuReset) begin
 			dtack_en <= 0;
 		end
 		else begin
-			cpuBusControl_d <= cpuBusControl;
+			// mem_latch_d = registered memoryLatch: high at busPhase 0, i.e. the
+			// START of each busCycle. (cpuBusControl & mem_latch_d) therefore
+			// strobes once at the start of EVERY cpu slot.
+			mem_latch_d <= memoryLatch;
 			if (_cpuAS) dtack_en <= 0;
 			// VRAM is SDRAM-backed and reads via the same cpu-slot as RAM,
-			// so it must take the slot-aligned DTACK path (cpuBusControl rising
-			// edge), NOT the immediate !ROM&!RAM peripheral path. Excluding
-			// selectVRAM here stops DTACK asserting before the SDRAM cpu-slot
-			// commits the read/write (was truncating longword writes / sampling
-			// stale data on the old VPA routing).
-			if (!_cpuAS & ((!cpuBusControl_d & cpuBusControl) | (!selectROM & !selectRAM & !selectVRAM))) dtack_en <= 1;
+			// so it must take the slot-aligned DTACK path (a cpu-slot start),
+			// NOT the immediate !ROM&!RAM peripheral path. Excluding selectVRAM
+			// here stops DTACK asserting before the SDRAM cpu-slot commits the
+			// read/write (was truncating longword writes / sampling stale data).
+			// H1: this was `!cpuBusControl_d & cpuBusControl` (rising edge), which
+			// gave each ISOLATED cpu slot one DTACK opportunity. With slot 00 now
+			// also a cpu slot the three slots are contiguous (one rising edge per
+			// round), so we strobe at each cpu-slot start instead — same busPhase-0
+			// timing as the old edge, but for all 3 slots (3 acks/round = +50%).
+			if (!_cpuAS & ((cpuBusControl & mem_latch_d) | (!selectROM & !selectRAM & !selectVRAM))) dtack_en <= 1;
 		end
 	end
 
