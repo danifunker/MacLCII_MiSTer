@@ -411,9 +411,12 @@ module emu
 	wire [7:0] pseudovia_dout;
 	wire pseudovia_irq;
 
-	// GEMINI: Force serialIn to 1 (Idle) to prevent SCC Break detection loop in ROM
-	// assign serialIn =  UART_RXD;
-	assign serialIn = 1'b1; 
+	// SCC Channel A RX is wired to the physical MiSTer UART pin so the serial
+	// port is usable for PPP / dial-up (and as the basis for AppleTalk work).
+	// (Previously forced to 1'b1 to dodge a suspected ROM "Break detection loop";
+	// that was a symptom of earlier boot issues, since resolved, not the RX path.)
+	// The line idles high; rxuart double-syncs UART_RXD internally.
+	assign serialIn = UART_RXD;
 	assign UART_TXD = serialOut;
 	assign UART_RTS = serialRTS ;
 	assign UART_DTR = UART_DSR;
