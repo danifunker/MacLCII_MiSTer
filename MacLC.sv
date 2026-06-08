@@ -55,7 +55,7 @@ module emu
 	
 	`include "build_id.v"
 	localparam CONF_STR = {
-		"MACLC;UART115200;",
+		"MACLC;UART57600:115200;",
 		"-;",
 		"F1,DSKIMG,Mount Pri Floppy;",
 		"F2,DSKIMG,Mount Sec Floppy;",
