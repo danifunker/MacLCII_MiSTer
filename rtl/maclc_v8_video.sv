@@ -166,7 +166,17 @@ end
 
 // Words (16-bit) per displayed scanline = h_active*bpp/16.
 // 640-wide: 1bpp=40, 2bpp=80, 4bpp=160, 8bpp=320. 512-wide 16bpp=512.
-assign words_per_line = (h_active * bits_per_pixel) >> 4;
+//
+// The product MUST be computed at full width before the >>4. words_per_line is
+// only 11 bits, and `(h_active * bits_per_pixel) >> 4` evaluates the multiply in
+// that 11-bit context, so it wraps mod 2048 for any mode whose product reaches
+// 2048 — corrupting exactly the high-bpp modes: 4bpp@640 (640*4=2560 -> 512 ->
+// /16 = 32 not 160), 8bpp@640 (5120 -> 1024 -> 64 not 320), 4bpp@512 (2048 -> 0
+// -> ALL WHITE), 16bpp@512 (8192 -> 0). 1/2bpp (<=1280) stayed under 2048, which
+// is why they always rendered full-width. This single truncation was the
+// long-hunted "bpp-dependent video cut" (NOT memory bandwidth/backend).
+wire [15:0] wpl_product = h_active * bits_per_pixel;   // full width (max 640*16=10240)
+assign words_per_line = wpl_product[14:4];             // /16; max 640 fits 11 bits
 
 // Packed word base of the current (display) scanline.
 reg [17:0] packed_row_start;
@@ -238,16 +248,8 @@ always @(posedge clk_sys) begin
             fetch_pend <= 1'b0;
         end
         // Write phase: commit the word whose read was issued last cycle.
-        // ---- DIAGNOSTIC (revert): write a synthetic gradient derived from the
-        // word index instead of the real framebuffer word. This bypasses the
-        // BRAM data AND the CPU-write/packing path, so the on-screen extent =
-        // how many words the FETCH LOOP itself fills per line. If the screen now
-        // fills FULL WIDTH at 4bpp (both 512 and 640), the fetch+display+scaler
-        // pipeline is fine and the cut is in the data; if it shows the SAME
-        // 512-white / 640-20% pattern, the fetch/display timing is mode-broken.
         if (fetch_pend)
-            linebuf[{fetch_buf_d, fetch_wr_idx[8:0]}] <= {4{fetch_wr_idx[3:0]}};
-            // ORIGINAL: linebuf[{fetch_buf_d, fetch_wr_idx[8:0]}] <= vram_rdata;
+            linebuf[{fetch_buf_d, fetch_wr_idx[8:0]}] <= vram_rdata;
     end
 end
 
