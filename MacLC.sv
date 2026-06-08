@@ -705,6 +705,7 @@ module emu
 		.we(selectAriel && !_cpuRW && cpuBusControl),
 		.req(selectAriel && cpuBusControl),
 		.mem_latch(memoryLatch),
+		.cpu_as_n(_cpuAS),
 
 		// The RAMDAC takes the pixel index from v8_video and returns RGB data
 		.pixel_index(ariel_pixel_addr),

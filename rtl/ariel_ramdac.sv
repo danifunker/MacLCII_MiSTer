@@ -18,6 +18,7 @@ module ariel_ramdac(
     input we,
     input req,
     input mem_latch,       // memoryLatch (busPhase==3): one pulse per bus transaction
+    input cpu_as_n,        // 68k _AS: low during a bus cycle, high between accesses
 
     // Palette lookup interface
     input [7:0] pixel_index,
@@ -93,15 +94,26 @@ always @(posedge clk_sys) begin
     rgb_out <= palette[pixel_index];
 end
 
-// `req`/`we` (cpuBusControl) are a multi-clk level asserted across several bus
-// slots per CPU access. The palette data register AUTO-INCREMENTS on every
-// access, so firing on every clk advanced the DAC several times per write and
-// scrambled the whole CLUT load (the OS's R,G,B for one entry spread across
-// several entries) — the boot CLUT came out as a corrupted ramp and 1bpp
-// colours looked inverted. Qualify with memoryLatch (busPhase==3), the same
-// once-per-transaction commit strobe the dataController uses to latch read
-// data, so each CPU access advances the DAC exactly once.
-wire req_stb = req && mem_latch;
+// `req`/`we`/`mem_latch` are asserted across SEVERAL bus slots during one CPU
+// access. The palette data register AUTO-INCREMENTS R->G->B on every fire, so
+// firing on every mem_latch advanced the DAC several times per write — the
+// single byte the OS sent for one component got stored into all three, so
+// every CLUT entry collapsed to grey (R=G=B) and color rendered as greyscale.
+// (memoryLatch alone is NOT once-per-access: a 68k write spans multiple bus
+// cycles, each with its own busPhase==3 pulse.)
+//
+// Arm a one-shot per CPU access using _AS, which deasserts between every
+// access — even back-to-back ones — so exactly one register action happens per
+// CPU access. This is the same proven pattern the ASC uses (rtl/asc.sv) and it
+// directly fixes the auto-increment over-advance. Data is still captured at
+// mem_latch, where it is stable; only the COUNT of advances changes.
+reg ariel_armed;
+always @(posedge clk_sys) begin
+    if (reset)                 ariel_armed <= 1'b1;
+    else if (cpu_as_n)         ariel_armed <= 1'b1; // access ended -> re-arm
+    else if (req && mem_latch) ariel_armed <= 1'b0; // captured this access
+end
+wire req_stb = ariel_armed && req && mem_latch;
 
 // CPU register access (matching MAME ariel.cpp behavior)
 // byte_reg = {A1, ~LDS} selects register 0-3
