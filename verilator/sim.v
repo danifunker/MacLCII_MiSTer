@@ -490,6 +490,9 @@ module emu
 		.v8_video_fetch(v8_video_latch),
 		.v8_hblank(v8_hblank),
 		.v8_vblank(v8_vblank),
+		.words_per_line(v8_words_per_line),
+		.vram_waddr(vram_bram_waddr),
+		.vram_we(vram_bram_we),
 		.memoryOverlayOn(memoryOverlayOn),
 		.overlay_trigger_addr(),  // debug output, unused in sim
 
@@ -608,8 +611,40 @@ module emu
 		.palette_addr(ariel_pixel_addr),
 		.palette_data(ariel_palette_data),
 
-		.video_req(v8_video_req)
+		.video_req(v8_video_req),
+		.words_per_line(v8_words_per_line)
 	);
+
+	// On-chip framebuffer (BRAM). Phase 1: mirror CPU VRAM writes here while the
+	// display still reads SDRAM (pure, non-regressing addition). Must match MacLC.sv.
+	wire [10:0] v8_words_per_line;
+	wire [17:0] vram_bram_waddr;
+	wire        vram_bram_we;
+
+	vram_bram vram_fb(
+		.clk(clk_sys),
+		.a_addr(vram_bram_waddr),
+		.a_din(memoryDataOut),
+		.a_be({~_cpuUDS, ~_cpuLDS}),
+		.a_we(vram_bram_we),
+		.a_dout(),            // Phase 1: CPU reads still from SDRAM
+		.b_addr(18'd0),       // Phase 1: video still reads SDRAM
+		.b_dout()
+	);
+
+`ifdef SIMULATION
+	// Phase 1 verification: confirm CPU VRAM writes are landing in the BRAM mirror.
+	reg [31:0] vram_wr_count = 0;
+	always @(posedge clk_sys) begin
+		if (vram_bram_we) begin
+			vram_wr_count <= vram_wr_count + 1;
+			if (vram_wr_count < 5 || (vram_wr_count % 50000 == 0))
+				$display("[F%0d] VRAM->BRAM write #%0d waddr=%05h data=%04h be=%b wpl=%0d",
+					sim_frame_count, vram_wr_count, vram_bram_waddr, memoryDataOut,
+					{~_cpuUDS,~_cpuLDS}, v8_words_per_line);
+		end
+	end
+`endif
 
 	dataController_top #(SCSI_DEVS) dc0
 	(

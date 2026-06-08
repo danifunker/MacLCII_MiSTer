@@ -34,7 +34,11 @@ module maclc_v8_video(
     // Bandwidth request: high while the next scanline still needs words
     // fetched. addrController grants video the idle "extra" bus slot when
     // this is asserted (Phase 1b) so 4/8bpp have enough fetch bandwidth.
-    output video_req
+    output video_req,
+
+    // Active words per scanline (= h_active*bpp/16). Exported so addrController
+    // can pack CPU VRAM writes into the on-chip framebuffer (stride-gap removed).
+    output [10:0] words_per_line
 );
 
 localparam [21:0] VRAM_BASE = 22'h0;  // Outputs byte offset; SDRAM base added in addrController
@@ -174,7 +178,7 @@ end
 
 // Words (16-bit) of VRAM consumed per displayed scanline = h_active*bpp/16.
 // 640-wide: 1bpp=40, 2bpp=80, 4bpp=160, 8bpp=320, 16bpp=640.
-wire [10:0] words_per_line = (h_active * bits_per_pixel) >> 4;
+assign words_per_line = (h_active * bits_per_pixel) >> 4;
 
 // Accumulate row start address (byte offset of current scanline)
 reg [21:0] row_start;

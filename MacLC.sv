@@ -602,6 +602,11 @@ module emu
 				.addr       ( tg68_a )
 			);
 	
+	// On-chip framebuffer (BRAM) Phase 1: packed CPU VRAM write mirror.
+	wire [10:0] v8_words_per_line;
+	wire [17:0] vram_bram_waddr;
+	wire        vram_bram_we;
+
 	addrController_top ac0
 	(
 		.clk(clk_sys),
@@ -648,6 +653,9 @@ module emu
 		.v8_video_fetch(v8_video_latch),
 		.v8_hblank(v8_hblank),
 		.v8_vblank(v8_vblank),
+		.words_per_line(v8_words_per_line),
+		.vram_waddr(vram_bram_waddr),
+		.vram_we(vram_bram_we),
 		.memoryOverlayOn(memoryOverlayOn),
 		.overlay_trigger_addr(overlay_trigger_addr),
 
@@ -755,7 +763,22 @@ module emu
 		.palette_addr(ariel_pixel_addr),
 		.palette_data(ariel_palette_data),
 
-		.video_req(v8_video_req)
+		.video_req(v8_video_req),
+		.words_per_line(v8_words_per_line)
+	);
+
+	// On-chip framebuffer (BRAM). Phase 1: mirror CPU VRAM writes here while the
+	// display still reads SDRAM (so this is a pure, non-regressing addition).
+	// Phase 2 switches the video fetch to read port B and drops the SDRAM VRAM path.
+	vram_bram vram_fb(
+		.clk(clk_sys),
+		.a_addr(vram_bram_waddr),
+		.a_din(memoryDataOut),
+		.a_be({~_cpuUDS, ~_cpuLDS}),
+		.a_we(vram_bram_we),
+		.a_dout(),            // Phase 1: CPU reads still come from SDRAM
+		.b_addr(18'd0),       // Phase 1: video still reads SDRAM
+		.b_dout()
 	);
 
 	// ASC sample outputs (Commit C will route to AUDIO_L/R)
