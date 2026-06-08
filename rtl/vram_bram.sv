@@ -5,23 +5,20 @@
 // HPS-DDR3 experiment). Both starved the video fetch (~64 of 160 words/line at
 // 4bpp) — not from lack of *bandwidth* (4bpp needs only ~9 MB/s) but from bus
 // sharing + read latency. On-chip BRAM is true dual-port and single-cycle, so the
-// CPU can write port A while video reads port B every clock with zero contention,
-// eliminating the wall for every Mac LC video mode that fits on-chip.
+// CPU can write port A while video reads port B every clock with zero contention.
 //
 // SIZE: DEPTH = 196,608 words (384 KB) = the largest supported framebuffer,
-// 16bpp @ 512x384. The DE10-Nano Cyclone V (5CSEBA6) has 553 M10K blocks; the
-// rest of the design uses 73, so this (~384 blocks at 16-bit width) fits.
-// 640x480 @ 16bpp is NOT a Mac LC mode and is out of scope.
+// 16bpp @ 512x384. 640x480 @ 16bpp is not a Mac LC mode and is out of scope.
 //
-// ADDRESSING: callers pass a *packed* word address. The V8 hardware scans the
-// framebuffer at a fixed 1024-byte (512-word) stride for 1..8 bpp, but only the
-// first `words_per_line` (= h_active*bpp/16) words of each line are visible. The
-// caller packs out the stride gap (packed = line*words_per_line + col) so 640-wide
-// modes fit in 384 KB; for 16bpp@512 (words_per_line=512) the packing degenerates
-// to the natural 1:1 word offset.
+// INFERENCE: this MUST map to M10K block RAM. A single 16-bit array written with
+// a sub-word *byte enable* (mem[a][7:0] <= ...) did NOT infer as block RAM in
+// Quartus 17 Lite — it was built in logic and Analysis & Synthesis ballooned to
+// ~20 GB. The robust fix is to split the framebuffer into two BYTE-WIDE simple-
+// dual-port RAMs, each written with a plain (whole-word) write enable. That is the
+// textbook M10K template and infers reliably; it also stays plain Verilog so the
+// sim builds it identically. Reads are registered (1-cycle latency).
 //
 // Single clk_sys domain => CPU writes and video reads are coherent with no CDC.
-// Reads are registered (1-cycle latency) for clean M10K inference.
 // ============================================================================
 module vram_bram #(
     parameter integer DEPTH = 196608,   // 16bpp @ 512x384 = 384KB / 2 bytes
@@ -29,7 +26,8 @@ module vram_bram #(
 )(
     input             clk,
 
-    // Port A — CPU read/write (byte-masked)
+    // Port A — CPU write (byte-masked). a_dout is reserved for a later phase
+    // (CPU VRAM reads still come from SDRAM today) and is tied off here.
     input  [AW-1:0]   a_addr,
     input  [15:0]     a_din,
     input  [1:0]      a_be,     // {upper, lower} byte write strobes
@@ -38,28 +36,26 @@ module vram_bram #(
 
     // Port B — video read
     input  [AW-1:0]   b_addr,
-    output reg [15:0] b_dout
+    output [15:0]     b_dout
 );
 
-    (* ramstyle = "M10K, no_rw_check" *)
-    reg [15:0] mem [0:DEPTH-1];
+    // Two byte-wide simple-dual-port RAMs (lower/upper byte lane). Each has a
+    // plain write enable -> clean M10K inference (no sub-word byte-enable).
+    (* ramstyle = "M10K,no_rw_check" *) reg [7:0] mem_lo [0:DEPTH-1];
+    (* ramstyle = "M10K,no_rw_check" *) reg [7:0] mem_hi [0:DEPTH-1];
 
-    // Simple dual-port: port A WRITE-ONLY (byte-masked), port B READ-ONLY. This
-    // is the canonical template Quartus reliably maps to M10K. A read-during-write
-    // on port A (a_dout <= mem[a_addr]) defeats clean inference and makes Quartus
-    // try to build the 3.1 Mbit array in logic. a_dout is unused for now (CPU VRAM
-    // reads still come from SDRAM); it's reserved for a later phase, tied off here.
-    always @(posedge clk) begin
-        if (a_we) begin
-            if (a_be[0]) mem[a_addr][7:0]  <= a_din[7:0];
-            if (a_be[1]) mem[a_addr][15:8] <= a_din[15:8];
-        end
-    end
-    always @(posedge clk) a_dout <= 16'h0000;  // reserved; not read in Phase 1/2
+    reg [7:0] q_lo, q_hi;
+
+    // Port A: byte-masked write (whole-byte WE per lane).
+    always @(posedge clk) if (a_we && a_be[0]) mem_lo[a_addr] <= a_din[7:0];
+    always @(posedge clk) if (a_we && a_be[1]) mem_hi[a_addr] <= a_din[15:8];
 
     // Port B: registered read (video).
-    always @(posedge clk) begin
-        b_dout <= mem[b_addr];
-    end
+    always @(posedge clk) q_lo <= mem_lo[b_addr];
+    always @(posedge clk) q_hi <= mem_hi[b_addr];
+    assign b_dout = {q_hi, q_lo};
+
+    // Reserved CPU read port — unused in Phase 1/2 (CPU reads come from SDRAM).
+    always @(posedge clk) a_dout <= 16'h0000;
 
 endmodule
