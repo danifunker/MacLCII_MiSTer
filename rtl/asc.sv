@@ -170,10 +170,23 @@ module asc(
 	always @(*) begin
 		data_out_reg = 8'h00;
 		if (addr >= 12'h800 && addr <= 12'h80F) begin
+			// V8 register reads are HARDWIRED (MAME asc_v8::read): MODE/CONTROL/
+			// FIFOMODE always read 1; WTCONTROL/CLOCK/BATMANCONTROL always read 0;
+			// VERSION=0xE8; FIFOSTAT is live. The chip IGNORES writes to MODE/
+			// CONTROL/FIFOMODE, so the old `default: regs[...]` (returning the last
+			// written value, or 0) diverged from real V8 hardware — a Sound Manager
+			// setup/poll loop that reads MODE/CONTROL/FIFOMODE waiting for the fixed
+			// V8 value would spin forever on our readback (hung sound cdev).
 			case (addr[3:0])
 				4'h0:    data_out_reg = 8'hE8;        // VERSION
+				4'h1:    data_out_reg = 8'h01;        // MODE       (V8: always 1)
+				4'h2:    data_out_reg = 8'h01;        // CONTROL    (V8: always 1)
+				4'h3:    data_out_reg = 8'h01;        // FIFOMODE   (V8: always 1)
 				4'h4:    data_out_reg = fifo_stat;    // FIFOSTAT (live)
-				default: data_out_reg = regs[addr[3:0]];
+				4'h5:    data_out_reg = 8'h00;        // WTCONTROL  (V8: always 0)
+				4'h7:    data_out_reg = 8'h00;        // CLOCK      (V8: always 0)
+				4'h8:    data_out_reg = 8'h00;        // BATMANCTRL (V8: always 0)
+				default: data_out_reg = regs[addr[3:0]]; // VOLUME(6)/PLAYRECA(A)/...
 			endcase
 		end
 	end
