@@ -70,6 +70,7 @@ module emu
 		"-;",
 		"O4,Memory,2MB,10MB;",
 		"-;",
+		"R5,Interrupt (NMI / MacsBug);",
 		"R6,Reset PRAM & Core;",
 		"R0,Reset & Apply CPU+Memory;",
 		"V,v",`BUILD_DATE
@@ -436,7 +437,8 @@ module emu
 	);
 	wire _cpuVMA, _cpuVPA, _cpuDTACK;
 	wire E_rising, E_falling;
-	wire [2:0] _cpuIPL;
+	wire [2:0] _cpuIPL;       // final IPL to CPU (programmer's-switch NMI applied below)
+	wire [2:0] _cpuIPL_dc;    // raw IPL from dataController (VIA1 / PseudoVIA / SCC)
 	wire [2:0] cpuFC;
 	wire [7:0] cpuAddrHi;
 	wire [31:0] cpuAddr;
@@ -526,6 +528,31 @@ module emu
 	assign      _cpuDTACK = fc7_berr ? 1'b1 :
 	                        selectSCSIDMA ? ~scsiDREQ :
 	                        (~(!_cpuAS && (cpuAddr[23:21] != 3'b111 || selectVRAM)) | !dtack_en);
+
+	// ── Programmer's switch / Level-7 NMI (debug aid) ───────────────────────────
+	// An OSD button (status[5], the "R5" momentary trigger) fires a non-maskable
+	// Level-7 interrupt so MacsBug can break into a HUNG system — the core has no
+	// other way in (it otherwise generates only IPL 1/2/4). The 68k takes the
+	// level-7 autovector through the same IACK/VPA path that already serves the
+	// normal interrupts. The latch clears on the level-7 IACK so it fires exactly
+	// ONCE and never masks levels 1/2/4; a ~2 ms timeout backstop releases it if
+	// the CPU can't ack (e.g. it is already running at mask 7).
+	reg        nmi_req   = 1'b0;
+	reg        nmi_btn_d = 1'b0;
+	reg [15:0] nmi_to    = 16'd0;
+	always @(posedge clk_sys) begin
+		nmi_btn_d <= status[5];
+		if (status[5] && !nmi_btn_d) begin
+			nmi_req <= 1'b1;
+			nmi_to  <= 16'hFFFF;
+		end else if (nmi_req) begin
+			if ((fc7_iack && cpuAddr[3:1] == 3'b111) || nmi_to == 16'd0)
+				nmi_req <= 1'b0;
+			else
+				nmi_to <= nmi_to - 1'b1;
+		end
+	end
+	assign _cpuIPL = nmi_req ? 3'b000 : _cpuIPL_dc;
 	wire        cpu_en_p      = clk16_en_p;
 	wire        cpu_en_n      = clk16_en_n;
 	assign      _cpuReset_o   = tg68_reset_n;
@@ -892,9 +919,9 @@ module emu
 		.E_falling(E_falling),
 		._systemReset(n_reset),
 		.pseudovia_irq(pseudovia_irq),
-		._cpuReset(_cpuReset), 
-		._cpuIPL(_cpuIPL),
-		._cpuUDS(_cpuUDS), 
+		._cpuReset(_cpuReset),
+		._cpuIPL(_cpuIPL_dc),
+		._cpuUDS(_cpuUDS),
 		._cpuLDS(_cpuLDS), 
 		._cpuRW(_cpuRW), 
 		._cpuVMA(_cpuVMA),

@@ -134,6 +134,11 @@ int  reset_at_frame = -1;
 long long warm_reset_start = -1;   // main_time when the pulse began (<0 = not yet)
 const long long WARM_RESET_LEN = 4000;  // hold reset asserted this many ticks
 
+// Level-7 NMI test (--nmi-at-frame N): pulse the programmer's-switch NMI at frame
+// N to verify the CPU+glue take the level-7 autovector (the MacsBug break path).
+int  nmi_at_frame = -1;
+long long nmi_start = -1;
+
 // Headless mode (no GUI)
 // ----------------------
 bool headless = false;
@@ -242,6 +247,17 @@ int verilate() {
 				VERTOPINTERN->reset = 0;
 				printf("[F%d] WARM RESET: released reset\n", (int)video.count_frame);
 			}
+		}
+
+		// Level-7 NMI test (--nmi-at-frame N): pulse nmi_pulse at frame N. sim.v
+		// edge-detects it and forces IPL=7; expect "NMI: cleared (level-7 IACK TAKEN)".
+		if (nmi_at_frame >= 0) {
+			if (nmi_start < 0 && (int)video.count_frame >= nmi_at_frame) {
+				nmi_start = main_time;
+				printf("[F%d] NMI TEST: pulsing Level-7 NMI\n", (int)video.count_frame);
+			}
+			VERTOPINTERN->nmi_pulse =
+				(nmi_start >= 0 && main_time < nmi_start + WARM_RESET_LEN) ? 1 : 0;
 		}
 
 		// Clock dividers
@@ -786,6 +802,10 @@ int main(int argc, char** argv, char** env) {
 		} else if (strcmp(argv[i], "--reset-at-frame") == 0 && i + 1 < argc) {
 			reset_at_frame = std::stoi(argv[i + 1]);
 			printf("Will pulse a WARM reset at frame %d (ROM kept in SDRAM)\n", reset_at_frame);
+			i++;
+		} else if (strcmp(argv[i], "--nmi-at-frame") == 0 && i + 1 < argc) {
+			nmi_at_frame = std::stoi(argv[i + 1]);
+			printf("Will pulse a Level-7 NMI at frame %d (MacsBug-path test)\n", nmi_at_frame);
 			i++;
 		} else if (strcmp(argv[i], "--no-cpu-trace") == 0) {
 			cpu_trace_disabled = true;
