@@ -19,14 +19,20 @@ Three clarifications reshape the plan:
    software) — document it / optionally ship a sample HD image with the
    extension preinstalled.
 2. **CHD is compressed → unreadable in the FPGA.** It MUST be decoded by
-   Main_MiSTer (libchdr) and pushed to the core. Confirmed mechanism
-   (PCE-CD `mister_load_chd`/`pcecd_send_data`, ao486): **per-core firmware
-   support code** decodes the image and sends sectors over a core-specific
-   download/management channel (data 2048 / audio 2352; TOC from CHD metadata).
-   **Not** a transparent block device. ⇒ CHD = real C++ in Main_MiSTer + an
-   FPGA bridge, **hardware-validated only** (no Verilator coverage).
+   Main_MiSTer (libchdr) and pushed to the core. **Mechanism now verified by
+   source review** (see FIRMWARE GROUND TRUTH below): per-core firmware support
+   code decodes the image with `lib/libchdr` and serves **normalized 2048-byte
+   user-data sectors** to the FPGA over a **task-file/management channel**
+   (`hps_ext.v` cmds `0x61`/`0x62`), *not* the generic `sd_lba` block interface
+   and *not* a transparent block device. The good news: the CHD decode itself is
+   already abstracted in Main_MiSTer as a clean **"give me LBA N → 2048 bytes"**
+   call (`mister_chd_read_sector`) — exactly the §2.2/§5 sector-source interface.
+   ⇒ CHD = reuse `support/chd/` + `lib/libchdr` verbatim + a Mac-specific
+   FPGA↔firmware bridge, **hardware-validated only** (no Verilator coverage).
 3. **CD audio deferred.** 2352 raw + SCSI PLAY AUDIO + routing PCM into the
-   core's audio mixer is a separate feature. v1 = **data CDs only**.
+   core's audio mixer is a separate feature. v1 = **data CDs only**. The full
+   Apple audio command set (MAME ground truth) is now documented in **Appendix
+   A** so it's ready to implement, not researched, when un-deferred.
 
 **Recommended sequencing (de-risk the novel part first):**
 * **Phase 1 (now): in-core ISO/TOAST.** Prove the SCSI CD-ROM *device* — the
@@ -38,6 +44,8 @@ Three clarifications reshape the plan:
   device is format-agnostic.
 * **Phase 2: firmware CD subsystem for CHD** behind the same interface.
   Cross-repo (Main_MiSTer), hardware-only.
+* **Phase 3: CD audio** (deferred). Orthogonal to format but reuses Phase 2's
+  EXT_BUS bridge, so it follows it. Command set in Appendix A; work plan in §5.1.
 
 Why ISO first: the SCSI target + Apple-driver mounting is identical for every
 format and is the part most likely to fight us. Proving it on the cheapest,
@@ -69,7 +77,8 @@ sim-testable format means Phase 2 only adds a *sector source*, not a new device.
   `0xC8–0xCE`. `scsi_command_done`: 0xc0-group commands are length 10.
 * **TEST UNIT READY:** GOOD if media present, else no-disc (`0xB0`).
 * **CD audio** (CDDA) is wired to the speaker in MAME (`maclc.cpp:355`) — but
-  **deferred** here (data CDs only); stub `0xC8–0xCE` as accepted/no-op.
+  **deferred** here (data CDs only); stub `0xC8–0xCE` as accepted/no-op. The
+  **full audio command set is captured in Appendix A** for when it's un-deferred.
 
 **Firmware / internal-vs-external answer (your question):** MAME models the
 internal `NSCSI_CDROM_APPLE` and external `NSCSI_CDROM_APPLE_EXT` with
@@ -81,6 +90,84 @@ data CD* is the **Apple CD-ROM system extension** in the booted System Folder
 their driver from block 0 — that's image content, not core/firmware). The
 MiSTer-firmware piece remains **only** for decoding CHD (libchdr); it is
 unrelated to the Mac recognizing the drive.
+
+## FIRMWARE GROUND TRUTH (Main_MiSTer + ao486 review, verified 2026-06-09)
+
+Reviewed `../ao486_MiSTer` (FPGA side) and `../Main_MiSTer` (firmware side). ao486
+is the canonical MiSTer "firmware data-CD reader," so it answers the Phase-2
+unknowns directly. **Key architectural finding:** in the MiSTer-canonical design
+the **firmware does ALL CD command interpretation *and* image decode**; the FPGA
+is a thin **task-file + data buffer + 3-bit request code**. This is the *opposite*
+of our Phase-1 in-RTL SCSI target — see "Architectural fork" below.
+
+### FPGA side (what the core must expose) — `ao486_MiSTer`
+* **`rtl/hps_ext.v`** (110 lines, directly copyable): the EXT_BUS bridge. Protocol:
+  byte-0 strobe returns a status word `{4'hE, …, ext_req}` (the per-device
+  `request` codes); byte-1 sets `ext_addr` (auto-increments, line 63); then
+  cmd **`0x61`** = host→core mgmt write (sub-addr `0xF3` routes to the CDDA audio
+  FIFO), cmd **`0x62`** = core→host mgmt read, cmd `0x63` = MIDI. **This is the
+  "exact EXT_BUS/download handshake" §5 listed as a Phase-2 risk** — now resolved
+  to a concrete reference.
+* **`rtl/soc/ide.v`** (314 lines): a *dumb* IDE task-file. Guest-facing `io_*`
+  registers + a `mgmt_*` port firmware drives + two `dpram` data buffers. Exposes
+  a 3-bit `request` (`reset` / `new command` / `data send-recv`). **No INQUIRY /
+  READ TOC / READ / CHD logic in RTL at all.**
+* **`rtl/soc/cdda.v`** + `hps_ext` `0x61`/`0xF3`: CD-audio PCM path (reference for
+  the deferred audio feature).
+
+### Firmware side (what Main_MiSTer already implements) — `Main_MiSTer`
+* **`ide.cpp::ide_io(num, req)`** (line 964): the poll handler. `ide_check()`
+  returns the `request` word; `req==4` → new command (`cdrom_handle_cmd`), `req==5`
+  → data phase (`cdrom_handle_pkt` / `cdrom_read` / mode-select). Data moves via
+  `ide_sendbuf`/`ide_recvbuf` to buffer reg 255 (the `ide.v` dpram).
+* **`ide_cdrom.cpp`** (1767 lines): a **complete ATAPI/MMC CD-ROM emulation** —
+  the full closest analog to our scsi_cdrom, but in C++:
+  * `cdrom_parse(num, file)` (line 1657): tries **CHD → CUE → ISO** loaders; "" =
+    unmount. Single entry point.
+  * `check_iso_file`/`check_magic` (line 62-110): **ISO auto-detect** by reading
+    the ISO9660/High-Sierra **PVD at sector 16** across candidate sector sizes
+    {2048, 2352-mode1, 2336-mode2, 2352-mode2} + offset 16/24. **More robust than
+    our §2.2 "Mode1 sync-bytes" heuristic — adopt this instead.**
+  * `read_cd_sectors` (line 994): **normalizes any sector size to 2048** by
+    `FileSeek(pre=16|24)` + read 2048 + `FileSeek(post)`. **This is the 2352
+    straddle §2.2 feared — trivial in firmware (byte-granular seeks, not
+    512-blocks).**
+  * `read_toc` (line 556), `cd_inquiry` (1134), `mode_sense` (733),
+    `disc_info`/`track_info`, sense (`set_sense`/`get_sense`) — full MMC command
+    set. **Note: this is standard MMC `0x43` TOC**, *not* Apple vendor `0xC1`;
+    not directly reusable if we keep RTL command decode (Option C).
+  * `cdrom_read` (1020): serves data sectors; CHD branch caches a decompressed
+    hunk and `memcpy`s the 2048 user bytes out.
+* **`support/chd/mister_chd.cpp`** (186 lines) — **the single biggest reusable
+  asset, format-clean:**
+  * `mister_load_chd(file, &toc)` (line 31): `chd_open` + parse
+    `CDROM_TRACK_METADATA2` → fills a `toc_t` (`cd.h`) of tracks (type, sector
+    size 2048/2336/2352, start/end, pregap, the CHD 4-sector-pad `offset`).
+  * `mister_chd_read_sector(chd_f, lba, d_off, s_off, len, dst, hunkbuf, *hunknum)`
+    (line 163): hunk-cached decode — **exactly the "give me LBA N → 2048 bytes"
+    sector source §2.2/§5 specify.** Reuse verbatim.
+* **`lib/libchdr`** — the decoder (`chd_open`/`chd_read`, FLAC/zlib/huffman). Reuse
+  verbatim.
+
+### Architectural fork (the real Phase-2 decision)
+| | **A. Hybrid (current plan)** | **B. Firmware target (ao486-style)** | **C. Mac-optimal hybrid** |
+|---|---|---|---|
+| SCSI command decode | in RTL (`scsi_cdrom`) | in firmware | in RTL (`scsi_cdrom`) |
+| Image decode (ISO/CHD/cue) | ISO in RTL via block IF; CHD in firmware | all in firmware | ISO in RTL via block IF; **CHD sector source in firmware via `mister_chd_*`** |
+| FPGA role | full SCSI target | thin task-file (`ide.v`-like) | full SCSI target + a CHD sector-fetch bridge |
+| Verilator coverage | Phase 1 yes | none | Phase 1 yes |
+| Reuses Main_MiSTer | `mister_chd` only | almost all of `ide_cdrom.cpp` | `mister_chd` + libchdr |
+| Mac-specific cost | Apple SCSI cmds in RTL + new firmware bridge | Apple SCSI cmds in C++ (port MMC→Apple `0xC1`/`0xB0`/SONY INQUIRY) | Apple SCSI cmds in RTL + small CHD bridge |
+
+**Recommendation: stay with the hybrid (A/C).** The Mac uses an **NCR5380 SCSI bus
+the core already arbitrates in RTL** (`scsi.v` + `ncr5380.sv`) — unlike ao486's
+register-level ATAPI device that the x86 guest drives, which is *why* ao486 put
+command decode in firmware. Our SCSI phase machine + Apple command set belong in
+RTL (testable in Verilator, MAME-diffable). Phase 2 then adds **only a CHD sector
+source**: reuse `mister_chd_read_sector` + libchdr unchanged, behind the §2.2
+"block N" interface. We do **not** need to port `ide_cdrom.cpp`'s MMC command
+emulation (our RTL does Apple SCSI), and we do **not** reuse its `read_toc`
+(we synthesize the Apple `0xC1` TOC in RTL per §2.3).
 
 ## 0. TL;DR / recommendation  *(historical — see REVISION above)*
 
@@ -150,7 +237,7 @@ handshake, `scsi_dpram` buffering, and `io_rd`/`io_wr` generation. Differences:
 | WRITE | supported | **rejected** (read-only) → CHECK COND |
 | READ TOC | — | **Apple `0xC1`** (BCD/MSF), synthesize single data track (see 2.3) |
 | EJECT `0xC0`, READ Q SUBCODE `0xC2`, READ HEADER `0xC3` | — | minimal (eject → set no-disc; subcode/header → zeros) |
-| AUDIO `0xC8`–`0xCE` | — | **deferred** — accept as no-op GOOD (data CDs only) |
+| AUDIO `0xC8`–`0xCE`, Q SUBCODE `0xC2` | — | **deferred** — accept as no-op GOOD (data CDs only); full set in **Appendix A** |
 | MODE SENSE(6/0x1A) | minimal | minimal valid header (block size 2048) |
 | PREVENT/ALLOW MEDIUM REMOVAL (0x1E), START/STOP (0x1B) | — | accept (GOOD) |
 | REQUEST SENSE (0x03) | supported | supported (report no-disc `0xB0` when unmounted) |
@@ -172,10 +259,13 @@ One 2048-byte CD logical block. Layouts (for reference; only 2048 in Phase 1):
   `N*2352 + 16`, length 2048. 2352 is **not** 512-aligned → the 2048 window
   straddles 5 consecutive 512-byte SD sectors at a variable sub-offset.
 
-**Auto-detect** at first read after mount: read SD sector 0, test bytes 0..11
-for the Mode1 sync `00 FF*10 00`. Present → `sec_size=2352, data_off=16`
-(Mode1) / `24` (Mode2/Form1, header byte test). Absent → `sec_size=2048,
-data_off=0`. Latch per mount.
+**Auto-detect** — prefer Main_MiSTer's proven method over the sync-byte guess:
+read the **ISO9660/High-Sierra PVD at logical sector 16** and probe candidate
+sector sizes {2048, 2352 mode1 (+16), 2336 mode2 (+24), 2352 mode2 (+24)} for the
+`CD001`/`CDROM` magic (`ide_cdrom.cpp::check_magic` line 62; the byte test is
+`pvd[0]==1 && "CD001" && pvd[6]==1`). The matching probe yields both `sec_size`
+and `data_off`. Fall back to 2048/0. Latch per mount. (Phase-1 ISO will hit the
+2048/`data_off=0` case; the others matter only if 2352 `.bin` is in scope.)
 
 **Buffering for 2352:** widen the read path to cover a 2048 window spanning ≤5
 SD sectors. Cleanest is a small **image-reader** helper that, given logical
@@ -269,21 +359,75 @@ target replaces the empty_cd cleanly. Verify before FPGA.
 
 ---
 
-## 5. Phase 2 — CHD via firmware
+## 5. Phase 2 — CHD via firmware  *(scope now concrete after Main_MiSTer review)*
 
-To mount `.chd` directly (cue/bin would come free through the same path):
+Keep the **Option C** shape: RTL `scsi_cdrom` still decodes every Apple SCSI
+command and synthesizes the `0xC1` TOC; firmware supplies **only** normalized
+2048-byte sectors for a CHD-mounted image, behind the §2.2 "block N" interface.
 
-1. Add an `hps_ext`-style bridge on the existing `hps_io` `EXT_BUS` port.
-2. Write Main_MiSTer support code (new `support/maclc/` or reuse a CD lib) that
-   decodes CHD via libchdr (and parses cue/bin), serves **data-track** 2048-byte
-   sectors + TOC over the management/download channel. Mirror **ao486's /
-   PCE-CD's data-CD path** (`mister_load_chd` / `*_send_data`).
-3. The `scsi_cdrom` target asks the **same "give me block N" interface** (§2.2)
-   for logical blocks; the firmware backend supplies normalized 2048-byte user
-   data. No new device logic.
-* **Risks:** cross-repo (Main_MiSTer), exact EXT_BUS/download handshake mirrored
-  from a reference core, **hardware-only** validation (no firmware in
-  Verilator). This is the larger half of the effort.
+**Reuse verbatim from Main_MiSTer (do not re-implement):**
+* `lib/libchdr` — the CHD decoder.
+* `support/chd/mister_chd.cpp` — `mister_load_chd(file,&toc)` (builds a `toc_t`
+  of tracks: type, 2048/2336/2352 sector size, start/end, pregap, the CHD
+  4-sector-pad `offset`) and `mister_chd_read_sector(...)` (hunk-cached → 2048
+  user bytes). Plus `cd.h` (`toc_t`/`cd_track_t`).
+
+**Mac-specific work to add:**
+1. **FPGA bridge.** Port `ao486_MiSTer/rtl/hps_ext.v` onto our `hps_io` `EXT_BUS`
+   port (`sys/hps_io.sv` line 174, already exposed). Use the `0x62` core→host
+   mgmt-read path to let firmware push sectors into a small CD buffer the
+   `scsi_cdrom` sector-source reads, and a `request`/`ext_req` code to signal
+   "CD slot wants block N." Mirror `ide.v`'s thin task-file/buffer pattern for
+   just the CD sector window (we do *not* need its full IDE register file).
+2. **Main_MiSTer support code** (e.g. `support/maclc/` or fold into the existing
+   CD path): on mount of a `.chd`, call `mister_load_chd`; pick the data track;
+   on each "block N" request, call `mister_chd_read_sector` and ship 2048 bytes
+   over the bridge. ~100 lines of glue around the reused functions — **not** a
+   new CD emulator.
+3. `scsi_cdrom`'s sector source gains a second backend: `chd_mounted ?
+   firmware-fed : block-device(ISO)`. No change to the SCSI command logic, TOC
+   synthesis, or INQUIRY — those stay in RTL from Phase 1. (TOC capacity/track
+   bounds for CHD come from the firmware-supplied `toc_t`.)
+
+**What we deliberately DON'T take from ao486:** its in-firmware MMC command
+emulation (`cdrom_handle_pkt`, `read_toc`, `cd_inquiry`, `mode_sense`) — our RTL
+target already speaks Apple SCSI, and ao486's TOC is MMC `0x43`, not Apple `0xC1`.
+
+* **Risks:** cross-repo (Main_MiSTer build), the bridge handshake is new Mac glue
+  (but `hps_ext.v` is a copyable template), **hardware-only** validation (no
+  firmware in Verilator). Smaller than originally feared — the hard part (CHD
+  decode + TOC parse + sector normalization) is reused, not written.
+
+---
+
+## 5.1 Phase 3 — CD audio (deferred; follow-on after Phase 2)
+
+**Status: DEFERRED.** v1 = data CDs only. Listed as a first-class phase so the
+work and its dependencies are explicit. CD audio is **orthogonal to the
+data-format axis** — it applies to raw `.cue`/`.bin` audio tracks *and* CHD audio
+tracks, not just one format — but it **depends on Phase 2's EXT_BUS bridge** for
+the PCM transport, so it sequences **after** Phase 2.
+
+Three pieces:
+1. **RTL audio command handlers** in `scsi_cdrom` — `0xC8–0xCE` + `0xC2` READ Q
+   SUBCODE: a small state machine over CDDA position + play/pause/stop +
+   per-channel gain. **CDB layouts & semantics: Appendix A (§A.2)** (all `0xCx`
+   are 10-byte CDBs; MSF/track fields BCD). Phase 1 already stubs these as no-op
+   GOOD — Phase 3 makes them real.
+2. **2352-byte raw audio read path** — distinct from the 2048 data path. Red Book
+   CD-DA = 2352 B/sector, 16-bit signed stereo, 44.1 kHz. ISO/cue audio tracks
+   read raw 2352; CHD audio tracks via `mister_chd_read_sector` at 2352 (Phase
+   2's decode, different length).
+3. **PCM into the core audio mixer** — feed CD-DA samples into the ASC audio
+   output with per-channel gain set by `0xCE` AUDIO CONTROL. Transport reuses the
+   Phase-2 EXT_BUS bridge (ao486 reference: `rtl/soc/cdda.v` + `hps_ext.v` cmd
+   `0x61`/sub-addr `0xF3` PCM FIFO).
+
+Also fold in MODE SENSE page `0x0E` (CD Audio Control) here (§A.3).
+
+**Verification:** Verilator covers the command state machine (play/pause/stop/
+status/position over a synthetic TOC); the actual PCM mix is **HW-validated** (no
+audio render in sim). **No rework of the Phase 1/2 data path.**
 
 ---
 
@@ -299,9 +443,104 @@ To mount `.chd` directly (cue/bin would come free through the same path):
 * `verilator/sim_main.cpp` — `--cdrom` arg.
 * `docs/verilator_differences.md`, README/handoff — host-driver + toast note.
 
-**Phase 2 (optional):** `sys/` bridge + Main_MiSTer support code.
+**Phase 2 (optional, cross-repo):**
+* `rtl/hps_ext.v` (new) — port `ao486_MiSTer/rtl/hps_ext.v`; wire `EXT_BUS` in
+  `MacLC.sv` + a thin CD sector-buffer/`request` in `scsi_cdrom`.
+* `Main_MiSTer` — `support/maclc/` glue (~100 lines) calling reused
+  `support/chd/mister_chd.cpp` + `lib/libchdr`; hook into the OSD CD slot mount.
+* Reused unchanged: `Main_MiSTer/lib/libchdr`, `support/chd/mister_chd.{cpp,h}`,
+  `cd.h`.
+
+**Phase 3 (CD audio, deferred — see §5.1 + Appendix A):**
+* `rtl/scsi.v` — audio command handlers (`0xC8–0xCE`, `0xC2`) + 2352 raw read
+  path; MODE SENSE page `0x0E`.
+* `MacLC.sv` / `rtl/dataController_top.sv` — CD-DA PCM into the ASC mixer +
+  per-channel gain reg.
+* `rtl/hps_ext.v` + `Main_MiSTer` — extend the Phase-2 bridge with the `0xF3`
+  PCM FIFO; firmware ships 2352 audio sectors via `mister_chd_read_sector`.
 
 ## 7. Open decisions to confirm before coding
-1. **2352 `.bin` in Phase 1, or defer to Phase 2?** (straddle complexity)
+1. **2352 `.bin` in Phase 1, or defer to Phase 2?** Now lower-risk: adopt the
+   firmware `check_magic` PVD probe (§2.2) for detection, and the
+   `read_cd_sectors` seek-skip pattern for normalization. Still recommend
+   **ISO/2048 first**, 2352 as a fast-follow once the 2048 path is proven.
 2. **CONF_STR token/ext** — confirm `SCn` + 3-char ext matching; toast handling.
 3. **One CD drive (ID 3) or two?** Default: one, at ID 3 (Apple default).
+4. **Architectural fork confirmed?** Recommendation is the **hybrid (Option
+   A/C)**: RTL Apple-SCSI command decode + Verilator-testable ISO in Phase 1,
+   firmware `mister_chd_*` sector source in Phase 2. Rejecting the full
+   ao486-style firmware target (Option B) because the Mac arbitrates SCSI in RTL.
+   Confirm before Phase 2 (it's the one place we could instead go all-firmware).
+
+---
+
+## Appendix A — Apple CD audio command set (MAME ground truth)
+
+> **Status: DEFERRED (v1 = data CDs only).** Captured now so the audio feature is
+> a known quantity, not a research project, when we pick it up. Source:
+> `../mame/src/devices/bus/nscsi/cd.cpp` `nscsi_cdrom_apple_device` (the device
+> `maclc.cpp` attaches at SCSI ID 3). Spec: *"Apple CD-ROM SCSI Command Set"* v1.4,
+> 1988 — Apple's customization of the **Sony CDU-541** command set. **All
+> `0xCx` CDBs are 10 bytes** (`scsi_command_done`: `command & 0xf0 == 0xc0 →
+> length 10`). Multi-byte MSF/track fields are **BCD**.
+
+### A.1 Vendor command map (`apple_scsi_command_e`, cd.cpp:1192)
+| Opcode | Name | Audio? | Plan handling |
+|---|---|---|---|
+| `0xC0` | EJECT DISC | — | data-CD: stop+unload, set no-disc sense; honor PREVENT/ALLOW |
+| `0xC1` | READ TOC | — | **data-CD (§2.3)** — already required |
+| `0xC2` | READ Q SUBCODE | playback pos | data-CD: zeros OK; audio: real position |
+| `0xC3` | READ HEADER | — | minimal (zeros); MAME has no handler → base/illegal |
+| `0xC8` | AUDIO TRACK SEARCH | ✓ | deferred |
+| `0xC9` | AUDIO PLAY | ✓ | deferred |
+| `0xCA` | AUDIO PAUSE | ✓ | deferred |
+| `0xCB` | AUDIO STOP | ✓ | deferred |
+| `0xCC` | AUDIO STATUS | ✓ | deferred |
+| `0xCD` | AUDIO SCAN | ✓ | deferred |
+| `0xCE` | AUDIO CONTROL (volume) | ✓ | deferred |
+
+### A.2 Audio command CDB layouts & semantics (cd.cpp:1376-1799)
+Common: **address mode = `CDB[9] & 0xC0`** → `0x00`=LBA, `0x40`=MSF (BCD in
+`CDB[5..7]`), `0x80`=track # (BCD in `CDB[5]`; **track 0 = stop**).
+
+* **`0xC8` AUDIO TRACK SEARCH** — seek/arm play position without altering the
+  fundamental play/pause state. `CDB[1] bit4`: 1=play, 0=pause-after-seek. Sets
+  start LBA; uses `m_stop_position` as the end. → `start_audio(start, stop-start)`.
+* **`0xC9` AUDIO PLAY** — `CDB[1] bit4`: 0 = `CDB` carries the **start** addr
+  (stop was set by a prior STOP); 1 = `CDB` carries the **stop** addr (start was
+  set by a prior TRACK SEARCH). MSF in `CDB[3..5]` for this opcode. Track 0 in
+  track-mode = stop. → `cdda->start_audio()`.
+* **`0xCA` AUDIO PAUSE** — `CDB[1] == 0x10` → pause; else → resume **and**
+  cancel any active scan.
+* **`0xCB` AUDIO STOP** — sets `m_stop_position` (per address mode; track-mode
+  uses *end* of the given track, i.e. next track start − 1). If current LBA has
+  already passed it → stop immediately.
+* **`0xCC` AUDIO STATUS** — returns **6 bytes**. `type = CDB[3]`:
+  * `type 0`: `[0]` = status code {`0`=PLAYING, `1`=PAUSED, `2`=PLAYING_MUTED,
+    `3`=REACHED_END, `4`=ERROR, `5`=VOID/idle}; `[1]`=0; `[2]`=ADR/control of
+    current track; `[3..5]` = current absolute **MSF (BCD)**.
+  * `type 1` ("volume status"): `[0]`=left gain 0-255, `[1]`=right gain 0-255.
+* **`0xCD` AUDIO SCAN** — fast scan from the addressed position; `CDB[1] bit4`:
+  0=forward, `0x10`=reverse. Terminated by an `0xCA` PAUSE-OFF.
+* **`0xCE` AUDIO CONTROL (volume)** — `scsi_data_out` of `CDB[8]` bytes into
+  buffer id 3; `scsi_put_data` byte 0 → **left output gain** (`/255`), byte 1 →
+  **right output gain**. This is the per-channel CD-DA volume.
+* **`0xC2` READ Q SUBCODE** — returns **9 bytes** (all BCD where applicable):
+  `[0]`=control nibble, `[1]`=track, `[2]`=index(=1), `[3..5]`=relative M/S/F,
+  `[6..8]`=absolute M/S/F.
+
+### A.3 Supporting pieces (not `0xCx`, but part of audio support)
+* **MODE SENSE page `0x0E`** = CD Audio Control page (cd.cpp:273/587). **MODE
+  SENSE page `0x30`** = the "magic Apple page" (`apple_magic[0x17]`, cd.cpp:606)
+  — *also relevant to driver binding even for data-only*; worth implementing in
+  Phase 1 if the stock Apple driver proves picky.
+* **PCM characteristics:** Red Book CD-DA = **2352 bytes/sector, 16-bit signed
+  stereo, 44.1 kHz**. The audio path reads raw 2352 sectors (not 2048).
+* **Routing:** `maclc.cpp:355` routes the drive's CDDA output to the Mac speaker.
+  For us this means the FPGA must **mix CD-DA PCM into the core audio output**
+  (ASC mixer), with per-channel gain set by `0xCE`. Reference: ao486's
+  `rtl/soc/cdda.v` + `hps_ext.v` cmd `0x61`/sub-addr `0xF3` PCM FIFO.
+
+### A.4 Work breakdown
+→ See **Phase 3 (§5.1)** for the work breakdown, dependencies, and verification.
+This appendix is the command-set reference that phase implements against.
