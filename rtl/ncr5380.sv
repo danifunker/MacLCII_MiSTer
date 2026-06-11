@@ -596,6 +596,20 @@ module ncr5380
 		end else
 			hstall <= 0;
 	end
+
+	// Byte-slip post-hoc detector (2026-06-10 +1-insertion forensics): the
+	// host pushing a pseudo-DMA WRITE while the bus phase no longer matches
+	// TCR means the target completed its data phase EARLY relative to the
+	// host's byte count — i.e. somewhere in the burst the target consumed a
+	// phantom byte. The target-side overrun check can miss this case because
+	// dma_ack is suppressed once pmatch drops; this one cannot.
+	reg old_dma_wr_slip;
+	always @(posedge clk) begin
+		old_dma_wr_slip <= i_dma_wr;
+		if (~old_dma_wr_slip & i_dma_wr & dma_en & ~bsr_pmatch)
+			$display("NCR_WR_PHASE_MISMATCH: pseudo-DMA write w/ phase mismatch (leftover host bytes - insertion upstream?) wdata=%04x tcr=%01h io=%b cd=%b msg=%b",
+			         wdata, tcr, scsi_io, scsi_cd, scsi_msg);
+	end
 `endif
 
 endmodule

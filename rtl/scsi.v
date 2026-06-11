@@ -601,6 +601,39 @@ always @(posedge clk) begin
 		data_cnt_seen <= 0;
 	end
 end
+
+// Write-path byte-slip instrumentation (2026-06-10 forensics: a 6-sector
+// WRITE landed on disk with ONE foreign byte inserted at payload offset 1
+// and the rest of the command's data shifted +1, last byte dropped — see
+// docs/scsi_byteslip_2026-06-10.md). Hooks:
+//   * SCSI_WR_OVERRUN: an ACK beat in a write data phase after
+//     data_complete — the host still has bytes after we counted data_len,
+//     i.e. a phantom byte was consumed earlier in the phase.
+//   * +scsi_wr_trace: per-beat log of every stored byte for offline diff
+//     against the expected payload (find WHERE the foreign byte enters).
+always @(posedge clk) begin
+	if (stb_ack && (phase == PHASE_DATA_IN) && data_complete)
+		$display("SCSI_WR_OVERRUN ID=%0d data_cnt=%0d data_len=%0d din=%02x lba=%0d cmd=%02h",
+		         ID, data_cnt, data_len, din, lba, cmd[0]);
+	if (stb_ack && (phase == PHASE_DATA_IN) && $test$plusargs("scsi_wr_trace"))
+		$display("SCSI_WR_BEAT ID=%0d cnt=%0d din=%02x lba=%0d", ID, data_cnt, din, lba);
+end
+
+// Stuck-flush watchdog: io_wr pending while the bus is idle means the
+// final-block flush ack raced the BSY drop (io_ack is masked by
+// target_bsy upstream in ncr5380) — recovery then relies on the Mac's
+// timeout + bus reset (the documented reset/re-scan loop). Candidate
+// mechanism for the forensically-observed LOST write commands.
+reg [31:0] idle_flush_cnt;
+always @(posedge clk) begin
+	if (io_wr && (phase == PHASE_IDLE)) begin
+		idle_flush_cnt <= idle_flush_cnt + 1'd1;
+		if (idle_flush_cnt == 32'd100000)
+			$display("SCSI_FLUSH_STUCK ID=%0d io_wr pending while bus idle (io_ack masked by !bsy?) lba=%0d",
+			         ID, lba);
+	end else
+		idle_flush_cnt <= 0;
+end
 `endif
 
 // check whether status byte has been sent

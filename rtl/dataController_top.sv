@@ -30,6 +30,7 @@ module dataController_top(
 	input selectSCSI,
 	input selectSCSIDMA,    // SCSI pseudo-DMA window (DACK)
 	output scsiDREQ,        // SCSI pseudo-DMA request (gates CPU DTACK upstream)
+	output scsiIRQ,         // NCR5380 latched IRQ (level) -> pseudo-VIA IFR bit 3
 	input selectSCC,
 	input selectIWM,
 	input selectVIA,
@@ -337,6 +338,10 @@ module dataController_top(
 	// dma_second_word describe the 68020 access width so the chip packs 1/2/4
 	// bytes per cycle (matches MAME scsi_drq_r/w). dreq feeds the CPU DTACK
 	// gate upstream so a pseudo-DMA cycle stalls until the target has data.
+	// o_irq (latched phase-mismatch IRQ, cleared by a reg-7 read) and dreq
+	// also feed the pseudo-VIA IFR bits 3/0 LEVEL-wise — the on-disk HD SC
+	// 4.3 driver's async path sleeps on those flags between pseudo-DMA
+	// chunks (Apple_Driver43 partition; the System 7 Welcome wedge).
 	ncr5380 #(.DEVS(SCSI_DEVS), .ENABLE_EMPTY_CD(0)) scsi(
 		.clk(clk32),
 		.reset(!_cpuReset),
@@ -349,6 +354,7 @@ module dataController_top(
 		.dma_longword(cpuLongword),
 		.dma_second_word(cpuAddrRegLo[0]),
 		.dreq(scsiDREQ),
+		.o_irq(scsiIRQ),
 		.wdata(cpuDataIn),
 		.rdata(scsiDataOut),
 

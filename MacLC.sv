@@ -465,6 +465,7 @@ module emu
 	wire memoryOverlayOn, selectSCSI, selectSCC, selectIWM, selectVIA, selectRAM, selectROM, selectASC, selectUnmapped;
 	wire selectSCSIDMA;   // SCSI pseudo-DMA window (DACK) from address decoder
 	wire scsiDREQ;        // SCSI pseudo-DMA request → gates CPU DTACK on DMA cycles
+	wire scsiIRQ;         // NCR5380 latched IRQ (level) → pseudo-VIA IFR bit 3
 	wire [23:0] overlay_trigger_addr;
 	wire [15:0] dataControllerDataOut;
 
@@ -763,6 +764,10 @@ module emu
 		.vblank_irq(v8_vblank),
 		.slot_irq(pds_slot_irq),
 		.asc_irq(asc_irq),
+		// SCSI flags, LEVEL-driven (MAME pseudovia.cpp scsi_irq_w/scsi_drq_w):
+		// the HD SC 4.3 driver sleeps on IFR bits 3/0 between pseudo-DMA chunks.
+		.scsi_irq(scsiIRQ),
+		.scsi_drq(scsiDREQ),
 		.irq_out(pseudovia_irq),
 		.ram_config(configRAMSize),
 		.monitor_id(v8_monitor_id),
@@ -934,6 +939,7 @@ module emu
 		.selectSCSI(selectSCSI),
 		.selectSCSIDMA(selectSCSIDMA),
 		.scsiDREQ(scsiDREQ),
+		.scsiIRQ(scsiIRQ),
 		.selectSCC(selectSCC),
 		.selectIWM(selectIWM),
 		.selectVIA(selectVIA),
