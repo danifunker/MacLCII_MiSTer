@@ -60,6 +60,9 @@ module ncr5380
 	input         dma_longword,
 	input         dma_second_word,
 	output        dreq,
+	// Latched 5380 interrupt (phase-mismatch during armed DMA). Reserved for
+	// a pseudo-VIA IFR bit-3 hookup (LC has no VIA2); see port notes.
+	output        o_irq,
 	input  [15:0] wdata,
 	output [15:0] rdata,
 
@@ -307,16 +310,61 @@ module ncr5380
 		end
 	end
 
+	/* Latched 5380 interrupt + DMA-armed tracking (LBMacTwo b760944 port).
+	 * Starting a DMA transfer (write to Start DMA Send / Start DMA Initiator
+	 * Receive) arms the phase-mismatch monitor; while MR.DMA_MODE is set and
+	 * armed, a FALLING edge of phase-match latches IRQ — this is how drivers
+	 * detect that a pseudo-DMA transfer ended (target moved to STATUS).
+	 * Reading the RESET PARITY/INTERRUPT register (reg 7) clears it.
+	 * Mirrors Snow controller.rs. Makes BSR.IRQ truthful for polled drivers;
+	 * o_irq is for a future pseudo-VIA IFR bit-3 hookup (level-driven, per
+	 * MAME src/devices/machine/pseudovia.cpp) if OS 7 still needs it.
+	 */
+	reg  irq_latch;
+	reg  dma_armed;
+	reg  pmatch_d;
+	wire rst_rd = bus_cs & ~dack & ior & (bus_rs == `RREG_RST);
+	reg  old_rst_rd;
+	always @(posedge clk or posedge reset) begin
+		if (reset) begin
+			irq_latch  <= 1'b0;
+			dma_armed  <= 1'b0;
+			pmatch_d   <= 1'b1;
+			old_rst_rd <= 1'b0;
+		end else begin
+			old_rst_rd <= rst_rd;
+			pmatch_d   <= bsr_pmatch;
+			if (!mr[`MR_DMA_MODE])
+				dma_armed <= 1'b0;
+			else if (reg_wr && (bus_rs == `WREG_DMAS || bus_rs == `WREG_IDMAR))
+				dma_armed <= 1'b1;
+			if (~old_rst_rd & rst_rd)
+				irq_latch <= 1'b0;
+			if (mr[`MR_DMA_MODE] && dma_armed && pmatch_d && !bsr_pmatch) begin
+				irq_latch <= 1'b1;
+				dma_armed <= 1'b0;
+			end
+			if (scsi_rst) begin
+				irq_latch <= 1'b0;
+				dma_armed <= 1'b0;
+			end
+		end
+	end
+	assign o_irq = irq_latch;
+
 	/* CSR (read only). We don't do parity */
 	assign csr = { scsi_rst, scsi_bsy, scsi_req, scsi_msg,
-	               scsi_cd, scsi_io, scsi_sel, 1'b0 };	
+	               scsi_cd, scsi_io, scsi_sel, 1'b0 };
 
 	/* Bus and Status register */
 	/* BSR (read only). We don't do a few things... */
-	wire bsr_eodma = 1'b0;	/* We don't do EOP */
+	/* End-of-DMA: Snow semantics — asserted whenever the bus is NOT in a
+	 * data phase (free/STATUS/MESSAGE). Drivers check this after pseudo-DMA
+	 * chunks. (Real chip latches the EOP pin; we have no EOP.) */
+	wire bsr_eodma = ~(scsi_bsy & ~scsi_cd & ~scsi_msg);
 	wire bsr_dmarq = scsi_req & dma_en;
 	wire bsr_perr = 1'b0;	/* We don't do parity */
-	wire bsr_irq = scsi_req & dma_en & ~bsr_pmatch;
+	wire bsr_irq = irq_latch;
 	wire bsr_pmatch = 
 	         tcr[`TCR_A_MSG] == scsi_msg &&
 	         tcr[`TCR_A_CD ] == scsi_cd  &&
@@ -432,6 +480,10 @@ module ncr5380
 		.clk    ( clk ),
 		.rst    ( scsi_rst ),
 		.sel    ( ENABLE_EMPTY_CD ? scsi_sel : 1'b0 ),
+		// Selection requires a free bus — a wedged-BUSY device must not let a
+		// second selection create two active targets sharing the broadcast ACK
+		// stream (LBMacTwo corruption fix 4376c8f).
+		.bus_busy ( |target_bsy ),
 		.ack    ( scsi_ack ),
 		.bsy    ( empty_cd_bsy  ),
 		.msg    ( empty_cd_msg  ),
@@ -453,6 +505,9 @@ module ncr5380
 				.clk    ( clk ),
 				.rst    ( scsi_rst ),
 				.sel    ( scsi_sel ),
+				// Free-bus selection gate (4376c8f); own bsy bit is harmless —
+				// the gate is only evaluated in the target's IDLE phase.
+				.bus_busy ( (|target_bsy) | empty_cd_active ),
 				.atn    ( scsi_atn ),
 
 				.ack    ( scsi_ack ),
