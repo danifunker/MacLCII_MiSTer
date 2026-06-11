@@ -352,8 +352,42 @@ module ncr5380
 	end
 	assign o_irq = irq_latch;
 
+	/* Deferred bus-visible REQ (Snow controller.rs `set_req` semantics —
+	 * LBMacTwo 2d025c5, PROVEN the System 7 Welcome-wedge exit). The SCSI
+	 * Manager's between-chunk settle loop (decoded live from the System's
+	 * polled TIB engine: `btst #5,CSR / beq exit / btst #3,BSR / bne loop`)
+	 * exits only when a CSR read returns REQ=0. On a real 5380 + drive the
+	 * per-byte handshake gives it that window; Snow instead DEFERS every
+	 * REQ assertion until the next CSR read ("MacII has a race condition
+	 * where it will get stuck if REQ is immediately set on a Data -> Status
+	 * transition"). Mirror Snow: when bus-visible REQ rises, hide it from
+	 * CSR until one full CSR read completes (that read returns REQ=0 and
+	 * disarms; the next shows 1). BSR.DRQ is NOT deferred (Snow's get_drq
+	 * includes the pending REQ), so DRQ-polled transfer loops and DACK
+	 * pacing are unaffected.
+	 */
+	reg req_deferred;
+	reg old_req_bus_d;
+	reg old_csr_rd_d;
+	always @(posedge clk or posedge reset) begin
+		if (reset) begin
+			req_deferred  <= 1'b0;
+			old_req_bus_d <= 1'b0;
+			old_csr_rd_d  <= 1'b0;
+		end else begin
+			old_req_bus_d <= scsi_req_bus;
+			old_csr_rd_d  <= csr_rd;
+			if (~old_req_bus_d & scsi_req_bus)
+				req_deferred <= 1'b1;       // new REQ: hidden until a CSR read
+			else if (req_deferred & old_csr_rd_d & ~csr_rd)
+				req_deferred <= 1'b0;       // CSR read completed: reveal REQ
+			if (!scsi_req_bus)
+				req_deferred <= 1'b0;
+		end
+	end
+
 	/* CSR (read only). We don't do parity */
-	assign csr = { scsi_rst, scsi_bsy, scsi_req, scsi_msg,
+	assign csr = { scsi_rst, scsi_bsy, scsi_req_bus & ~req_deferred, scsi_msg,
 	               scsi_cd, scsi_io, scsi_sel, 1'b0 };
 
 	/* Bus and Status register */
@@ -362,7 +396,7 @@ module ncr5380
 	 * data phase (free/STATUS/MESSAGE). Drivers check this after pseudo-DMA
 	 * chunks. (Real chip latches the EOP pin; we have no EOP.) */
 	wire bsr_eodma = ~(scsi_bsy & ~scsi_cd & ~scsi_msg);
-	wire bsr_dmarq = scsi_req & dma_en;
+	wire bsr_dmarq = scsi_req_bus & dma_en;
 	wire bsr_perr = 1'b0;	/* We don't do parity */
 	wire bsr_irq = irq_latch;
 	wire bsr_pmatch = 
@@ -397,6 +431,7 @@ module ncr5380
 
 	/* Mux target signals */
 	reg scsi_cd, scsi_io, scsi_msg, scsi_req;
+	reg scsi_req_bus;  // bus-visible REQ (no HPS-fetch dropouts in data phases)
 
 	always begin
 		integer i;
@@ -404,6 +439,7 @@ module ncr5380
 		scsi_io = 0;
 		scsi_msg = 0;
 		scsi_req = 0;
+		scsi_req_bus = 0;
 		din = 8'h00;
 		din_pair = 16'h0000;
 		din_pair_next = 16'h0000;
@@ -414,6 +450,7 @@ module ncr5380
 				scsi_io = target_io[i];
 				scsi_msg = target_msg[i];
 				scsi_req = target_req[i];
+				scsi_req_bus = target_req_bus[i];
 				din = target_dout[i];
 				din_pair = target_dout_pair[i];
 				din_pair_next = target_dout_pair_next[i];
@@ -425,6 +462,7 @@ module ncr5380
 			scsi_io = empty_cd_io;
 			scsi_msg = empty_cd_msg;
 			scsi_req = empty_cd_req;
+			scsi_req_bus = empty_cd_req_bus;
 			din = empty_cd_dout;
 			din_pair = empty_cd_dout_pair;
 			din_pair_next = empty_cd_dout_pair_next;
@@ -459,6 +497,7 @@ module ncr5380
 	wire [DEVS-1:0] target_io;
 	wire [DEVS-1:0] target_cd;
 	wire [DEVS-1:0] target_req;
+	wire [DEVS-1:0] target_req_bus;  // bus-visible REQ (continuity across HPS fetches)
 	wire      [7:0] target_dout[DEVS];
 	wire     [15:0] target_dout_pair[DEVS];
 	wire     [15:0] target_dout_pair_next[DEVS];
@@ -470,6 +509,7 @@ module ncr5380
 	wire empty_cd_io;
 	wire empty_cd_cd;
 	wire empty_cd_req;
+	wire empty_cd_req_bus;
 	wire [7:0] empty_cd_dout;
 	wire [15:0] empty_cd_dout_pair;
 	wire [15:0] empty_cd_dout_pair_next;
@@ -490,6 +530,7 @@ module ncr5380
 		.cd     ( empty_cd_cd   ),
 		.io     ( empty_cd_io   ),
 		.req    ( empty_cd_req  ),
+		.req_bus( empty_cd_req_bus ),
 		.dout   ( empty_cd_dout ),
 		.dout_pair ( empty_cd_dout_pair ),
 		.dout_pair_next ( empty_cd_dout_pair_next ),
@@ -519,6 +560,7 @@ module ncr5380
 				.cd     ( target_cd[i]   ),
 				.io     ( target_io[i]   ),
 				.req    ( target_req[i]  ),
+				.req_bus( target_req_bus[i] ),
 				.dout   ( target_dout[i] ),
 				.dout_pair ( target_dout_pair[i] ),
 				.dout_pair_next ( target_dout_pair_next[i] ),

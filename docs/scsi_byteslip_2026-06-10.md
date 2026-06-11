@@ -121,3 +121,33 @@ sweep (best `d` where `corrupt[i] == pristine[i-d]`).
   driver path will exercise multi-chunk transfers it never completed
   before) until the slip is fixed — treat both as one campaign gated by
   the protocol above.
+
+## 2026-06-11 addendum — the REAL OS 7 wedge fixes, ported
+
+HW test of the pseudo-VIA IFR build: System 7 still wedged (System 6
+fine) — matching LBMacTwo round-4's finding that the HD SC 4.3 boot path
+**doesn't consume the IFR flags at all** (VIA2 IER=0x02 on Mac II; the
+flags stay wired here for the async paths). The three-way audit
+(`../lbmactwo_MiSTer/docs/scsi_audit_2026-06-10.md`) triangulated and
+HW-PROVED the actual mechanism, in two stacked parts, both now ported:
+
+1. **`5adc2e1` — bus-visible REQ continuity.** `scsi.v` splits REQ into
+   flow (`req`, unchanged — still gates DREQ/DTACK so premature data
+   access stalls instead of reading a stale buffer half) vs visibility
+   (`req_bus`, held across `io_busy` in the data phases). `ncr5380.sv`
+   feeds CSR.REQ and BSR.DRQ from `req_bus`. Without it the driver's
+   between-chunk poll saw a dead bus (CSR=0x44) for the whole ~ms HPS
+   fetch and parked.
+2. **`2d025c5` — deferred REQ until CSR read (Snow `set_req`).** The
+   System's polled TIB engine spins `btst #5,CSR / beq exit / btst
+   #3,BSR / bne loop` — it exits ONLY when a CSR read returns REQ=0. A
+   combinational always-up REQ never shows that window. On each
+   bus-visible REQ rising edge, CSR hides REQ until one full CSR read
+   completes; BSR.DRQ is NOT deferred (DACK pacing untouched).
+
+LBMacTwo round-6 validated both on HW: System boots AND corruption gone
+(1-sector MDB diff, zero COPY runs) — supporting the recovery-poke theory
+of our SHIFT-class corruption (the dead-bus window was what sent the
+driver into the byte-injecting error path). Re-run the §Validation
+protocol on MacLC after this build: expect OS 7 past Welcome and zero
+SHIFT runs.
