@@ -467,7 +467,7 @@ module emu
 	wire scsiDREQ;        // SCSI pseudo-DMA request → gates CPU DTACK on DMA cycles
 	wire scsiIRQ;         // NCR5380 latched IRQ (level) → pseudo-VIA IFR bit 3
 	// JTAG probe feeds from the SCSI engine (consumed by dbg_probes below)
-	wire [15:0] dbg_scsi2_w, dbg_scsi4_w, dbg_scsi5_w;
+	wire [15:0] dbg_scsi_w, dbg_scsi2_w, dbg_scsi4_w, dbg_scsi5_w;
 	wire [31:0] dbg_ncr_w, dbg_ncr2_w, dbg_wr_w;
 	wire [23:0] overlay_trigger_addr;
 	wire [15:0] dataControllerDataOut;
@@ -773,10 +773,19 @@ module emu
 		.vblank_irq(v8_vblank),
 		.slot_irq(pds_slot_irq),
 		.asc_irq(asc_irq),
-		// SCSI flags, LEVEL-driven (MAME pseudovia.cpp scsi_irq_w/scsi_drq_w):
-		// the HD SC 4.3 driver sleeps on IFR bits 3/0 between pseudo-DMA chunks.
-		.scsi_irq(scsiIRQ),
-		.scsi_drq(scsiDREQ),
+		// SCSI flags TIED OFF (2026-06-11): MAME's maclc.cpp does NOT connect
+		// the 5380 IRQ/DRQ to the LC pseudo-VIA and boots LC System 7 — the
+		// bit-3/bit-0 mapping came from MAME's SHARED pseudovia device as
+		// used by other machines, not LC ground truth. With them wired,
+		// System 7.x crashed+restarted ~1s after Happy Mac (stray IFR bits
+		// during the System's V8 interrupt-handler install; System 6 masks
+		// via IER and survived; LBMacTwo — no pseudovia — boots 7.1.2 with
+		// the identical SCSI RTL). The System 7 wedge fix is the deferred
+		// CSR REQ in ncr5380, NOT IFR delivery (audit item 11, round-4).
+		// Plumbing (scsiIRQ/scsiDREQ wires, pseudovia ports) kept for a
+		// future hardware-verified re-introduction.
+		.scsi_irq(1'b0),
+		.scsi_drq(1'b0),
 		.irq_out(pseudovia_irq),
 		.ram_config(configRAMSize),
 		.monitor_id(v8_monitor_id),
@@ -813,6 +822,7 @@ module emu
 		.selectSCC(selectSCC),
 		.scsiDREQ(scsiDREQ),
 		.scsiIRQ(scsiIRQ),
+		.scsi_dbg(dbg_scsi_w),
 		.scsi_dbg2(dbg_scsi2_w),
 		.scsi_dbg4(dbg_scsi4_w),
 		.scsi_dbg5(dbg_scsi5_w),
@@ -993,6 +1003,7 @@ module emu
 		.selectSCSIDMA(selectSCSIDMA),
 		.scsiDREQ(scsiDREQ),
 		.scsiIRQ(scsiIRQ),
+		.dbg_scsi(dbg_scsi_w),
 		.dbg_scsi2(dbg_scsi2_w),
 		.dbg_scsi4(dbg_scsi4_w),
 		.dbg_scsi5(dbg_scsi5_w),

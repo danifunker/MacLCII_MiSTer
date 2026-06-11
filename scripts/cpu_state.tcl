@@ -65,7 +65,7 @@ puts [format "PIFA last IF    : %06X (ifcnt %u -> %u, %s)" \
 set padr [rd PADR]
 set a [expr {$padr & 0xFFFFFF}]
 set region "?"
-if {($a & 0xE00000) == 0xE00000} { set region "I/O ($F0xxxx)" } \
+if {($a & 0xE00000) == 0xE00000} { set region "I/O (F0xxxx)" } \
 elseif {$a < 0x800000}           { set region "RAM" } \
 else                             { set region "high" }
 puts [format "PADR cpuAddr    : %06X  (%s)" $a $region]
@@ -111,9 +111,20 @@ puts [format "PSCS last rd    : reg %d (%s) = %04X  img_seen=%d%d sd_rd=%d%d sd_
     [expr {($scs>>29)&1}] [expr {($scs>>28)&1}] \
     [expr {($scs>>31)&1}] [expr {($scs>>30)&1}]]
 
+set p2 [rd PSC2]
+if {$p2 >= 0} {
+    puts [format "PSC2 selection  : sel_ids=%02X at-sel{out_en=%d bsy=%d tbsy=%d%d MOUNTED=%d%d} live{out_en=%d sel=%d bsy=%d tbsy=%d%d mounted=%d%d adb=%d data=%02X}" \
+        [expr {($p2>>24)&0xFF}] \
+        [expr {($p2>>23)&1}] [expr {($p2>>21)&1}] [expr {($p2>>20)&1}] [expr {($p2>>19)&1}] \
+        [expr {($p2>>18)&1}] [expr {($p2>>17)&1}] \
+        [expr {($p2>>15)&1}] [expr {($p2>>14)&1}] [expr {($p2>>13)&1}] \
+        [expr {($p2>>12)&1}] [expr {($p2>>11)&1}] [expr {($p2>>10)&1}] [expr {($p2>>9)&1}] \
+        [expr {($p2>>8)&1}] [expr {$p2&0xFF}]]
+}
+
 set phn {IDLE CMD_IN DATA_OUT(rd) DATA_IN(wr) STATUS MSG ph6? ph7?}
 set p3 [rd PSC3]
-puts [format "PSC3 phases     : t1=%s t0=%s  max t1=%s t0=%s  rst[3:0]=%d" \
+puts [format "PSC3 phases     : t1=%s t0=%s  max t1=%s t0=%s  rst_lo4=%d" \
     [lindex $phn [expr {($p3>>21)&7}]] [lindex $phn [expr {($p3>>18)&7}]] \
     [lindex $phn [expr {($p3>>10)&7}]] [lindex $phn [expr {($p3>>6)&7}]] \
     [expr {($p3>>28)&0xF}]]
@@ -160,4 +171,4 @@ set v [rd PVID]
 puts [format "PVID video      : vbl_cnt=%d clut_wr=%d vram_wr=%d video_config=%02X" \
     [expr {($v>>24)&0xFF}] [expr {($v>>16)&0xFF}] [expr {($v>>8)&0xFF}] [expr {$v&0xFF}]]
 
-end_insystem_source_probe -device_name $dev -hardware_name $hw
+catch { end_insystem_source_probe }

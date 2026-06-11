@@ -52,6 +52,7 @@ module dbg_probes (
     // SCSI
     input wire        scsiDREQ,
     input wire        scsiIRQ,
+    input wire [15:0] scsi_dbg,       // selection: out_en/SEL/BSY/bsy/mounted/data
     input wire [15:0] scsi_dbg2,      // phases + io handshake
     input wire [15:0] scsi_dbg4,      // bus-reset count + completion flags
     input wire [15:0] scsi_dbg5,      // last opcodes
@@ -213,6 +214,33 @@ module dbg_probes (
         .instance_id ("PSCS"), .probe_width (32), .source_width(1),
         .sld_auto_instance_index ("YES")
     ) cp_pscs (.probe(pscs_r), .source(), .source_clk(clk), .source_ena(1'b1));
+
+    // ---- PSC2: selection transaction visibility ---------------------------
+    // scsi_dbg layout (ncr5380.sv): [15]=out_en [14]=SEL [13]=BSY
+    // [12:11]=target_bsy [10:9]=target_MOUNTED [8]=ICR.A_DATA
+    // [7:0]=scsi_bus_data (the ID bits driven during selection).
+    // PSC2 = {sel_ids_sticky[7:0], dbg_at_sel[15:8], dbg_scsi_live[15:0]}:
+    //   [31:24] sticky OR of every data byte seen while SEL asserted —
+    //           which IDs the ROM actually tried to select
+    //   [23:16] upper byte of scsi_dbg latched at the last SEL assertion
+    //           (out_en/BSY/target_bsy/MOUNTED at the selection moment)
+    //   [15:0]  live scsi_dbg
+    // Directly answers "is the target mounted and does it see its ID" for
+    // the deaf-disk-after-reset state.
+    reg [7:0] sel_ids;
+    reg [7:0] dbg_at_sel;
+    always @(posedge clk)
+        if (scsi_dbg[14]) begin       // SEL asserted
+            sel_ids    <= sel_ids | scsi_dbg[7:0];
+            dbg_at_sel <= scsi_dbg[15:8];
+        end
+    reg [31:0] psc2_r;
+    always @(posedge clk) psc2_r <= {sel_ids, dbg_at_sel, scsi_dbg};
+
+    altsource_probe #(
+        .instance_id ("PSC2"), .probe_width (32), .source_width(1),
+        .sld_auto_instance_index ("YES")
+    ) cp_psc2 (.probe(psc2_r), .source(), .source_clk(clk), .source_ena(1'b1));
 
     // ---- PSC3: target phases + max-phase + io/sd handshake ----------------
     // LBMacTwo layout with the spare top nibble carrying the bus-reset count:

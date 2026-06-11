@@ -32,6 +32,7 @@ module dataController_top(
 	output scsiDREQ,        // SCSI pseudo-DMA request (gates CPU DTACK upstream)
 	output scsiIRQ,         // NCR5380 latched IRQ (level) -> pseudo-VIA IFR bit 3
 	// JTAG probe feeds (dbg_probes.sv in the FPGA top; unconnected in sim)
+	output [15:0] dbg_scsi,   // selection/arbitration: out_en/SEL/BSY/bsy/MOUNTED/data
 	output [15:0] dbg_scsi2,  // target phases + HPS io handshake
 	output [15:0] dbg_scsi4,  // bus-reset count + per-target completion flags
 	output [15:0] dbg_scsi5,  // per-target last-opcode bitmap
@@ -379,7 +380,7 @@ module dataController_top(
 		.sd_buff_wr(sd_buff_wr),
 
 		// JTAG probe feeds (consumed by dbg_probes.sv in the FPGA top)
-		.dbg_scsi(),
+		.dbg_scsi(dbg_scsi),
 		.dbg_scsi2(dbg_scsi2),
 		.dbg_scsi3(),
 		.dbg_scsi4(dbg_scsi4),

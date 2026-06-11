@@ -590,10 +590,12 @@ module emu
 		.vblank_irq(v8_vblank),
 		.slot_irq(pds_slot_irq),
 		.asc_irq(asc_irq),
-		// SCSI flags, LEVEL-driven (MAME pseudovia.cpp scsi_irq_w/scsi_drq_w):
-		// the HD SC 4.3 driver sleeps on IFR bits 3/0 between pseudo-DMA chunks.
-		.scsi_irq(scsiIRQ),
-		.scsi_drq(scsiDREQ),
+		// SCSI flags TIED OFF (2026-06-11) — matches MacLC.sv (see the
+		// comment there: MAME maclc ground truth; stray IFR bits crashed
+		// System 7.x boot ~1s after Happy Mac; deferred CSR REQ is the real
+		// System 7 fix). Plumbing kept for a future re-introduction.
+		.scsi_irq(1'b0),
+		.scsi_drq(1'b0),
 		.irq_out(pseudovia_irq),
 		.ram_config(configRAMSize),
 		.monitor_id(v8_monitor_id),
@@ -740,6 +742,7 @@ module emu
 		.scsiIRQ(scsiIRQ),
 		// JTAG probe feeds — FPGA-only (dbg_probes.sv lives in MacLC.sv;
 		// altsource_probe is an Altera primitive, never bring it into sim)
+		.dbg_scsi(),
 		.dbg_scsi2(),
 		.dbg_scsi4(),
 		.dbg_scsi5(),
