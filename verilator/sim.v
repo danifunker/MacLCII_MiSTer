@@ -738,6 +738,14 @@ module emu
 		.selectSCSIDMA(selectSCSIDMA),
 		.scsiDREQ(scsiDREQ),
 		.scsiIRQ(scsiIRQ),
+		// JTAG probe feeds — FPGA-only (dbg_probes.sv lives in MacLC.sv;
+		// altsource_probe is an Altera primitive, never bring it into sim)
+		.dbg_scsi2(),
+		.dbg_scsi4(),
+		.dbg_scsi5(),
+		.dbg_ncr(),
+		.dbg_ncr2(),
+		.dbg_wr(),
 		.selectSCC(selectSCC),
 		.selectIWM(selectIWM),
 		.selectVIA(selectVIA),

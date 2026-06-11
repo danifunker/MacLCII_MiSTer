@@ -12,7 +12,20 @@ CPU-glue or top-level wiring fix must be made in **both** files or sim and FPGA
 silently diverge. (This has bitten us before — e.g. sim once hardwired
 `.berr(1'b0)`, masking the MOVES bus-error fix.)
 
-Last audited: 2026-06-06 (PRAM NVRAM persistence added — see the PRAM row below).
+Last audited: 2026-06-11 (JTAG probe deck added FPGA-only; selectASC divergence
+FIXED — see below).
+
+**2026-06-11 — selectASC divergence FIXED (was a real FPGA-only bug):**
+`sim.v` connected `.selectASC(selectASC)` on its addrController instance;
+`MacLC.sv` NEVER did — the wire floated to GND on hardware, so ASC register
+access was dead on FPGA while sim audio worked. Found when the new probe deck
+made the dangling net visible (Quartus warning 12110). Both tops now connect it.
+
+**2026-06-11 — intentional FPGA-only addition:** `rtl/dbg_probes.sv` (JTAG
+In-System probes, `docs/jtag_probes.md`) is instantiated ONLY in `MacLC.sv` —
+`altsource_probe` is an Altera primitive and must never reach Verilator. The
+probe FEED wires exist in both tops (ncr5380 `dbg_ncr`/`dbg_ncr2`/`dbg_wr`
+through `dataController_top`); sim.v ties them off explicitly.
 
 ---
 

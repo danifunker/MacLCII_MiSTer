@@ -466,6 +466,9 @@ module emu
 	wire selectSCSIDMA;   // SCSI pseudo-DMA window (DACK) from address decoder
 	wire scsiDREQ;        // SCSI pseudo-DMA request → gates CPU DTACK on DMA cycles
 	wire scsiIRQ;         // NCR5380 latched IRQ (level) → pseudo-VIA IFR bit 3
+	// JTAG probe feeds from the SCSI engine (consumed by dbg_probes below)
+	wire [15:0] dbg_scsi2_w, dbg_scsi4_w, dbg_scsi5_w;
+	wire [31:0] dbg_ncr_w, dbg_ncr2_w, dbg_wr_w;
 	wire [23:0] overlay_trigger_addr;
 	wire [15:0] dataControllerDataOut;
 
@@ -683,6 +686,12 @@ module emu
 		.selectSCC(selectSCC),
 		.selectIWM(selectIWM),
 		.selectVIA(selectVIA),
+		// selectASC was NEVER connected here (sim.v had it; FPGA didn't) —
+		// the wire floated to GND, so ASC register access was DEAD on
+		// hardware while sim audio worked. Found 2026-06-11 when the probe
+		// deck made the dangling net visible (Quartus 12110). Prime suspect
+		// for the broken FPGA sound.
+		.selectASC(selectASC),
 		.selectRAM(selectRAM),
 		.selectROM(selectROM),
 		.selectAriel(selectAriel),
@@ -774,6 +783,50 @@ module emu
 		.video_config(pvia_video_config),
 		.ram_config_out(pvia_ram_config_out),
 		.ram_configured(pvia_ram_configured)
+	);
+
+	// JTAG In-System probes (SCSI / CPU loop sampler / ASC / video).
+	// FPGA-only — never instantiate in verilator/sim.v (altsource_probe is an
+	// Altera primitive). Read with: bash scripts/read_probes.sh
+	dbg_probes probes(
+		.clk(clk_sys),
+		.cpuAddr(cpuAddr[23:0]),
+		.cpuFC(cpuFC),
+		.cpuAS_n(_cpuAS),
+		.cpuRW(_cpuRW),
+		.cpuDTACK_n(_cpuDTACK),
+		.cpuVPA_n(_cpuVPA),
+		.cpuUDS_n(_cpuUDS),
+		.cpuLDS_n(_cpuLDS),
+		.cpuIPL_n(_cpuIPL),
+		.cpu_din(dataControllerDataOut),
+		.selectSCSI(selectSCSI),
+		.selectSCSIDMA(selectSCSIDMA),
+		.selectRAM(selectRAM),
+		.selectROM(selectROM),
+		.selectVRAM(selectVRAM),
+		.selectVIA(selectVIA),
+		.selectPseudoVIA(selectPseudoVIA),
+		.selectASC(selectASC),
+		.selectAriel(selectAriel),
+		.selectIWM(selectIWM),
+		.selectSCC(selectSCC),
+		.scsiDREQ(scsiDREQ),
+		.scsiIRQ(scsiIRQ),
+		.scsi_dbg2(dbg_scsi2_w),
+		.scsi_dbg4(dbg_scsi4_w),
+		.scsi_dbg5(dbg_scsi5_w),
+		.scsi_dbg_ncr(dbg_ncr_w),
+		.scsi_dbg_ncr2(dbg_ncr2_w),
+		.scsi_dbg_wr(dbg_wr_w),
+		.img_mounted(img_mounted[1:0]),
+		.sd_rd(sd_rd[1:0]),
+		.sd_wr(sd_wr[1:0]),
+		.sd_ack(sd_ack[1:0]),
+		.asc_irq(asc_irq),
+		.asc_sample_l(asc_sample_l),
+		.pvia_video_config(pvia_video_config),
+		.v8_vblank(v8_vblank)
 	);
 
 	maclc_v8_video v8_video(
@@ -940,6 +993,12 @@ module emu
 		.selectSCSIDMA(selectSCSIDMA),
 		.scsiDREQ(scsiDREQ),
 		.scsiIRQ(scsiIRQ),
+		.dbg_scsi2(dbg_scsi2_w),
+		.dbg_scsi4(dbg_scsi4_w),
+		.dbg_scsi5(dbg_scsi5_w),
+		.dbg_ncr(dbg_ncr_w),
+		.dbg_ncr2(dbg_ncr2_w),
+		.dbg_wr(dbg_wr_w),
 		.selectSCC(selectSCC),
 		.selectIWM(selectIWM),
 		.selectVIA(selectVIA),

@@ -95,7 +95,25 @@ module ncr5380
 	output      [15:0] dbg_scsi4,
 	// JTAG debug: per-target command-type bitmap
 	//   [15:8] target1 dbg_cmd   [7:0] target0 dbg_cmd
-	output      [15:0] dbg_scsi5
+	output      [15:0] dbg_scsi5,
+	// JTAG debug (PSNC): NCR5380 host-side pseudo-DMA state (why DREQ stops).
+	//   [0]=dreq [1]=scsi_req [2]=scsi_ack [3]=dma_en [4]=dma_ack
+	//   [5]=dma_ack_busy [8:6]=dma_ack_holdoff [9]=mr_dma_mode [10]=bsr_pmatch
+	//   [11]=dma_word_latched [12]=dma_longword_latched [13]=longword_second_pending
+	//   [17:14]=tcr [31:18]=dma_wr_count (i_dma_wr OR i_dma_rd pulses, both directions)
+	output      [31:0] dbg_ncr,
+	// JTAG debug (PSWL): write loss-mechanism + IRQ/deferral machine state.
+	//   [7:0]=blind_wr_count (i_dma_wr while dreq==0 = Mac wrote w/o DREQ)
+	//   [8]=dma_en [9]=bsr_pmatch [10]=dreq [11]=bsr_eodma [12]=dma_armed
+	//   [13]=irq_latch [14]=scsi_req_bus [15]=req_deferred
+	//   [31:16]=req_drop_count (scsi_req 1->0 edges while dma_en — REQ pauses)
+	output      [31:0] dbg_ncr2,
+	// JTAG debug (PSCW): write-stall snapshot of whichever target is in the
+	// WRITE data phase (PHASE_DATA_IN=3); defaults to target 1 (the
+	// OSD-mounted disk usually lands there). Layout = scsi.v dbg_wrstall:
+	//   [15:0]=data_cnt [18:16]=phase [19]=data_complete [20]=io_wr [21]=io_ack
+	//   [22]=io_busy [23]=sd_buff_sel [24]=cmd_write [30:25]=tlen [31]=req
+	output      [31:0] dbg_wr
 );
 	parameter DEVS = 2;
 	parameter ENABLE_EMPTY_CD = 0;
@@ -477,6 +495,7 @@ module ncr5380
 	wire [7:0]      target_cmd[DEVS];
 	wire [31:0]     target_wrsnap[DEVS];   // JTAG debug: first-word-write capture
 	wire [31:0]     target_selsnap[DEVS];  // JTAG debug: selection/command handshake
+	wire [31:0]     target_wrstall[DEVS];  // JTAG debug: write-stall snapshot (PSCW)
 	wire [DEVS-1:0] target_bsy;
 
 	// Count SCSI bus resets (Mac asserting ICR.RST) -- the abort/retry signal.
@@ -589,7 +608,8 @@ module ncr5380
 				.dbg_dma_long( dma_longword_latched ),
 				.dbg_dma_lowbyte( dma_write_low_byte ),
 				.dbg_wrsnap( target_wrsnap[i] ),
-				.dbg_selsnap( target_selsnap[i] )
+				.dbg_selsnap( target_selsnap[i] ),
+				.dbg_wrstall( target_wrstall[i] )
 			);
 		end
 	endgenerate
@@ -606,14 +626,69 @@ module ncr5380
 	                    target_mounted[1:0], icr[`ICR_A_DATA],
 	                    scsi_bus_data };
 
+	// NOTE: the 2'b0 gap at [7:6] makes this a full 16 bits so the phase fields
+	// land at [13:11]/[10:8] as the header comment (and the probe decode)
+	// expect. Without it the 14-bit concat right-justified and shifted the
+	// phases down 2 bits, garbling the decode (lbmactwo's "phase 6/7 red
+	// herring", fixed there 2026-06-10 — same latent bug existed here).
 	assign dbg_scsi2 = { 2'b0, target_phase[1], target_phase[0],
-	                     io_rd[1:0], io_wr[1:0], io_ack[1:0] };
+	                     2'b0, io_rd[1:0], io_wr[1:0], io_ack[1:0] };
 
 	assign dbg_scsi3 = { target_hs[1], target_hs[0] };
 
 	assign dbg_scsi4 = { dbg_rst_count, target_hs2[1], target_hs2[0] };
 
 	assign dbg_scsi5 = { target_cmd[1], target_cmd[0] };
+
+	// ---- JTAG probe feeds (PSNC / PSWL / PSCW) — synthesizable, mirror
+	// ---- lbmactwo's dbg_min decode layouts exactly. ----------------------
+	// dma_wr_count: rising edges of i_dma_wr OR i_dma_rd — pseudo-DMA beats
+	// in BOTH directions. Frozen while dreq=1 during a wedge = "DREQ ignored".
+	reg [13:0] dma_wr_count;
+	always @(posedge clk) begin
+		if (reset) dma_wr_count <= 14'd0;
+		else if ((~old_dma_wr & i_dma_wr) | (~old_dma_rd & i_dma_rd))
+			dma_wr_count <= dma_wr_count + 14'd1;
+	end
+	assign dbg_ncr = { dma_wr_count, tcr[3:0], dma_longword_second_pending,
+	                   dma_longword_latched, dma_word_latched, bsr_pmatch,
+	                   mr[`MR_DMA_MODE], dma_ack_holdoff, dma_ack_busy, dma_ack,
+	                   dma_en, scsi_ack, scsi_req, dreq };
+
+	// blind_wr_count: host pseudo-DMA writes while DREQ=0 (blind writes);
+	// req_drop_count: REQ 1->0 edges while dma_en (HPS-flush REQ pauses).
+	reg [15:0] blind_wr_count;
+	reg [15:0] req_drop_count;
+	reg        old_scsi_req_dbg;
+	always @(posedge clk) begin
+		if (reset) begin
+			blind_wr_count   <= 16'd0;
+			req_drop_count   <= 16'd0;
+			old_scsi_req_dbg <= 1'b0;
+		end else begin
+			old_scsi_req_dbg <= scsi_req;
+			if (~old_dma_wr & i_dma_wr & ~dreq & (blind_wr_count != 16'hFFFF))
+				blind_wr_count <= blind_wr_count + 16'd1;
+			if (old_scsi_req_dbg & ~scsi_req & dma_en & (req_drop_count != 16'hFFFF))
+				req_drop_count <= req_drop_count + 16'd1;
+		end
+	end
+	assign dbg_ncr2 = { req_drop_count,
+	                    req_deferred, scsi_req_bus, irq_latch, dma_armed,
+	                    bsr_eodma, dreq, bsr_pmatch, dma_en,
+	                    blind_wr_count[7:0] };
+
+	// PSCW mux: route whichever target is in the WRITE data phase
+	// (PHASE_DATA_IN=3); defaults to target 1 (the OSD-mounted disk usually
+	// lands on t1, so the idle snapshot is the real disk).
+	reg [31:0] dbg_wr_mux;
+	always begin : pscw_mux
+		integer j;
+		dbg_wr_mux = target_wrstall[DEVS-1];
+		for (j = 0; j < DEVS; j = j + 1)
+			if (target_phase[j] == 3'd3) dbg_wr_mux = target_wrstall[j];
+	end
+	assign dbg_wr = dbg_wr_mux;
 
 	// NOTE: lbmactwo's JTAG In-System Source/Probe (altsource_probe) blocks for
 	// target_wrsnap/target_selsnap were removed in the MacLC port — this core has
