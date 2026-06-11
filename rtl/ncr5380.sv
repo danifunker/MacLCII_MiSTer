@@ -610,6 +610,22 @@ module ncr5380
 			$display("NCR_WR_PHASE_MISMATCH: pseudo-DMA write w/ phase mismatch (leftover host bytes - insertion upstream?) wdata=%04x tcr=%01h io=%b cd=%b msg=%b",
 			         wdata, tcr, scsi_io, scsi_cd, scsi_msg);
 	end
+
+	// Recovery-poke detector (Snow-derived hypothesis, 2026-06-10): our REQ
+	// drops bus-visibly for the whole ~ms HPS fetch/flush at every 512-byte
+	// boundary (and io_busy even carries into the NEXT command's CMD phase).
+	// Real drives/Snow pre-buffer, so the System 7 driver's between-chunk
+	// PIO poll always sees a live bus; on a dead-looking bus it may bail
+	// into a recovery path that pokes registers manually. A manual ICR ACK
+	// pulse while MR.DMA_MODE is set would inject exactly ONE phantom byte
+	// into the target's stream = the forensic +1 insertion. This catches it.
+	reg old_icr_ack_dbg;
+	always @(posedge clk) begin
+		old_icr_ack_dbg <= icr[`ICR_A_ACK];
+		if (~old_icr_ack_dbg & icr[`ICR_A_ACK] & mr[`MR_DMA_MODE])
+			$display("NCR_MANUAL_ACK_IN_DMA: ICR ACK poke while DMA mode (driver recovery path?) odr=%02x tcr=%01h req=%b dreq=%b dma_en=%b",
+			         dout, tcr, scsi_req, dreq, dma_en);
+	end
 `endif
 
 endmodule
