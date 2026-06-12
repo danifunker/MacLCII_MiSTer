@@ -12,6 +12,18 @@
 set dur 75
 if {$argc >= 1} { set dur [lindex $argv 0] }
 
+# Optional 2nd arg: side-channel log file. Quartus block-buffers stdout under
+# redirection (4 KB chunks, flush stdout does NOT reach the OS), so live
+# monitoring needs a plain Tcl file channel flushed per line.
+set side ""
+if {$argc >= 2} { set side [open [lindex $argv 1] w] }
+proc emit {s} {
+    global side
+    puts $s
+    flush stdout
+    if {$side ne ""} { puts $side $s; flush $side }
+}
+
 set hw ""
 foreach h [get_hardware_names] {
     if {[string match "DE-SoC*" $h]} { set hw $h; break }
@@ -28,20 +40,18 @@ set dev ""
 if {$hw ne ""} {
     foreach d [get_device_names -hardware_name $hw] { if {[string match "*5CSE*" $d]} { set dev $d; break } }
 }
-puts "hw=$hw dev=$dev"
-if {$dev eq ""} { puts "NO DEVICE"; exit 1 }
+emit "hw=$hw dev=$dev"
+if {$dev eq ""} { emit "NO DEVICE"; exit 1 }
 
 # Wait (up to 10 min) for a bitstream with ISSP probes — i.e. the MacLC core.
-puts "WAITING for MacLC core (probes) on the chain..."
-flush stdout
+emit "WAITING for MacLC core (probes) on the chain..."
 set info ""
 for {set w 0} {$w < 1200} {incr w} {
     if {![catch {set info [get_insystem_source_probe_instance_info -device_name $dev -hardware_name $hw]}] && [llength $info] > 0} break
     after 500
 }
-if {$info eq ""} { puts "TIMEOUT waiting for probes"; exit 1 }
-puts "CORE UP — sampling for $dur s"
-flush stdout
+if {$info eq ""} { emit "TIMEOUT waiting for probes"; exit 1 }
+emit "CORE UP — sampling for $dur s"
 
 array set idx {}
 set i 0
@@ -61,21 +71,21 @@ set dead 0
 while {[clock milliseconds] - $t0 < $dur * 1000} {
     set line [format "T%06d" [expr {[clock milliseconds] - $t0}]]
     set allff 1
-    foreach p {PACT PIFA PSCS PSC2 PSC3 PSNC PSWL PSC6 PVID PASC PSTA PADR} {
+    foreach p {PACT PIFA PSCS PSC2 PSC3 PSCW PSNC PSWL PSC6 PVID PSTA PADR PEXC PEX3} {
         set v [rd $p]
-        if {$v != 0xFFFFFFFF && $v != -1} { set allff 0 }
+        # Only probes that exist in this bitstream may veto the all-FF
+        # (reconfig) detector — a missing probe reads as a constant 0.
+        if {[info exists idx($p)] && $v != 0xFFFFFFFF && $v != -1} { set allff 0 }
         append line [format " %s=%08X" $p $v]
     }
-    puts $line
-    flush stdout
+    emit $line
     if {$allff} {
         incr dead
         if {$dead >= 20} {
             # FPGA reconfigured under us (core reload): the ISSP session is
             # stale and will return all-ones forever. Re-attach: close the
             # session, wait for probes to reappear, re-enumerate, resume.
-            puts "RECONFIG_DETECTED — re-attaching..."
-            flush stdout
+            emit "RECONFIG_DETECTED — re-attaching..."
             catch { end_insystem_source_probe }
             set info ""
             while {[clock milliseconds] - $t0 < $dur * 1000} {
@@ -88,8 +98,7 @@ while {[clock milliseconds] - $t0 < $dur * 1000} {
             set i 0
             foreach inst $info { set idx([lindex $inst 3]) $i; incr i }
             start_insystem_source_probe -device_name $dev -hardware_name $hw
-            puts "REATTACHED"
-            flush stdout
+            emit "REATTACHED"
             set dead 0
         }
     } else {
@@ -97,4 +106,4 @@ while {[clock milliseconds] - $t0 < $dur * 1000} {
     }
 }
 catch { end_insystem_source_probe }
-puts "DONE"
+emit "DONE"

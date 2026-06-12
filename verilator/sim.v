@@ -201,7 +201,6 @@ module emu
 	assign serial_txd = serialOut;
 
 	// V8 Video system wires
-	wire [21:0] v8_video_addr;
 	wire v8_hsync, v8_vsync, v8_hblank, v8_vblank, v8_de;
 	wire [7:0] v8_vga_r, v8_vga_g, v8_vga_b;
 	wire [7:0] ariel_pixel_addr;
@@ -232,15 +231,11 @@ module emu
 	wire _romOE;
 	wire _ramOE, _ramWE;
 	wire _memoryUDS, _memoryLDS;
-	wire videoBusControl;
 	wire dioBusControl;
 	wire cpuBusControl;
 	wire [22:0] memoryAddr;  // 23-bit SDRAM word address from address controller
 	wire [15:0] memoryDataOut;
 	wire memoryLatch;
-	// Video latch: only pulse when memoryLatch AND in video bus cycle
-	wire v8_video_latch;   // driven by addrController.v8_video_fetch (Phase 1b)
-	wire v8_video_req;     // v8_video → addrController: extra-slot fetch request
 	// peripherals
 	wire pds_slot_irq = 1'b0;  // PDS slot interrupt — single point for future PDS work
 	wire vid_alt;
@@ -300,10 +295,15 @@ module emu
 	// ROM's `moves.w $22000,D1` (SFC=7) relies on this fault; if VPA/DTACK answer it
 	// the probe completes inline and boot diverts into the STM serial diagnostic.
 	wire        fc7_berr = (cpuFC == 3'b111) && !fc7_iack;
+	// NuBus/PDS slot space ($F1000000-$FEFFFFFF) must BUS-ERROR on a cardless
+	// LC — full rationale in MacLC.sv (phantom PDS card → System 7 boot Sad
+	// Macs). Keep both tops identical.
+	wire        slot_space = (cpuAddrFullHi >= 8'hF1) && (cpuAddrFullHi <= 8'hFE);
 	// SCSI pseudo-DMA ($F06000/$F12000) uses async DTACK gated by the NCR5380 DREQ
 	// instead of the 6800-style VPA path the rest of $F0xxxx uses — see MacLC.sv.
-	assign      _cpuVPA = fc7_iack ? 1'b0 : (fc7_berr ? 1'b1 : ~(!_cpuAS && cpuAddr[23:21] == 3'b111 && !selectVRAM && !selectSCSIDMA));
+	assign      _cpuVPA = fc7_iack ? 1'b0 : ((fc7_berr || slot_space) ? 1'b1 : ~(!_cpuAS && cpuAddr[23:21] == 3'b111 && !selectVRAM && !selectSCSIDMA));
 	assign      _cpuDTACK = fc7_berr ? 1'b1 :
+	                        (slot_space && !_cpuAS) ? 1'b0 :
 	                        selectSCSIDMA ? ~scsiDREQ :
 	                        (~(!_cpuAS && (cpuAddr[23:21] != 3'b111 || selectVRAM)) | !dtack_en);
 
@@ -368,7 +368,33 @@ module emu
 	// Bus-error CPU-space (FC=7) accesses that are NOT interrupt acknowledges:
 	// the boot ROM's hardware-presence probes (`moves` to CPU space) which a real
 	// 68030 faults because nothing decodes the cycle.
-	wire cpu_berr = fc7_berr && !_cpuAS;
+	// Slot-space: ACK with $FFFF (NuBus open-bus, the LBMacTwo
+	// empty-slot mechanism) — TG68 berr is not handler-recoverable for
+	// normal cycles. Keep both tops identical (MacLC.sv has the rationale).
+	// Pseudo-DMA stall timeout → BERR — mirror of MacLC.sv (rationale there).
+	localparam SDMA_TIMEOUT = 23'd8125000;  // ~250 ms @ 32.5 MHz
+	reg [22:0] sdma_stall_ctr = 23'd0;
+	reg        sdma_berr      = 1'b0;
+	always @(posedge clk_sys) begin
+		if (!_cpuReset) begin
+			sdma_stall_ctr <= 0;
+			sdma_berr      <= 0;
+		end else if (_cpuAS) begin
+			sdma_stall_ctr <= 0;
+			sdma_berr      <= 0;
+		end else if (selectSCSIDMA && !scsiDREQ && !sdma_berr) begin
+			sdma_stall_ctr <= sdma_stall_ctr + 23'd1;
+			if (sdma_stall_ctr == SDMA_TIMEOUT) begin
+				sdma_berr <= 1'b1;   // held until AS deasserts
+`ifdef SIMULATION
+				$display("SDMA_BERR_TIMEOUT: addr=%h @%0t", cpuAddr, $time);
+`endif
+			end
+		end else if (selectSCSIDMA)
+			sdma_stall_ctr <= 0;
+	end
+
+	wire cpu_berr = (fc7_berr && !_cpuAS) || sdma_berr;
 `ifdef SIMULATION
 	reg _cpuAS_d;
 	always @(posedge clk_sys) _cpuAS_d <= _cpuAS;
@@ -410,7 +436,7 @@ module emu
 
 		.ipl        ( _cpuIPL ),
 		.berr       ( cpu_berr ),
-		.din        ( dataControllerDataOut ),
+		.din        ( slot_space ? 16'hFFFF : dataControllerDataOut ),
 		.dout       ( tg68_dout ),
 		.longword   ( tg68_longword ),
 		.addr       ( tg68_a ),
@@ -504,7 +530,6 @@ module emu
 		._romOE(_romOE),
 		._ramOE(_ramOE),
 		._ramWE(_ramWE),
-		.videoBusControl(videoBusControl),
 		.dioBusControl(dioBusControl),
 		.cpuBusControl(cpuBusControl),
 		.selectSCSI(selectSCSI),
@@ -519,11 +544,6 @@ module emu
 		.selectPseudoVIA(selectPseudoVIA),
 		.selectVRAM(selectVRAM),
 		.selectUnmapped(selectUnmapped),
-		.v8_video_addr(v8_video_addr),
-		.v8_video_req(v8_video_req),
-		.v8_video_fetch(v8_video_latch),
-		.v8_hblank(v8_hblank),
-		.v8_vblank(v8_vblank),
 		.words_per_line(v8_words_per_line),
 		.vram_waddr(vram_bram_waddr),
 		.vram_we(vram_bram_we),
@@ -590,12 +610,12 @@ module emu
 		.vblank_irq(v8_vblank),
 		.slot_irq(pds_slot_irq),
 		.asc_irq(asc_irq),
-		// SCSI flags TIED OFF (2026-06-11) — matches MacLC.sv (see the
-		// comment there: MAME maclc ground truth; stray IFR bits crashed
-		// System 7.x boot ~1s after Happy Mac; deferred CSR REQ is the real
-		// System 7 fix). Plumbing kept for a future re-introduction.
-		.scsi_irq(1'b0),
-		.scsi_drq(1'b0),
+		// SCSI flags RE-WIRED (2026-06-12) — matches MacLC.sv (rationale
+		// there: the crash that motivated the 06-11 tie-off was the phantom
+		// PDS card; the async HD SC driver needs this interrupt or it spins
+		// on its completion flag forever).
+		.scsi_irq(scsiIRQ),
+		.scsi_drq(scsiDREQ),
 		.irq_out(pseudovia_irq),
 		.ram_config(configRAMSize),
 		.monitor_id(v8_monitor_id),
@@ -634,10 +654,6 @@ module emu
 		.clk8_en_p(clk8_en_p),
 		.reset(~n_reset),
 
-		.video_addr(v8_video_addr),
-		.video_data_in(ram_do),
-		.video_latch(v8_video_latch),
-
 		.video_mode(v8_video_mode),
 		.monitor_id(v8_monitor_id),
 
@@ -654,7 +670,6 @@ module emu
 		.palette_addr(ariel_pixel_addr),
 		.palette_data(ariel_palette_data),
 
-		.video_req(v8_video_req),
 		.words_per_line(v8_words_per_line),
 		.vram_raddr(v8_vram_raddr),
 		.vram_rdata(v8_vram_rdata)
@@ -755,7 +770,6 @@ module emu
 		.selectASC(selectASC),
 		.asc_data_in(asc_data_out),
 		.cpuBusControl(cpuBusControl),
-		.videoBusControl(videoBusControl),
 		.memoryDataOut(memoryDataOut),
 		.memoryDataIn(ram_do),
 		.memoryLatch(memoryLatch),
@@ -820,6 +834,9 @@ module emu
 	// Floppy disk image tracking
 	reg dsk_int_ds, dsk_ext_ds;
 	reg dsk_int_ss, dsk_ext_ss;
+	// DiskCopy 4.2 header skip — mirror of MacLC.sv (rationale there).
+	reg dc42_name_ok;
+	reg dc42_skip;
 	wire dsk_int_ins = dsk_int_ds || dsk_int_ss;
 	wire dsk_ext_ins = dsk_ext_ds || dsk_ext_ss;
 
@@ -827,8 +844,10 @@ module emu
 		reg old_down;
 		old_down <= dio_download;
 		if(old_down && ~dio_download && dio_index == 1) begin
-			dsk_int_ds <= (dio_addr == 409600);
-			dsk_int_ss <= (dio_addr == 204800);
+			dsk_int_ds <= (dio_addr == 409600) ||
+			              (dc42_skip && (dio_addr == 409642 || dio_addr == 419242));
+			dsk_int_ss <= (dio_addr == 204800) ||
+			              (dc42_skip && (dio_addr == 204842 || dio_addr == 209642));
 		end
 		if(diskEject[0]) begin
 			dsk_int_ds <= 0;
@@ -840,8 +859,10 @@ module emu
 		reg old_down;
 		old_down <= dio_download;
 		if(old_down && ~dio_download && dio_index == 2) begin
-			dsk_ext_ds <= (dio_addr == 409600);
-			dsk_ext_ss <= (dio_addr == 204800);
+			dsk_ext_ds <= (dio_addr == 409600) ||
+			              (dc42_skip && (dio_addr == 409642 || dio_addr == 419242));
+			dsk_ext_ss <= (dio_addr == 204800) ||
+			              (dc42_skip && (dio_addr == 204842 || dio_addr == 209642));
 		end
 		if(diskEject[1]) begin
 			dsk_ext_ds <= 0;
@@ -858,14 +879,27 @@ module emu
 	reg        dio_write;
 	reg        dio_old_cyc = 0;
 
+	// DC42 write offset: active from the word after the magic (word 41)
+	wire [19:0] dio_flp_a = dc42_skip ? (dio_addr[19:0] - 20'd42) : dio_addr[19:0];
+
 	always @(posedge clk_sys) begin
 		if(ioctl_wr) begin
+			if (dio_index[1:0] != 2'b00) begin
+				// accept either byte lane order for the sim stream
+				if (dio_addr[19:0] == 20'd0) begin
+					dc42_skip    <= 1'b0;
+					dc42_name_ok <= ((ioctl_dout[7:0]  >= 8'd1) && (ioctl_dout[7:0]  <= 8'd63)) ||
+					                ((ioctl_dout[15:8] >= 8'd1) && (ioctl_dout[15:8] <= 8'd63));
+				end else if (dio_addr[19:0] == 20'd41 && dc42_name_ok &&
+				             (ioctl_dout == 16'h0001 || ioctl_dout == 16'h0100))
+					dc42_skip <= 1'b1;
+			end
 			// Don't byte-swap for sim_ram (original swaps for SDRAM byte ordering)
 			dio_data <= ioctl_dout;
 			case (dio_index[1:0])
-				2'b01:   dio_a <= 23'h600000 + {3'b0, dio_addr[19:0]};  // Floppy 1
-				2'b10:   dio_a <= 23'h700000 + {3'b0, dio_addr[19:0]};  // Floppy 2
-				default: dio_a <= {5'b10100, dio_addr[17:0]};            // ROM at $500000 (must match addrController rom_sdram_word)
+				2'b01:   dio_a <= 23'h600000 + {3'b0, dio_flp_a};  // Floppy 1
+				2'b10:   dio_a <= 23'h700000 + {3'b0, dio_flp_a};  // Floppy 2
+				default: dio_a <= {5'b10100, dio_addr[17:0]};      // ROM at $500000 (must match addrController rom_sdram_word)
 			endcase
 			ioctl_wait <= 1;
 		end

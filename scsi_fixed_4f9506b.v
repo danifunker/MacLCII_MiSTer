@@ -19,7 +19,6 @@ module scsi
 	output 	  io,
 
 	output 	  req,
-	output 	  req_bus,   // bus-visible REQ (stays up across HPS block fetches in data phases)
 	input 	  ack, // initiator acknowledges a request
 	input     host_csr_rd, // pulse: host read the Current SCSI Bus Status reg (REQ poll)
 	input     host_data_rd, // pulse: host read the SCSI data register via /DACK (next byte)
@@ -231,22 +230,6 @@ wire   io_busy = (phase == PHASE_DATA_OUT && (io_rd | io_ack) && data_cnt[9] == 
 	// sampling window, so REQ now comes up on selection like the references.
 	assign req = (phase != PHASE_IDLE) && !ack && !io_busy && !data_phase_complete;
 
-	// Bus-VISIBLE REQ (CSR bit 5 / BSR DRQ): stays asserted across the HPS
-	// 512-byte block-boundary fetches in the data phases. Real drives never
-	// drop REQ mid-command for ~ms, and both oracles guarantee the same
-	// observable (Snow pre-buffers whole responses; MAME synthesizes DRQ
-	// from its FIFO). The System-7-era HD SC 4.3 driver polls CSR/BSR
-	// between 512-byte pseudo-DMA chunks — when it saw our dead bus it
-	// concluded the transfer died and parked forever (the Welcome wedge at
-	// data_cnt=512). Flow control is unaffected: the DACK path still stalls
-	// the CPU via `req` (DTACK gate) until the buffer half is really valid,
-	// so a premature data access waits instead of reading stale bytes.
-	// Non-data phases keep the io_busy suppression (status byte must not
-	// be offered while a flush/fetch is still in flight).
-	// (LBMacTwo 5adc2e1, HW-validated with 2d025c5 in round 6.)
-	assign req_bus = (phase != PHASE_IDLE) && !ack && !data_phase_complete &&
-	                 ((phase == PHASE_DATA_OUT) || (phase == PHASE_DATA_IN) || !io_busy);
-
 assign bsy = (phase != PHASE_IDLE);
 
 assign dout = (phase == PHASE_STATUS_OUT)?status:
@@ -293,44 +276,79 @@ wire [7:0] request_sense_dout_next  = (data_cnt_next  == 32'd0)?8'h70:(data_cnt_
 wire [7:0] request_sense_dout_next2 = (data_cnt_next2 == 32'd0)?8'h70:(data_cnt_next2 == 32'd7)?8'h0a:8'h00;
 wire [7:0] request_sense_dout_next3 = (data_cnt_next3 == 32'd0)?8'h70:(data_cnt_next3 == 32'd7)?8'h0a:8'h00;
 
-// output of inquiry command, identify as "MiSTer  VIRTUAL DISKx" (x = SCSI ID)
-//   vendor  (bytes  8-15): "MiSTer  "        (8 chars, space-padded)
-//   product (bytes 16-31): "VIRTUAL DISKx   " (16 chars, x = '0'+ID)
-// (identifiers match lbmactwo_MiSTer rtl/scsi.v — keep the SCSI files in sync)
+// output of inquiry command, identify as "SEAGATE ST225N"
 // additional-length byte = 31 -> standard 36-byte INQUIRY response (5 + 31),
 // matching real drives and Snow. It was 32 (=37 total): a driver that reads
 // the standard 36 bytes then left 1 unserved byte on the target -> REQ held
 // forever -> the post-clamp Welcome wedge of 2026-06-10c.
-function [7:0] inquiry_byte;
-	input [31:0] cnt;
-	begin
-		inquiry_byte =
-			(cnt == 32'd4 )?8'd31:  // additional length
+wire [7:0] inquiry_dout =
+		(data_cnt == 32'd4 )?8'd31:  // additional length
 
-			(cnt == 32'd8 )?"M":(cnt == 32'd9 )?"i":
-			(cnt == 32'd10)?"S":(cnt == 32'd11)?"T":
-			(cnt == 32'd12)?"e":(cnt == 32'd13)?"r":
-			(cnt == 32'd14)?" ":(cnt == 32'd15)?" ":
+		(data_cnt == 32'd8 )?" ":(data_cnt == 32'd9 )?"S":
+		(data_cnt == 32'd10)?"E":(data_cnt == 32'd11)?"A":
+		(data_cnt == 32'd12)?"G":(data_cnt == 32'd13)?"A":
+		(data_cnt == 32'd14)?"T":(data_cnt == 32'd15)?"E":
+		(data_cnt == 32'd16)?" ":(data_cnt == 32'd17)?" ":
+		(data_cnt == 32'd18)?" ":(data_cnt == 32'd19)?" ":
+		(data_cnt == 32'd20)?" ":(data_cnt == 32'd21)?" ":
+		(data_cnt == 32'd22)?" ":(data_cnt == 32'd23)?" ":
+		(data_cnt == 32'd24)?" ":(data_cnt == 32'd25)?" ":
 
-			(cnt == 32'd16)?"V":(cnt == 32'd17)?"I":
-			(cnt == 32'd18)?"R":(cnt == 32'd19)?"T":
-			(cnt == 32'd20)?"U":(cnt == 32'd21)?"A":
-			(cnt == 32'd22)?"L":(cnt == 32'd23)?" ":
-			(cnt == 32'd24)?"D":(cnt == 32'd25)?"I":
-			(cnt == 32'd26)?"S":(cnt == 32'd27)?"K":
-			(cnt == 32'd28)?"0" + {5'd0, ID}:
-			(cnt == 32'd29)?" ":(cnt == 32'd30)?" ":
-			(cnt == 32'd31)?" ":
-			8'h00;
-	end
-endfunction
+		(data_cnt == 32'd26)?"S":(data_cnt == 32'd27)?"T":
+		(data_cnt == 32'd28)?"2":(data_cnt == 32'd29)?"2":
+		(data_cnt == 32'd30)?"5":(data_cnt == 32'd31)?"N" + {5'd0, ID}: // TESTING. ElectronAsh.
+		8'h00;
 wire [31:0] data_cnt_next = data_cnt + 32'd1;
 wire [31:0] data_cnt_next2 = data_cnt + 32'd2;
 wire [31:0] data_cnt_next3 = data_cnt + 32'd3;
-wire [7:0] inquiry_dout       = inquiry_byte(data_cnt);
-wire [7:0] inquiry_dout_next  = inquiry_byte(data_cnt_next);
-wire [7:0] inquiry_dout_next2 = inquiry_byte(data_cnt_next2);
-wire [7:0] inquiry_dout_next3 = inquiry_byte(data_cnt_next3);
+wire [7:0] inquiry_dout_next =
+		(data_cnt_next == 32'd4 )?8'd31:
+		(data_cnt_next == 32'd8 )?" ":(data_cnt_next == 32'd9 )?"S":
+		(data_cnt_next == 32'd10)?"E":(data_cnt_next == 32'd11)?"A":
+		(data_cnt_next == 32'd12)?"G":(data_cnt_next == 32'd13)?"A":
+		(data_cnt_next == 32'd14)?"T":(data_cnt_next == 32'd15)?"E":
+		(data_cnt_next == 32'd16)?" ":(data_cnt_next == 32'd17)?" ":
+		(data_cnt_next == 32'd18)?" ":(data_cnt_next == 32'd19)?" ":
+		(data_cnt_next == 32'd20)?" ":(data_cnt_next == 32'd21)?" ":
+		(data_cnt_next == 32'd22)?" ":(data_cnt_next == 32'd23)?" ":
+		(data_cnt_next == 32'd24)?" ":(data_cnt_next == 32'd25)?" ":
+
+		(data_cnt_next == 32'd26)?"S":(data_cnt_next == 32'd27)?"T":
+		(data_cnt_next == 32'd28)?"2":(data_cnt_next == 32'd29)?"2":
+		(data_cnt_next == 32'd30)?"5":(data_cnt_next == 32'd31)?"N" + {5'd0, ID}:
+		8'h00;
+wire [7:0] inquiry_dout_next2 =
+		(data_cnt_next2 == 32'd4 )?8'd31:
+		(data_cnt_next2 == 32'd8 )?" ":(data_cnt_next2 == 32'd9 )?"S":
+		(data_cnt_next2 == 32'd10)?"E":(data_cnt_next2 == 32'd11)?"A":
+		(data_cnt_next2 == 32'd12)?"G":(data_cnt_next2 == 32'd13)?"A":
+		(data_cnt_next2 == 32'd14)?"T":(data_cnt_next2 == 32'd15)?"E":
+		(data_cnt_next2 == 32'd16)?" ":(data_cnt_next2 == 32'd17)?" ":
+		(data_cnt_next2 == 32'd18)?" ":(data_cnt_next2 == 32'd19)?" ":
+		(data_cnt_next2 == 32'd20)?" ":(data_cnt_next2 == 32'd21)?" ":
+		(data_cnt_next2 == 32'd22)?" ":(data_cnt_next2 == 32'd23)?" ":
+		(data_cnt_next2 == 32'd24)?" ":(data_cnt_next2 == 32'd25)?" ":
+
+		(data_cnt_next2 == 32'd26)?"S":(data_cnt_next2 == 32'd27)?"T":
+		(data_cnt_next2 == 32'd28)?"2":(data_cnt_next2 == 32'd29)?"2":
+		(data_cnt_next2 == 32'd30)?"5":(data_cnt_next2 == 32'd31)?"N" + {5'd0, ID}:
+		8'h00;
+wire [7:0] inquiry_dout_next3 =
+		(data_cnt_next3 == 32'd4 )?8'd31:
+		(data_cnt_next3 == 32'd8 )?" ":(data_cnt_next3 == 32'd9 )?"S":
+		(data_cnt_next3 == 32'd10)?"E":(data_cnt_next3 == 32'd11)?"A":
+		(data_cnt_next3 == 32'd12)?"G":(data_cnt_next3 == 32'd13)?"A":
+		(data_cnt_next3 == 32'd14)?"T":(data_cnt_next3 == 32'd15)?"E":
+		(data_cnt_next3 == 32'd16)?" ":(data_cnt_next3 == 32'd17)?" ":
+		(data_cnt_next3 == 32'd18)?" ":(data_cnt_next3 == 32'd19)?" ":
+		(data_cnt_next3 == 32'd20)?" ":(data_cnt_next3 == 32'd21)?" ":
+		(data_cnt_next3 == 32'd22)?" ":(data_cnt_next3 == 32'd23)?" ":
+		(data_cnt_next3 == 32'd24)?" ":(data_cnt_next3 == 32'd25)?" ":
+
+		(data_cnt_next3 == 32'd26)?"S":(data_cnt_next3 == 32'd27)?"T":
+		(data_cnt_next3 == 32'd28)?"2":(data_cnt_next3 == 32'd29)?"2":
+		(data_cnt_next3 == 32'd30)?"5":(data_cnt_next3 == 32'd31)?"N" + {5'd0, ID}:
+		8'h00;
 
 // output of read capacity command
 //wire [31:0] capacity = 32'd41056;   // 40960 + 96 blocks = 20MB
@@ -582,39 +600,6 @@ always @(posedge clk) begin
 		stall_cnt <= 0;
 		data_cnt_seen <= 0;
 	end
-end
-
-// Write-path byte-slip instrumentation (2026-06-10 forensics: a 6-sector
-// WRITE landed on disk with ONE foreign byte inserted at payload offset 1
-// and the rest of the command's data shifted +1, last byte dropped — see
-// docs/scsi_byteslip_2026-06-10.md). Hooks:
-//   * SCSI_WR_OVERRUN: an ACK beat in a write data phase after
-//     data_complete — the host still has bytes after we counted data_len,
-//     i.e. a phantom byte was consumed earlier in the phase.
-//   * +scsi_wr_trace: per-beat log of every stored byte for offline diff
-//     against the expected payload (find WHERE the foreign byte enters).
-always @(posedge clk) begin
-	if (stb_ack && (phase == PHASE_DATA_IN) && data_complete)
-		$display("SCSI_WR_OVERRUN ID=%0d data_cnt=%0d data_len=%0d din=%02x lba=%0d cmd=%02h",
-		         ID, data_cnt, data_len, din, lba, cmd[0]);
-	if (stb_ack && (phase == PHASE_DATA_IN) && $test$plusargs("scsi_wr_trace"))
-		$display("SCSI_WR_BEAT ID=%0d cnt=%0d din=%02x lba=%0d", ID, data_cnt, din, lba);
-end
-
-// Stuck-flush watchdog: io_wr pending while the bus is idle means the
-// final-block flush ack raced the BSY drop (io_ack is masked by
-// target_bsy upstream in ncr5380) — recovery then relies on the Mac's
-// timeout + bus reset (the documented reset/re-scan loop). Candidate
-// mechanism for the forensically-observed LOST write commands.
-reg [31:0] idle_flush_cnt;
-always @(posedge clk) begin
-	if (io_wr && (phase == PHASE_IDLE)) begin
-		idle_flush_cnt <= idle_flush_cnt + 1'd1;
-		if (idle_flush_cnt == 32'd100000)
-			$display("SCSI_FLUSH_STUCK ID=%0d io_wr pending while bus idle (io_ack masked by !bsy?) lba=%0d",
-			         ID, lba);
-	end else
-		idle_flush_cnt <= 0;
 end
 `endif
 
@@ -900,7 +885,6 @@ module scsi_empty_cd
 	output     cd,
 	output     io,
 	output     req,
-	output     req_bus,  // bus-visible REQ (no HPS backing here: identical to req)
 	input  [7:0] din,
 	output [7:0] dout,
 	output [15:0] dout_pair,
@@ -938,7 +922,6 @@ assign io = (phase == PHASE_DATA_OUT) || (phase == PHASE_STATUS_OUT) || (phase =
 	wire data_done = data_complete || (data_len == 32'd0);
 	wire data_phase_complete = (phase == PHASE_DATA_OUT) && data_done;
 	assign req = (phase != PHASE_IDLE) && !ack && !data_phase_complete;
-	assign req_bus = req;   // no HPS backing: visible REQ == flow REQ
 assign bsy = (phase != PHASE_IDLE);
 assign dbg_phase = phase;
 

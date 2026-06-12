@@ -39,7 +39,6 @@ module addrController_top(
 	output _romOE,
 	output _ramOE,
 	output _ramWE,
-	output videoBusControl,
 	output dioBusControl,
 	output cpuBusControl,
 	output memoryLatch,
@@ -59,13 +58,6 @@ module addrController_top(
 	output selectPseudoVIA,
 	output selectVRAM,
 	output selectUnmapped,
-
-	// video:
-	input  [21:0] v8_video_addr,
-	input  v8_hblank,
-	input  v8_vblank,
-	input  v8_video_req,    // video wants extra fetch bandwidth (Phase 1b)
-	output v8_video_fetch,  // 1-clk strobe: latch v8_video_data this cycle
 
 	// On-chip framebuffer (BRAM) write mirror — Phase 1 of the VRAM-in-BRAM plan.
 	input  [10:0] words_per_line, // active words/line (from v8_video) for packing
@@ -117,40 +109,21 @@ module addrController_top(
 		end
 	end
 
-	// H1 (perf): video moved to on-chip BRAM (vram_bram), so it no longer needs
-	// an SDRAM slot — its read here was DEAD (a stale fetch every round). Reclaim
-	// slot 00 for the CPU: cpuBusControl now owns 00/01/11 (3 of 4 slots, +50% CPU
-	// SDRAM bandwidth). videoBusControl is forced 0 so the dead video read drops
-	// out of _ramOE/addr_mux. NOTE: the dtack glue in MacLC.sv/sim.v must assert
-	// per-cpu-slot (the 3 slots 11,00,01 are CONTIGUOUS, so the old rising-edge
-	// detector would see only one edge per round and HALVE throughput).
-	assign videoBusControl = 1'b0;
+	// H1 (perf): video scanout reads the on-chip BRAM framebuffer (vram_bram),
+	// not SDRAM, so the CPU owns slots 00/01/11 (3 of 4 slots). The remaining
+	// "extra" slot (10) serves floppy disk reads. NOTE: the dtack glue in
+	// MacLC.sv/sim.v must assert per-cpu-slot (the 3 slots 11,00,01 are
+	// CONTIGUOUS, so a rising-edge detector would see only one edge per round
+	// and HALVE throughput).
 	assign cpuBusControl = (busCycle == 2'b00) || (busCycle == 2'b01) || (busCycle == 2'b11);
 	wire extraBusControl = (busCycle == 2'b10);
-
-	// Phase 1b: when video is still hungry for the next scanline AND the
-	// "extra" slot isn't doing a disk read this cycle, lend it to video.
-	// This gives 4/8bpp a 2nd fetch slot (and lets prefetch run during
-	// hblank/vblank). CPU's two slots (01/11) are never touched.
-	wire video_extra = extraBusControl && v8_video_req &&
-	                   !dskReadAckInt && !dskReadAckExt;
-	wire video_slot  = videoBusControl || video_extra;
-	assign v8_video_fetch = memoryLatch && video_slot;
 
 	// ============================================================
 	// Memory control signals
 	// ============================================================
-	// Use V8's blanking signals for RAM control timing
-	wire videoControlActive = !v8_hblank && !v8_vblank;
-
 	assign _romOE = ~(cpuBusControl && selectROM && _cpuRW);
 
-	// Video read is enabled on its normal slot (gated to active display, as
-	// before) AND on a stolen extra slot (ungated, so the line buffer can
-	// prefetch the next line during hblank/vblank).
-	assign _ramOE = ~((videoBusControl && videoControlActive) ||
-						video_extra ||
-						(cpuBusControl && (selectRAM || selectVRAM) && _cpuRW));
+	assign _ramOE = ~(cpuBusControl && (selectRAM || selectVRAM) && _cpuRW);
 
 	// RAM Write Enable: Active for RAM or VRAM writes
 	assign _ramWE = ~(cpuBusControl && (selectRAM || selectVRAM) && !_cpuRW);
@@ -233,9 +206,6 @@ module addrController_top(
 	// (off-screen stride padding is dropped so it can't corrupt the next line).
 	assign vram_we = selectVRAM && !_cpuRW && cpuBusControl && memoryLatch && vram_col_visible;
 
-	// Video fetch: v8_video_addr is byte offset from VRAM start → SDRAM word $580000+
-	wire [22:0] vid_sdram_word = 23'h580000 + {2'b0, v8_video_addr[21:1]};
-
 	// Floppy disk addresses: byte offset → SDRAM word
 	wire [22:0] dsk_int_sdram_word = 23'h600000 + {2'b0, dskReadAddrInt[21:1]};
 	wire [22:0] dsk_ext_sdram_word = 23'h700000 + {2'b0, dskReadAddrExt[21:1]};
@@ -246,11 +216,7 @@ module addrController_top(
 	                              selectRAM ? ram_sdram_word :
 	                              23'h0;
 
-	// Main address mux: priority among bus cycle types. The stolen extra
-	// slot (video_extra) also drives the video address so the prefetch reads
-	// VRAM, not whatever the CPU decode produced.
-	wire [22:0] addr_mux = video_slot ? vid_sdram_word :
-	                        cpu_sdram_word;
+	wire [22:0] addr_mux = cpu_sdram_word;
 
 	// ============================================================
 	// Extra bus slots (disk reads, sound)

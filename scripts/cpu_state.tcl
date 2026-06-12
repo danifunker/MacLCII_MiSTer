@@ -1,6 +1,6 @@
 # Read the MacLC JTAG In-System probes and decode them.
-# Deck: PADR PSTA PACT PIFA PIFD PDRD PSCS PSC3 PSCW PSNC PSWL PSC6
-#       PASC PAUD PVID   (defined in rtl/dbg_probes.sv)
+# Deck: PADR PSTA PACT PIFA PIFD PDRD PSCS PSC2 PSC3 PSCW PSNC PSWL PSC6
+#       PVID   (defined in rtl/dbg_probes.sv; PASC/PAUD audio probes removed)
 #
 #   quartus_stp_tcl -t scripts/cpu_state.tcl     (or: bash scripts/read_probes.sh)
 #
@@ -89,6 +89,33 @@ puts [format "  selects={%s}  scsiDREQ=%d scsiIRQ=%d" [join $sels ,] \
 set ifd [rd PIFD]
 puts [format "PIFD IF pair    : PC16=%04X opcode=%04X   (sample_loop.tcl for the full loop)" \
     [expr {($ifd>>16)&0xFFFF}] [expr {$ifd&0xFFFF}]]
+
+# ---- PEXC / PEX2 / PEX3: exception-vector latches ---------------------------
+if {[info exists idx(PEXC)]} {
+    set ex [rd PEXC]
+    set vn {- - BUSERR ADDRERR ILLEGAL DIV0 CHK TRAPV PRIV TRACE}
+    set vec [expr {($ex>>4)&0xF}]
+    set cnt [expr {$ex&0xF}]
+    if {$cnt == 0} {
+        puts "PEXC exception  : (no fatal-vector fetch since config)"
+    } else {
+        puts [format "PEXC last fatal : faulting IF=%06X vec=%d (%s) fires(wrap16)=%d" \
+            [expr {($ex>>8)&0xFFFFFF}] $vec [lindex $vn $vec] $cnt]
+    }
+}
+if {[info exists idx(PEX3)]} {
+    set e3 [rd PEX3]
+    set icnt [expr {$e3&0xFF}]
+    if {$icnt == 0} {
+        puts "PEX3 1st ILLEGAL: (none since config)"
+    } else {
+        set e2 [rd PEX2]
+        puts [format "PEX3 1st ILLEGAL: faulting IF=%06X  total illegals=%d" \
+            [expr {($e3>>8)&0xFFFFFF}] $icnt]
+        puts [format "PEX2 at 1st ill : last IF addr16=%04X OPCODE=%04X" \
+            [expr {($e2>>16)&0xFFFF}] [expr {$e2&0xFFFF}]]
+    }
+}
 set drd [rd PDRD]
 set daf [expr {($drd>>16)&0xFFFF}]
 set dfull [expr {0xF00000 | ($daf << 4)}]
@@ -101,6 +128,35 @@ elseif {($dfull & 0xFFE000) == 0xF14000} { set ddev "ASC" } \
 elseif {($dfull & 0xFFE000) == 0xF16000} { set ddev "IWM" }
 puts [format "PDRD I/O read   : %06X (%s) = %04X" $dfull $ddev [expr {$drd&0xFFFF}]]
 
+# ---- PFR: restart flight recorder (rev 2: BERR/RTE capture) ------------------
+if {[info exists idx(PFR0)]} {
+    set f0 [rd PFR0]; set f1 [rd PFR1]; set f2 [rd PFR2]; set f3 [rd PFR3]
+    set frozen [expr {($f0>>27)&1}]
+    set cause  [expr {($f0>>24)&7}]
+    set cn {none CPURESET-FALL RESET-INSTR - BERR-NEAR-DEATH}
+    puts [format "PFR recorder    : frozen=%d cause=%s  rst_falls=%d instr_falls=%d berr_trigs=%d" \
+        $frozen [lindex $cn $cause] \
+        [expr {($f1>>28)&0xF}] [expr {($f1>>24)&0xF}] [expr {($f3>>24)&0xFF}]]
+    if {$frozen} {
+        puts [format "  faulting IF=%06X (prev %06X)" \
+            [expr {$f0&0xFFFFFF}] [expr {$f1&0xFFFFFF}]]
+        if {[expr {($f2>>24)&1}]} {
+            puts [format "  handler RTE landed at: %06X then %06X   <-- garbage = TG68 frame bug confirmed" \
+                [expr {$f2&0xFFFFFF}] [expr {$f3&0xFFFFFF}]]
+        } else {
+            puts "  (RTE not yet seen after trigger)"
+        }
+    }
+}
+
+# ---- PSDT: pseudo-DMA stall timeout ------------------------------------------
+if {[info exists idx(PSDT)]} {
+    set sd [rd PSDT]
+    set mx [expr {$sd & 0x7FFFFF}]
+    puts [format "PSDT dma timeout: berr_fires=%d  max_stall=%d cyc (~%.2f ms)" \
+        [expr {($sd>>24)&0xFF}] $mx [expr {$mx / 32500.0}]]
+}
+
 # ---- SCSI -----------------------------------------------------------------
 set scs [rd PSCS]
 set regnames {CDR/ODR ICR MR TCR CSR BSR IDR RST}
@@ -112,8 +168,8 @@ puts [format "PSCS last rd    : reg %d (%s) = %04X  img_seen=%d%d sd_rd=%d%d sd_
     [expr {($scs>>31)&1}] [expr {($scs>>30)&1}]]
 
 set p2 [rd PSC2]
-if {$p2 >= 0} {
-    puts [format "PSC2 selection  : sel_ids=%02X at-sel{out_en=%d bsy=%d tbsy=%d%d MOUNTED=%d%d} live{out_en=%d sel=%d bsy=%d tbsy=%d%d mounted=%d%d adb=%d data=%02X}" \
+if {[info exists idx(PSC2)]} {
+    puts [format "PSC2 selection  : at_sel_data=%02X at-sel{out_en=%d bsy=%d tbsy=%d%d MOUNTED=%d%d} live{out_en=%d sel=%d bsy=%d tbsy=%d%d mounted=%d%d adb=%d data=%02X}" \
         [expr {($p2>>24)&0xFF}] \
         [expr {($p2>>23)&1}] [expr {($p2>>21)&1}] [expr {($p2>>20)&1}] [expr {($p2>>19)&1}] \
         [expr {($p2>>18)&1}] [expr {($p2>>17)&1}] \
@@ -158,15 +214,20 @@ puts [format "PSC6 rst/opcode : bus_resets=%d hs2 t1=%X t0=%X  last opcode t1=%0
     [expr {($c6>>8)&0xFF}] [expr {$c6&0xFF}]]
 
 # ---- sound / video ---------------------------------------------------------
+# PASC/PAUD audio probes were removed from the build; print only if present.
 set s [rd PASC]
-puts [format "PASC sound      : asc_irq_cnt=%d cpu_wr_cnt=%d" \
-    [expr {($s>>16)&0xFFFF}] [expr {$s&0xFFFF}]]
+if {$s >= 0 && [info exists idx(PASC)]} {
+    puts [format "PASC sound      : asc_irq_cnt=%d cpu_wr_cnt=%d" \
+        [expr {($s>>16)&0xFFFF}] [expr {$s&0xFFFF}]]
+}
 set au [rd PAUD]
-set amax [expr {($au>>16)&0xFFFF}]; if {$amax > 0x7FFF} { set amax [expr {$amax-0x10000}] }
-set amin [expr {$au&0xFFFF}];       if {$amin > 0x7FFF} { set amin [expr {$amin-0x10000}] }
-puts [format "PAUD audio range: min=%d max=%d  (%s)" $amin $amax \
-    [expr {$amin == 32767 && $amax == -32768 ? "no samples yet" :
-     ($amin <= -32700 && $amax >= 32700 ? "FULL-SCALE (clipping?)" : "bounded")}]]
+if {$au >= 0 && [info exists idx(PAUD)]} {
+    set amax [expr {($au>>16)&0xFFFF}]; if {$amax > 0x7FFF} { set amax [expr {$amax-0x10000}] }
+    set amin [expr {$au&0xFFFF}];       if {$amin > 0x7FFF} { set amin [expr {$amin-0x10000}] }
+    puts [format "PAUD audio range: min=%d max=%d  (%s)" $amin $amax \
+        [expr {$amin == 32767 && $amax == -32768 ? "no samples yet" :
+         ($amin <= -32700 && $amax >= 32700 ? "FULL-SCALE (clipping?)" : "bounded")}]]
+}
 set v [rd PVID]
 puts [format "PVID video      : vbl_cnt=%d clut_wr=%d vram_wr=%d video_config=%02X" \
     [expr {($v>>24)&0xFF}] [expr {($v>>16)&0xFF}] [expr {($v>>8)&0xFF}] [expr {$v&0xFF}]]

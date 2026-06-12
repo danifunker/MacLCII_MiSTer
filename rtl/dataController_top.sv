@@ -54,10 +54,7 @@ module dataController_top(
 	input selectUnmapped,
 
 	// RAM/ROM:
-
-	// RAM/ROM:
-	input videoBusControl,	
-	input cpuBusControl,	
+	input cpuBusControl,
 	input [15:0] memoryDataIn,
 	output [15:0] memoryDataOut,
 	input memoryLatch,
@@ -201,6 +198,12 @@ module dataController_top(
 	// 68020 is held in resetDelay.
 	reg [9:0] egretBootCounter = 0;
 	wire egretReset = (egretBootCounter < 10'd256) || !minResetPassed;
+	// NOTE (2026-06-12): wiring the 68k RESET instruction into the NCR/SCC
+	// resets here REGRESSED cold boot to a blinking `?` — the LC ROM issues
+	// RESET at ~T+4s AFTER initializing the SCSI chip at ~T+2.8s and expects
+	// that setup to survive. Do NOT hard-reset the NCR from the RESET
+	// instruction. The 7.x post-enabler-restart ID-6 skip remains open
+	// (docs/findings_pds_phantom_card_2026-06-12.md).
 
 	always @(posedge clk32) begin
 		if (!_systemReset) begin

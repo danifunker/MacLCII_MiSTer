@@ -26,6 +26,9 @@ module dbg_probes (
 
     // CPU bus
     input wire [23:0] cpuAddr,
+    input wire [7:0]  cpuAddrHi,   // cpuAddr[31:24] — 32-bit qualifier
+    input wire        cpuReset_n,    // system/Egret-driven CPU reset (active low)
+    input wire        resetInstr_n,  // 68k RESET-instruction output (active low)
     input wire [2:0]  cpuFC,
     input wire        cpuAS_n,
     input wire        cpuRW,
@@ -160,6 +163,153 @@ module dbg_probes (
         .sld_auto_instance_index ("YES")
     ) cp_pifd (.probe(pifd_r), .source(), .source_clk(clk), .source_ena(1'b1));
 
+    // ---- PEXC / PEX2 / PEX3: exception-vector latches ----------------------
+    // vec_fetch fires on a supervisor read of the low vector table
+    // ($000008-$000024: buserr=2, addrerr=3, ILLEGAL=4, div0=5, CHK=6,
+    // TRAPV=7, priv=8, trace=9). Line-A ($28) and line-F ($2C) are EXCLUDED:
+    // the Mac OS dispatches every system call through line-A, which would
+    // overwrite the interesting fatal vector thousands of times a second.
+    // The vector read happens while if_addr still holds the faulting
+    // instruction's fetch address.
+    //   PEXC (rolling, last fatal) = {if_addr[23:0], vec#[3:0], cnt wrap4}
+    //   PEX2 (STICKY, first ILLEGAL vec 4) = pifd_pair at the fault =
+    //        {fetch addr16, OPCODE16} of the last completed fetch
+    //   PEX3 (STICKY, first ILLEGAL) = {if_addr[23:0], illegal_cnt[7:0]}
+    // Note: the boot ROM's hardware probes take INTENTIONAL bus errors and
+    // a soft restart re-runs them — hence rolling for PEXC but sticky
+    // first-ILLEGAL for PEX2/PEX3 (the Sad Mac 0F/0003 class).
+    // cpuAddrHi == 0 qualifier: without it, 32-bit device probes (e.g. the
+    // ROM's $FE000010 PDS slot read) alias into the low vector window on the
+    // 24-bit cpuAddr slice and fire false "exceptions".
+    wire vec_fetch = cpuAS_n_d && !cpuAS_n && cpuRW &&
+                     cpuFC[2] && (cpuFC[1:0] != 2'b11) &&
+                     (cpuAddrHi == 8'd0) &&
+                     (cpuAddr[23:6] == 18'd0) &&
+                     (cpuAddr[5:0] >= 6'h08) && (cpuAddr[5:0] <= 6'h24);
+    wire illegal_fetch = vec_fetch && (cpuAddr[5:2] == 4'd4);
+    reg [3:0]  vec_cnt     = 4'd0;
+    reg [7:0]  illegal_cnt = 8'd0;
+    reg        illegal_seen = 1'b0;
+    reg [31:0] pexc_r = 32'd0;
+    reg [31:0] pex2_r = 32'd0;
+    reg [31:0] pex3_r = 32'd0;
+    always @(posedge clk) begin
+        if (vec_fetch) begin
+            pexc_r  <= {if_addr, cpuAddr[5:2], vec_cnt + 4'd1};
+            vec_cnt <= vec_cnt + 4'd1;
+        end
+        if (illegal_fetch) begin
+            if (illegal_cnt != 8'hFF) illegal_cnt <= illegal_cnt + 8'd1;
+            if (!illegal_seen) begin
+                illegal_seen <= 1'b1;
+                pex2_r <= pifd_pair;
+                pex3_r <= {if_addr, 8'd1};
+            end else
+                pex3_r[7:0] <= illegal_cnt + 8'd1;
+        end
+    end
+
+    altsource_probe #(
+        .instance_id ("PEXC"), .probe_width (32), .source_width(1),
+        .sld_auto_instance_index ("YES")
+    ) cp_pexc (.probe(pexc_r), .source(), .source_clk(clk), .source_ena(1'b1));
+
+    altsource_probe #(
+        .instance_id ("PEX2"), .probe_width (32), .source_width(1),
+        .sld_auto_instance_index ("YES")
+    ) cp_pex2 (.probe(pex2_r), .source(), .source_clk(clk), .source_ena(1'b1));
+
+    altsource_probe #(
+        .instance_id ("PEX3"), .probe_width (32), .source_width(1),
+        .sld_auto_instance_index ("YES")
+    ) cp_pex3 (.probe(pex3_r), .source(), .source_clk(clk), .source_ena(1'b1));
+
+    // ---- PFR0-3: restart flight recorder, rev 2 ------------------------------
+    // Findings from rev 1: the mid-boot restart asserts NO reset line and does
+    // NOT execute RESET — it is a software transfer into ROM init. Leading
+    // theory: a deterministic SCSI bus error near dack=14592 is "handled" by
+    // the OS, but TG68's bus-fault frame is malformed, so the handler's RTE
+    // lands at garbage (ROM init). This rev captures exactly that:
+    //   * arms only after 4096 instruction fetches (rev-1 froze on the
+    //     core-load reset with an empty trail)
+    //   * cause 1/2 (reset-line falls) kept, gated by armed
+    //   * cause 4: BUS-ERROR vector fetch while dack_beats > 14000 — the
+    //     death-adjacent bus error. Freezes the pre-trail {pc0=faulting IF,
+    //     pc1=previous IF}, then waits for the handler's RTE opcode ($4E73)
+    //     and captures the 2 fetch addresses that follow = WHERE RTE LANDED.
+    // Readout: PFR0={0,frozen,cause,pre_pc0} PFR1={rst_falls,instr_falls,pre_pc1}
+    //          PFR2={0,rte_caught,rte_pc0} PFR3={berr_trig_count,rte_pc1}
+    reg [23:0] fr_pc0 = 24'd0, fr_pc1 = 24'd0;
+    reg [23:0] fr_rte_pc0 = 24'd0, fr_rte_pc1 = 24'd0;
+    reg        fr_frozen = 1'b0;
+    reg [2:0]  fr_cause  = 3'd0;
+    reg [1:0]  fr_post   = 2'd0;   // 0=pre, 1=waiting RTE, 2=capture rte_pc0, 3=done
+    reg        fr_rte_caught = 1'b0;
+    reg [3:0]  fr_rst_falls = 4'd0, fr_instr_falls = 4'd0;
+    reg [7:0]  fr_berr_trigs = 8'd0;
+    reg [11:0] fr_arm_cnt = 12'd0;
+    wire       fr_armed = (fr_arm_cnt == 12'hFFF);
+    reg        cpuReset_n_d = 1'b1, resetInstr_n_d = 1'b1;
+    reg [31:0] pifd_d = 32'd0;
+    wire [13:0] fr_dack = scsi_dbg_ncr[31:18];
+    wire fr_berr_vec  = vec_fetch && (cpuAddr[5:2] == 4'd2);   // bus-error vector read
+    wire fr_berr_trig = fr_berr_vec && (fr_dack > 14'd14000);
+    always @(posedge clk) begin
+        cpuReset_n_d   <= cpuReset_n;
+        resetInstr_n_d <= resetInstr_n;
+        pifd_d         <= pifd_pair;
+        if (if_cycle && !fr_armed) fr_arm_cnt <= fr_arm_cnt + 12'd1;
+        if (fr_armed) begin
+            if (cpuReset_n_d   && !cpuReset_n   && fr_rst_falls   != 4'hF) fr_rst_falls   <= fr_rst_falls + 4'd1;
+            if (resetInstr_n_d && !resetInstr_n && fr_instr_falls != 4'hF) fr_instr_falls <= fr_instr_falls + 4'd1;
+        end
+        if (fr_berr_trig && fr_berr_trigs != 8'hFF) fr_berr_trigs <= fr_berr_trigs + 8'd1;
+        if (!fr_frozen) begin
+            if (if_cycle) begin
+                fr_pc1 <= fr_pc0;
+                fr_pc0 <= cpuAddr;
+            end
+            if (fr_armed && cpuReset_n_d && !cpuReset_n) begin
+                fr_frozen <= 1'b1; fr_cause <= 3'd1; fr_post <= 2'd3;
+            end else if (fr_armed && resetInstr_n_d && !resetInstr_n) begin
+                fr_frozen <= 1'b1; fr_cause <= 3'd2; fr_post <= 2'd3;
+            end else if (fr_berr_trig) begin
+                fr_frozen <= 1'b1; fr_cause <= 3'd4; fr_post <= 2'd1;
+            end
+        end else begin
+            case (fr_post)
+                2'd1: // waiting for the handler's RTE to complete a fetch
+                    if (pifd_pair != pifd_d && pifd_pair[15:0] == 16'h4E73)
+                        fr_post <= 2'd2;
+                2'd2: // first fetch after RTE = where it landed
+                    if (if_cycle) begin
+                        fr_rte_pc0 <= cpuAddr; fr_rte_caught <= 1'b1; fr_post <= 2'd3;
+                    end
+                2'd3: // one more fetch for context, then done
+                    if (if_cycle && fr_rte_caught && fr_rte_pc1 == 24'd0)
+                        fr_rte_pc1 <= cpuAddr;
+                default: ;
+            endcase
+        end
+    end
+
+    altsource_probe #(
+        .instance_id ("PFR0"), .probe_width (32), .source_width(1),
+        .sld_auto_instance_index ("YES")
+    ) cp_pfr0 (.probe({4'd0, fr_frozen, fr_cause, fr_pc0}), .source(), .source_clk(clk), .source_ena(1'b1));
+    altsource_probe #(
+        .instance_id ("PFR1"), .probe_width (32), .source_width(1),
+        .sld_auto_instance_index ("YES")
+    ) cp_pfr1 (.probe({fr_rst_falls, fr_instr_falls, fr_pc1}), .source(), .source_clk(clk), .source_ena(1'b1));
+    altsource_probe #(
+        .instance_id ("PFR2"), .probe_width (32), .source_width(1),
+        .sld_auto_instance_index ("YES")
+    ) cp_pfr2 (.probe({7'd0, fr_rte_caught, fr_rte_pc0}), .source(), .source_clk(clk), .source_ena(1'b1));
+    altsource_probe #(
+        .instance_id ("PFR3"), .probe_width (32), .source_width(1),
+        .sld_auto_instance_index ("YES")
+    ) cp_pfr3 (.probe({fr_berr_trigs, fr_rte_pc1}), .source(), .source_clk(clk), .source_ena(1'b1));
+
     // ---- PDRD: live atomic {I/O-read addr field, data} ---------------------
     // Same end-of-cycle commit for DATA-space reads in the $F00000 I/O region.
     // Answers "what is the wait loop polling and what does it see" directly.
@@ -219,23 +369,23 @@ module dbg_probes (
     // scsi_dbg layout (ncr5380.sv): [15]=out_en [14]=SEL [13]=BSY
     // [12:11]=target_bsy [10:9]=target_MOUNTED [8]=ICR.A_DATA
     // [7:0]=scsi_bus_data (the ID bits driven during selection).
-    // PSC2 = {sel_ids_sticky[7:0], dbg_at_sel[15:8], dbg_scsi_live[15:0]}:
-    //   [31:24] sticky OR of every data byte seen while SEL asserted —
-    //           which IDs the ROM actually tried to select
+    // PSC2 = {at_sel_data[7:0], dbg_at_sel[15:8], dbg_scsi_live[15:0]}:
+    //   [31:24] data byte on the bus at the LAST SEL assertion — the ID
+    //           bits the targets actually saw (din[ID] match evidence)
     //   [23:16] upper byte of scsi_dbg latched at the last SEL assertion
     //           (out_en/BSY/target_bsy/MOUNTED at the selection moment)
     //   [15:0]  live scsi_dbg
     // Directly answers "is the target mounted and does it see its ID" for
     // the deaf-disk-after-reset state.
-    reg [7:0] sel_ids;
-    reg [7:0] dbg_at_sel;
+    reg [7:0] at_sel_data = 8'h00;
+    reg [7:0] dbg_at_sel  = 8'h00;
     always @(posedge clk)
         if (scsi_dbg[14]) begin       // SEL asserted
-            sel_ids    <= sel_ids | scsi_dbg[7:0];
-            dbg_at_sel <= scsi_dbg[15:8];
+            at_sel_data <= scsi_dbg[7:0];
+            dbg_at_sel  <= scsi_dbg[15:8];
         end
     reg [31:0] psc2_r;
-    always @(posedge clk) psc2_r <= {sel_ids, dbg_at_sel, scsi_dbg};
+    always @(posedge clk) psc2_r <= {at_sel_data, dbg_at_sel, scsi_dbg};
 
     altsource_probe #(
         .instance_id ("PSC2"), .probe_width (32), .source_width(1),
@@ -302,40 +452,8 @@ module dbg_probes (
         .sld_auto_instance_index ("YES")
     ) cp_psc6 (.probe(psc6_r), .source(), .source_clk(clk), .source_ena(1'b1));
 
-    // ---- PASC: ASC refill cadence — {asc_irq_cnt[15:0], asc_wr_cnt[15:0]} -
-    // If irq_cnt outruns wr_cnt the FIFO is underrunning -> distortion.
-    reg asc_irq_d;
-    reg [15:0] asc_irq_cnt, asc_wr_cnt;
-    always @(posedge clk) begin
-        asc_irq_d <= asc_irq;
-        if (asc_irq && !asc_irq_d) asc_irq_cnt <= asc_irq_cnt + 16'd1;
-        if (cpuAS_n_d && !cpuAS_n && selectASC && !cpuRW)
-            asc_wr_cnt <= asc_wr_cnt + 16'd1;
-    end
-    reg [31:0] pasc_r;
-    always @(posedge clk) pasc_r <= {asc_irq_cnt, asc_wr_cnt};
-
-    altsource_probe #(
-        .instance_id ("PASC"), .probe_width (32), .source_width(1),
-        .sld_auto_instance_index ("YES")
-    ) cp_pasc (.probe(pasc_r), .source(), .source_clk(clk), .source_ena(1'b1));
-
-    // ---- PAUD: audio range — {audio_max[15:0], audio_min[15:0]} (sticky) --
-    // Clean audio sweeps a bounded range; full-scale (8000/7FFF) = clipping,
-    // collapsed near-zero = dead output.
-    reg signed [15:0] audio_min, audio_max;
-    initial begin audio_min = 16'sh7FFF; audio_max = 16'sh8000; end
-    always @(posedge clk) begin
-        if (asc_sample_l < audio_min) audio_min <= asc_sample_l;
-        if (asc_sample_l > audio_max) audio_max <= asc_sample_l;
-    end
-    reg [31:0] paud_r;
-    always @(posedge clk) paud_r <= {audio_max, audio_min};
-
-    altsource_probe #(
-        .instance_id ("PAUD"), .probe_width (32), .source_width(1),
-        .sld_auto_instance_index ("YES")
-    ) cp_paud (.probe(paud_r), .source(), .source_clk(clk), .source_ena(1'b1));
+    // (PASC/PAUD audio probes removed — re-add from git history if the sound
+    // path needs JTAG visibility again.)
 
     // ---- PVID: video liveness — {vbl_cnt, clut_wr_cnt, vram_wr_cnt, config}
     //   [31:24] vblank count (wrap8)      — frozen = video timing dead
