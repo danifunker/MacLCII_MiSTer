@@ -82,16 +82,24 @@ end
 // --------------------------- startup/reset ---------------------------
 // ---------------------------------------------------------------------
 
-// wait 1ms (32 8Mhz cycles) after FPGA config is done before going
-// into normal operation. Initialize the ram in the last 16 reset cycles (cycles 15-0)
-reg [4:0] reset;
+// JEDEC SDR-SDRAM init: ~118us of NOPs after the clock starts (the chip
+// wants 100us of stable clock before the first command — the FPGA was just
+// reconfigured, so the SDRAM clock was dead/floating until now), then
+// PRECHARGE ALL -> 8x AUTO REFRESH -> LOAD MODE. The previous sequence
+// (31 chipset cycles ~4us, ZERO refreshes; its "wait 1ms" comment was wrong)
+// relied on the chip state the PREVIOUS core left behind; whether the mode
+// register write took was per-load luck — suspected cause of the cold-load
+// flakiness that clears after loading a different core first.
+// The ladder is content-preserving (NOPs/refreshes/MRS only), so it is also
+// safe to re-run via `init` on a warm user reset while the ROM is in SDRAM.
+reg [9:0] reset;
 always @(posedge clk_64) begin
-	if(init)	reset <= 5'h1f;
+	if(init)	reset <= 10'h3ff;
 	else if((t == STATE_LAST) && (reset != 0))
-		reset <= reset - 5'd1;
+		reset <= reset - 10'd1;
 end
 
-initial reset = 5'h1F;
+initial reset = 10'h3FF;
 
 // ---------------------------------------------------------------------
 // ------------------ generate ram control signals ---------------------
@@ -124,13 +132,19 @@ always @(posedge clk_64) begin
 	sd_data <= 16'bZZZZZZZZZZZZZZZZ;
 
 	if(reset != 0) begin
-		// initialization takes place at the end of the reset phase
+		// init ladder, one command slot per chipset cycle (~123ns apart):
+		// 1023..65 = NOP wait, 64 = PRECHARGE ALL, 56/52/../28 = 8x AUTO
+		// REFRESH, 2 = LOAD MODE. tRP/tRFC/tMRD are all satisfied by orders
+		// of magnitude at this spacing.
 		if(t == STATE_CMD_START) begin
 
-			if(reset == 13) begin
+			if(reset == 64) begin
 				sd_cmd <= CMD_PRECHARGE;
 				sd_addr[10] <= 1'b1;      // precharge all banks
 			end
+
+			if(reset >= 28 && reset <= 56 && reset[1:0] == 2'b00)
+				sd_cmd <= CMD_AUTO_REFRESH;
 
 			if(reset == 2) begin
 				sd_cmd <= CMD_LOAD_MODE;

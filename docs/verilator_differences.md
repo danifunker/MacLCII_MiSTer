@@ -12,8 +12,21 @@ CPU-glue or top-level wiring fix must be made in **both** files or sim and FPGA
 silently diverge. (This has bitten us before — e.g. sim once hardwired
 `.berr(1'b0)`, masking the MOVES bus-error fix.)
 
-Last audited: 2026-06-11 (JTAG probe deck added FPGA-only; selectASC divergence
-FIXED — see below).
+Last audited: 2026-06-12 (cold-load reset hardening added FPGA-only — see below).
+
+**2026-06-12 — intentional FPGA-only additions (cold-load reset hardening):**
+all in `MacLC.sv` / `rtl/sdram.v`, none applicable to sim:
+- `rom_loaded` latch: system reset is held from FPGA config until the first
+  boot0.rom download (dio_index 0) begins, closing the window where the 68k
+  executed the previous core's leftover SDRAM contents. Sim preloads/streams
+  the ROM immediately and its RAM model initialises clean, so no equivalent
+  is needed in `sim.v` (its `n_reset` block already gates on `dio_download`).
+- `pll_locked` 2-FF synchroniser (`pll_locked_s`) feeding the reset block and
+  PRAM FSM. Sim's `pll_locked = !reset` is already synchronous.
+- `sdram_reinit` pulse (user resets R0/R6/core button → content-preserving
+  SDRAM re-init) + JEDEC-robust init ladder in `rtl/sdram.v` (100 µs wait,
+  precharge-all, 8× auto-refresh, MRS). `rtl/sdram.v` is not compiled by the
+  Verilator build at all (sim.v has its own RAM model).
 
 **2026-06-11 — selectASC divergence FIXED (was a real FPGA-only bug):**
 `sim.v` connected `.selectASC(selectASC)` on its addrController instance;

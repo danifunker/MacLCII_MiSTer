@@ -89,6 +89,24 @@ module emu
 		.locked(pll_locked)
 	);
 
+	// pll_locked is asynchronous to clk_sys — synchronize it before the reset
+	// logic / PRAM FSM consume it. (The sdram controller keeps the raw signal:
+	// a glitchy init reload there is harmless, it just re-runs the ladder.)
+	reg [1:0] pll_locked_sync = 2'b00;
+	always @(posedge clk_sys) pll_locked_sync <= {pll_locked_sync[0], pll_locked};
+	wire pll_locked_s = pll_locked_sync[1];
+
+	// Hold the machine in reset from FPGA config until the framework has
+	// streamed boot0.rom (dio_index 0) into SDRAM. Without this latch the 68k
+	// runs through the 100+ ms gap between PLL lock and the start of the ROM
+	// download, executing whatever the PREVIOUS core left in SDRAM at the ROM
+	// window — per-load garbage that can poke any peripheral (and HPS-side
+	// block-device state) before the real boot. Symptom: cold loads sometimes
+	// misbehave (weird boot chime) unless a different core is loaded first.
+	// Cleared only by reconfig; the ROM stays in SDRAM across warm resets.
+	reg rom_loaded = 1'b0;
+	always @(posedge clk_sys) if (dio_download && dio_index == 0) rom_loaded <= 1'b1;
+
 	reg       status_mem = 1'b1;
 	localparam [1:0] status_cpu = 2'b10; // 68020
 	reg       n_reset = 0;
@@ -107,7 +125,9 @@ module emu
 			// stream into SDRAM on the separate `dioBusControl` slot while the CPU
 			// keeps running, so they must NOT reboot the core (hot-insert, like real
 			// hardware / lbmactwo). Gating on dio_index==0 fixes the insert-disk reboot.
-			if(~pll_locked || status[0] || buttons[1] || RESET || pram_force_reset || (dio_download && dio_index == 0)) begin
+			// `!rom_loaded` extends the hold from config until that first ROM
+			// download begins (see the rom_loaded latch above).
+			if(~pll_locked_s || !rom_loaded || status[0] || buttons[1] || RESET || pram_force_reset || (dio_download && dio_index == 0)) begin
 				rst_cnt <= '1;
 				n_reset <= 0;
 			end
@@ -208,7 +228,7 @@ module emu
 	reg  [6:0] rst_hold;
 
 	always @(posedge clk_sys) begin
-		if (~pll_locked) begin
+		if (~pll_locked_s) begin
 			pst <= P_IDLE; pram_rd <= 0; pram_wr_req <= 0; pram_load_wr <= 0;
 			pram_ena <= 0; pram_dirty <= 0; pram_force_reset <= 0; pram_rst_after <= 0;
 			pram_load_pending <= 0; pram_flush_pending <= 0; pram_clr_pending <= 0;
@@ -1302,20 +1322,37 @@ module emu
 
 	assign SDRAM_CKE = 1;
 
+	// Dedicated SDRAM re-init pulse on the explicit user resets (R0 / R6 /
+	// core button). The reverted d88c098/50d0c32 attempts tied .init to
+	// signals that are ALSO asserted through the cold-load ROM download, so
+	// init swallowed the download writes and broke cold boot (HW-confirmed
+	// 2026-06-08). This pulse is structurally different — exactly the shape
+	// the handoff §5 follow-up prescribed:
+	//   * edge-triggered, never level-held through a download;
+	//   * fires only once the ROM is already in SDRAM (rom_loaded);
+	//   * suppressed while ANY download is active (!dio_download);
+	//   * the init ladder is content-preserving (NOPs + refreshes + mode-
+	//     register rewrite, ~126 us — see rtl/sdram.v), and n_reset's ~4 ms
+	//     stretch keeps the CPU in reset until long after it completes.
+	reg  [3:0] sdram_reinit_cnt = 4'd0;
+	reg        user_reset_d = 1'b0;
+	wire       user_reset_now = status[0] | buttons[1] | pram_force_reset;
+	always @(posedge clk_sys) begin
+		user_reset_d <= user_reset_now;
+		if (user_reset_now && !user_reset_d && rom_loaded && !dio_download)
+			sdram_reinit_cnt <= 4'd15;
+		else if (sdram_reinit_cnt != 0)
+			sdram_reinit_cnt <= sdram_reinit_cnt - 4'd1;
+	end
+	wire sdram_reinit = (sdram_reinit_cnt != 0);
+
 	sdram sdram
 	(
 		// system interface
-		// Re-init the SDRAM controller ONLY at config (`!pll_locked`). Two attempts to
-		// ALSO re-init on a warm reset both regressed COLD boot to a grey/black screen,
-		// because the ROM download writes get swallowed while init is held high:
-		//   d88c098  .init(!pll_locked || ~n_reset)   -- ~n_reset is held during download
-		//   50d0c32  .init(!pll_locked || status[0])  -- status[0] also overlaps the load
-		// (HW-confirmed 2026-06-08: both broke cold boot.) Reverted to the known-good
-		// baseline. A warm-boot SDRAM resync — IF that is even the cause of the warm-boot
-		// hang — must be driven by a dedicated pulse that is gated OFF during the ROM
-		// download AND holds _cpuReset until init completes (handoff §5 follow-up), not by
-		// piggy-backing on a system-reset signal that is also active during cold load.
-		.init           ( !pll_locked ),
+		// Full init at config (`!pll_locked`), plus the gated user-reset
+		// re-init pulse above. Do NOT add any signal here that is held
+		// during the ROM download (see comment above for the history).
+		.init           ( !pll_locked || sdram_reinit ),
 		.clk_64         ( clk_mem                  ),
 		.clk_8          ( clk8                     ),
 
