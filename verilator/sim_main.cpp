@@ -126,6 +126,19 @@ bool screenshot_mode = false;
 int stop_at_frame = -1;
 bool stop_at_frame_enabled = false;
 
+// Warm-reset test: pulse the top-level reset at a given frame WITHOUT reloading
+// the ROM (it persists in the SDRAM model) — a faithful proxy for the FPGA's R0
+// soft reset / OS restart, to test whether the machine warm-boots.
+// -------------------------------------------------------------------
+int  reset_at_frame = -1;
+long long warm_reset_start = -1;   // main_time when the pulse began (<0 = not yet)
+const long long WARM_RESET_LEN = 4000;  // hold reset asserted this many ticks
+
+// Level-7 NMI test (--nmi-at-frame N): pulse the programmer's-switch NMI at frame
+// N to verify the CPU+glue take the level-7 autovector (the MacsBug break path).
+int  nmi_at_frame = -1;
+long long nmi_start = -1;
+
 // Headless mode (no GUI)
 // ----------------------
 bool headless = false;
@@ -218,6 +231,34 @@ int verilate() {
 		if (main_time < initialReset) { VERTOPINTERN->reset = 1; }
 		// Deassert reset after startup
 		if (main_time == initialReset) { VERTOPINTERN->reset = 0; }
+
+		// Warm-reset test (--reset-at-frame N): once we reach frame N, hold the
+		// top-level reset asserted for WARM_RESET_LEN ticks, then release. The ROM
+		// already lives in the SDRAM model and is NOT reloaded, so this mirrors an
+		// FPGA R0 / OS restart (warm boot against existing SDRAM).
+		if (reset_at_frame >= 0) {
+			if (warm_reset_start < 0 && (int)video.count_frame >= reset_at_frame) {
+				warm_reset_start = main_time;
+				printf("[F%d] WARM RESET: asserting reset (ROM kept in SDRAM)\n", (int)video.count_frame);
+			}
+			if (warm_reset_start >= 0 && main_time < warm_reset_start + WARM_RESET_LEN) {
+				VERTOPINTERN->reset = 1;
+			} else if (warm_reset_start >= 0 && main_time == warm_reset_start + WARM_RESET_LEN) {
+				VERTOPINTERN->reset = 0;
+				printf("[F%d] WARM RESET: released reset\n", (int)video.count_frame);
+			}
+		}
+
+		// Level-7 NMI test (--nmi-at-frame N): pulse nmi_pulse at frame N. sim.v
+		// edge-detects it and forces IPL=7; expect "NMI: cleared (level-7 IACK TAKEN)".
+		if (nmi_at_frame >= 0) {
+			if (nmi_start < 0 && (int)video.count_frame >= nmi_at_frame) {
+				nmi_start = main_time;
+				printf("[F%d] NMI TEST: pulsing Level-7 NMI\n", (int)video.count_frame);
+			}
+			VERTOPINTERN->nmi_pulse =
+				(nmi_start >= 0 && main_time < nmi_start + WARM_RESET_LEN) ? 1 : 0;
+		}
 
 		// Clock dividers
 		clk_sys.Tick();
@@ -757,6 +798,14 @@ int main(int argc, char** argv, char** env) {
 			stop_at_frame = std::stoi(argv[i + 1]);
 			stop_at_frame_enabled = true;
 			printf("Will stop at frame %d\n", stop_at_frame);
+			i++;
+		} else if (strcmp(argv[i], "--reset-at-frame") == 0 && i + 1 < argc) {
+			reset_at_frame = std::stoi(argv[i + 1]);
+			printf("Will pulse a WARM reset at frame %d (ROM kept in SDRAM)\n", reset_at_frame);
+			i++;
+		} else if (strcmp(argv[i], "--nmi-at-frame") == 0 && i + 1 < argc) {
+			nmi_at_frame = std::stoi(argv[i + 1]);
+			printf("Will pulse a Level-7 NMI at frame %d (MacsBug-path test)\n", nmi_at_frame);
 			i++;
 		} else if (strcmp(argv[i], "--no-cpu-trace") == 0) {
 			cpu_trace_disabled = true;

@@ -30,6 +30,15 @@ module dataController_top(
 	input selectSCSI,
 	input selectSCSIDMA,    // SCSI pseudo-DMA window (DACK)
 	output scsiDREQ,        // SCSI pseudo-DMA request (gates CPU DTACK upstream)
+	output scsiIRQ,         // NCR5380 latched IRQ (level) -> pseudo-VIA IFR bit 3
+	// JTAG probe feeds (dbg_probes.sv in the FPGA top; unconnected in sim)
+	output [15:0] dbg_scsi,   // selection/arbitration: out_en/SEL/BSY/bsy/MOUNTED/data
+	output [15:0] dbg_scsi2,  // target phases + HPS io handshake
+	output [15:0] dbg_scsi4,  // bus-reset count + per-target completion flags
+	output [15:0] dbg_scsi5,  // per-target last-opcode bitmap
+	output [31:0] dbg_ncr,    // host-side pseudo-DMA state + DACK beat count
+	output [31:0] dbg_ncr2,   // req_deferred/req_bus + IRQ machine + counters
+	output [31:0] dbg_wr,     // write-stall snapshot (DATA_IN target)
 	input selectSCC,
 	input selectIWM,
 	input selectVIA,
@@ -45,10 +54,7 @@ module dataController_top(
 	input selectUnmapped,
 
 	// RAM/ROM:
-
-	// RAM/ROM:
-	input videoBusControl,	
-	input cpuBusControl,	
+	input cpuBusControl,
 	input [15:0] memoryDataIn,
 	output [15:0] memoryDataOut,
 	input memoryLatch,
@@ -192,6 +198,12 @@ module dataController_top(
 	// 68020 is held in resetDelay.
 	reg [9:0] egretBootCounter = 0;
 	wire egretReset = (egretBootCounter < 10'd256) || !minResetPassed;
+	// NOTE (2026-06-12): wiring the 68k RESET instruction into the NCR/SCC
+	// resets here REGRESSED cold boot to a blinking `?` — the LC ROM issues
+	// RESET at ~T+4s AFTER initializing the SCSI chip at ~T+2.8s and expects
+	// that setup to survive. Do NOT hard-reset the NCR from the RESET
+	// instruction. The 7.x post-enabler-restart ID-6 skip remains open
+	// (docs/findings_pds_phantom_card_2026-06-12.md).
 
 	always @(posedge clk32) begin
 		if (!_systemReset) begin
@@ -337,6 +349,10 @@ module dataController_top(
 	// dma_second_word describe the 68020 access width so the chip packs 1/2/4
 	// bytes per cycle (matches MAME scsi_drq_r/w). dreq feeds the CPU DTACK
 	// gate upstream so a pseudo-DMA cycle stalls until the target has data.
+	// o_irq (latched phase-mismatch IRQ, cleared by a reg-7 read) and dreq
+	// also feed the pseudo-VIA IFR bits 3/0 LEVEL-wise — the on-disk HD SC
+	// 4.3 driver's async path sleeps on those flags between pseudo-DMA
+	// chunks (Apple_Driver43 partition; the System 7 Welcome wedge).
 	ncr5380 #(.DEVS(SCSI_DEVS), .ENABLE_EMPTY_CD(0)) scsi(
 		.clk(clk32),
 		.reset(!_cpuReset),
@@ -349,6 +365,7 @@ module dataController_top(
 		.dma_longword(cpuLongword),
 		.dma_second_word(cpuAddrRegLo[0]),
 		.dreq(scsiDREQ),
+		.o_irq(scsiIRQ),
 		.wdata(cpuDataIn),
 		.rdata(scsiDataOut),
 
@@ -365,12 +382,15 @@ module dataController_top(
 		.sd_buff_din(sd_buff_din),
 		.sd_buff_wr(sd_buff_wr),
 
-		// JTAG debug outputs unused in this core
-		.dbg_scsi(),
-		.dbg_scsi2(),
+		// JTAG probe feeds (consumed by dbg_probes.sv in the FPGA top)
+		.dbg_scsi(dbg_scsi),
+		.dbg_scsi2(dbg_scsi2),
 		.dbg_scsi3(),
-		.dbg_scsi4(),
-		.dbg_scsi5()
+		.dbg_scsi4(dbg_scsi4),
+		.dbg_scsi5(dbg_scsi5),
+		.dbg_ncr(dbg_ncr),
+		.dbg_ncr2(dbg_ncr2),
+		.dbg_wr(dbg_wr)
 	);
 
 	// count vblanks, and set 1 second interrupt after 60 vblanks

@@ -29,6 +29,8 @@ module pseudovia(
     input vblank_irq,    // Active high VBlank signal
     input slot_irq,      // Slot interrupt
     input asc_irq,       // ASC interrupt
+    input scsi_irq,      // NCR5380 latched interrupt (LEVEL) -> IFR bit 3 ("CB2")
+    input scsi_drq,      // NCR5380 DREQ (LEVEL)              -> IFR bit 0 ("CA2")
     output reg irq_out,
 
     // Config from top level
@@ -78,8 +80,12 @@ wire [7:0] slot_irqs_masked = slot_irqs & (slot_ier & 8'h78);
 wire any_slot_irq = |slot_irqs_masked;
 
 // Live IFR source bits, mirroring MAME pseudovia_recalc_irqs():
-//   bit4 = ASC, bit3 = slot, bit1 = any-slot summary; others keep stored value.
-wire [7:0] ifr_live = { ifr[7], ifr[6], ifr[5], asc_irq, slot_irq, ifr[2], any_slot_irq, ifr[0] };
+//   bit4 = ASC, bit3 = SCSI IRQ, bit1 = any-slot summary, bit0 = SCSI DRQ;
+//   others keep stored value. (bit3 previously carried slot_irq — that
+//   contradicted MAME pseudovia.cpp, where scsi_irq_w owns bit 3 and slot
+//   sources live in slot_status + the bit-1 summary; the slot input is tied
+//   0 in both tops, so nothing depended on the old mapping.)
+wire [7:0] ifr_live = { ifr[7], ifr[6], ifr[5], asc_irq, scsi_irq, ifr[2], any_slot_irq, scsi_drq };
 
 // MAME: IRQ asserts when (IFR & IER[$13] & 0x1B) != 0. The main IER ($13)
 // gates the final interrupt; the slot IER ($12) only gates the slot summary.
@@ -116,11 +122,12 @@ always @(posedge clk_sys) begin
         else
             ifr[1] <= 1'b0;
 
-        // Per-source IFR bits — match MAME pseudovia.cpp asc_irq_w / slot_irq_w
-        // pattern (set when source asserts, clear when source deasserts).
-        // MAME's recalc reads `regs[3] & regs[0x13] & 0x1B` — mask 0x1B
-        // includes bit 4 (ASC), bit 3 (slot), bit 1 (any slot), bit 0. So
-        // these per-source bits matter for the boot ROM's IRQ-source decode.
+        // Per-source IFR bits — match MAME pseudovia.cpp asc_irq_w /
+        // scsi_irq_w / scsi_drq_w pattern (set when source asserts, clear
+        // when source deasserts). MAME's recalc reads
+        // `regs[3] & regs[0x13] & 0x1B` — mask 0x1B includes bit 4 (ASC),
+        // bit 3 (SCSI IRQ), bit 1 (any slot), bit 0 (SCSI DRQ). So these
+        // per-source bits matter for the boot ROM's IRQ-source decode.
         // Previously only bit 1 (summary) was set; the ROM could see "an
         // IRQ fired" but couldn't tell WHICH source, and any handler that
         // dispatched off IFR[4] / IFR[3] saw 0 and fell through to a wrong
@@ -130,10 +137,24 @@ always @(posedge clk_sys) begin
         else
             ifr[4] <= 1'b0;
 
-        if (slot_irq)
+        // SCSI flags are LEVEL-driven — NEVER edge-latch these here. The
+        // LBMacTwo round-3 HW test proved an edge model deadlocks: the
+        // latched IRQ from the previous chunk holds the line, so no new
+        // edge fires at the next pseudo-DMA chunk boundary and the HD SC
+        // 4.3 driver's IFR poll sleeps forever (lbmactwo 1ee80e8). The
+        // 5380's own irq_latch (cleared by a reg-7 read) provides the
+        // handshake; these flags just FOLLOW it. A W1C IFR write below may
+        // clear a bit for one cycle; the level re-asserts on the next —
+        // self-correcting, Snow semantics.
+        if (scsi_irq)
             ifr[3] <= 1'b1;
         else
             ifr[3] <= 1'b0;
+
+        if (scsi_drq)
+            ifr[0] <= 1'b1;
+        else
+            ifr[0] <= 1'b0;
 
         // Update IRQ output
         if (irq_pending) begin

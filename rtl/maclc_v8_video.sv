@@ -6,10 +6,6 @@ module maclc_v8_video(
     input clk8_en_p,
     input reset,
 
-    output [21:0] video_addr,
-    input [15:0] video_data_in,
-    input video_latch,
-
     input [2:0] video_mode,
     input [3:0] monitor_id,
 
@@ -31,11 +27,6 @@ module maclc_v8_video(
     output [7:0] palette_addr,
     input [23:0] palette_data,
 
-    // Bandwidth request: high while the next scanline still needs words
-    // fetched. addrController grants video the idle "extra" bus slot when
-    // this is asserted (Phase 1b) so 4/8bpp have enough fetch bandwidth.
-    output video_req,
-
     // Active words per scanline (= h_active*bpp/16). Exported so addrController
     // can pack CPU VRAM writes into the on-chip framebuffer (stride-gap removed).
     output [10:0] words_per_line,
@@ -45,8 +36,6 @@ module maclc_v8_video(
     output [17:0] vram_raddr,
     input  [15:0] vram_rdata
 );
-
-localparam [21:0] VRAM_BASE = 22'h0;  // Outputs byte offset; SDRAM base added in addrController
 
 reg [10:0] h_total, h_active, h_sync_start, h_sync_end;
 reg [9:0] v_total, v_active, v_sync_start, v_sync_end;
@@ -137,23 +126,12 @@ end
 
 `ifdef SIMULATION
 reg [3:0] monitor_id_prev;
-reg [31:0] latch_count;
 always @(posedge clk_sys) begin
     if (monitor_id != monitor_id_prev) begin
         `ifdef VERBOSE_TRACE
         $display("V8: monitor_id changed to %h @%0t", monitor_id, $time);
         `endif
         monitor_id_prev <= monitor_id;
-    end
-    if (reset)
-        latch_count <= 0;
-    else if (video_latch && !hblank && !vblank) begin
-        `ifdef VERBOSE_TRACE
-        if (latch_count < 10 || (latch_count % 100000 == 0))
-            $display("V8 FETCH[%0d] @%0t: addr=%h data=%h mode=%d pixel_idx=%h palette=%h",
-                latch_count, $time, video_addr, video_data_in, video_mode, pixel_index, palette_data);
-        `endif
-        latch_count <= latch_count + 1;
     end
 end
 `endif
@@ -227,9 +205,7 @@ reg       fetch_buf_d;    // fetch_buf aligned to the write phase
 
 assign vram_raddr = fetch_packed_base + {8'd0, fetch_idx};
 
-// SDRAM video path retired in Phase 2 — video now reads the on-chip framebuffer.
-assign video_addr = 22'd0;
-assign video_req  = 1'b0;
+// SDRAM video path retired in Phase 2 — video reads the on-chip framebuffer.
 
 always @(posedge clk_sys) begin
     if (reset) begin
