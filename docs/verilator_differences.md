@@ -12,7 +12,33 @@ CPU-glue or top-level wiring fix must be made in **both** files or sim and FPGA
 silently diverge. (This has bitten us before — e.g. sim once hardwired
 `.berr(1'b0)`, masking the MOVES bus-error fix.)
 
-Last audited: 2026-06-06 (PRAM NVRAM persistence added — see the PRAM row below).
+Last audited: 2026-06-12 (cold-load reset hardening added FPGA-only — see below).
+
+**2026-06-12 — intentional FPGA-only additions (cold-load reset hardening):**
+all in `MacLC.sv` / `rtl/sdram.v`, none applicable to sim:
+- `rom_loaded` latch: system reset is held from FPGA config until the first
+  boot0.rom download (dio_index 0) begins, closing the window where the 68k
+  executed the previous core's leftover SDRAM contents. Sim preloads/streams
+  the ROM immediately and its RAM model initialises clean, so no equivalent
+  is needed in `sim.v` (its `n_reset` block already gates on `dio_download`).
+- `pll_locked` 2-FF synchroniser (`pll_locked_s`) feeding the reset block and
+  PRAM FSM. Sim's `pll_locked = !reset` is already synchronous.
+- `sdram_reinit` pulse (user resets R0/R6/core button → content-preserving
+  SDRAM re-init) + JEDEC-robust init ladder in `rtl/sdram.v` (100 µs wait,
+  precharge-all, 8× auto-refresh, MRS). `rtl/sdram.v` is not compiled by the
+  Verilator build at all (sim.v has its own RAM model).
+
+**2026-06-11 — selectASC divergence FIXED (was a real FPGA-only bug):**
+`sim.v` connected `.selectASC(selectASC)` on its addrController instance;
+`MacLC.sv` NEVER did — the wire floated to GND on hardware, so ASC register
+access was dead on FPGA while sim audio worked. Found when the new probe deck
+made the dangling net visible (Quartus warning 12110). Both tops now connect it.
+
+**2026-06-11 — intentional FPGA-only addition:** `rtl/dbg_probes.sv` (JTAG
+In-System probes, `docs/jtag_probes.md`) is instantiated ONLY in `MacLC.sv` —
+`altsource_probe` is an Altera primitive and must never reach Verilator. The
+probe FEED wires exist in both tops (ncr5380 `dbg_ncr`/`dbg_ncr2`/`dbg_wr`
+through `dataController_top`); sim.v ties them off explicitly.
 
 ---
 
