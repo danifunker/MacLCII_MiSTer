@@ -866,12 +866,65 @@ module scc
 	wire post_loopback_a = loopback_was_used_a & ~local_loopback_a;
 	wire post_loopback_b = loopback_was_used_b & ~local_loopback_b;
 
+	// SDLC-mode latch. NOT a decode of wr4 (wr4 resets to 0, which would make
+	// "sync mode" true from reset until the first WR4 write — that leaked the
+	// new sync-only RR0 behavior into the ROM 'atlk' self-test, whose early
+	// phases run before/between WR4=$4C writes, and killed the 7.1 boot at
+	// dack=14592). Set ONLY by an explicit WR4 write selecting SDLC
+	// (stop bits 00 + sync mode 10) — exactly what the LAP Manager programs
+	// (WR4=$20); cleared by reset or any other WR4 value. While clear, RR0
+	// bits 4/6 and the TxEmpty gating behave bit-identically to the
+	// pre-LocalTalk-fix build.
+	reg sdlc_mode_a = 1'b0;
+	reg sdlc_mode_b = 1'b0;
+	always @(posedge clk or posedge reset) begin
+		if (reset) begin
+			sdlc_mode_a <= 1'b0;
+			sdlc_mode_b <= 1'b0;
+		end else begin
+			if (reset_a)                                  sdlc_mode_a <= 1'b0;
+			else if (cen && wreg_a && rindex_latch == 4)  sdlc_mode_a <= (wdata[3:2] == 2'b00) && (wdata[5:4] == 2'b10);
+			if (reset_b)                                  sdlc_mode_b <= 1'b0;
+			else if (cen && wreg_b && rindex_latch == 4)  sdlc_mode_b <= (wdata[3:2] == 2'b00) && (wdata[5:4] == 2'b10);
+		end
+	end
+	wire sync_mode_a = sdlc_mode_a;
+	wire sync_mode_b = sdlc_mode_b;
+
+	// Sync/Hunt latch (RR0 bit 4) — the LocalTalk fix (2026-06-12, MAME
+	// ground truth: docs/findings_welcome_wedge_mame_2026-06-12.md).
+	// WR3 bit 4 = "Enter Hunt"; the LAP Manager's transmit worker gates on
+	// RR0 bit 4 == 1 ("receiver hunting" = the LocalTalk line is idle) before
+	// sending. We model no sync receive data, so once hunting the receiver
+	// never leaves hunt — which is exactly a quiet single-node line. With
+	// this bit stuck 0, every 7.x LAP transmit took the defer path and slept
+	// forever on an SCC ExtSts interrupt we never generate (the System 7.x
+	// "Welcome to Macintosh" wedge).
+	reg hunt_a = 1'b0;
+	reg hunt_b = 1'b0;
+	always @(posedge clk or posedge reset) begin
+		if (reset) begin
+			hunt_a <= 1'b0;
+			hunt_b <= 1'b0;
+		end else begin
+			if (reset_a)                                       hunt_a <= 1'b0;
+			else if (cen && wreg_a && rindex_latch == 3 && wdata[4]) hunt_a <= 1'b1;
+			if (reset_b)                                       hunt_b <= 1'b0;
+			else if (cen && wreg_b && rindex_latch == 3 && wdata[4]) hunt_b <= 1'b1;
+		end
+	end
+
 	// TX buffer empty gating: after loopback self-test, with loopback now off
 	// and no cable connected, report TX buffer as not empty. A real Z8530 with
 	// Auto Enable and CTS=0 won't drain the TX buffer, so the driver's TX
 	// routine stalls and eventually gives up.
-	wire tx_empty_gated_a = post_loopback_a ? 1'b0 : tx_empty_latch_a;
-	wire tx_empty_gated_b = post_loopback_b ? 1'b0 : tx_empty_latch_b;
+	// SCOPED TO ASYNC ONLY (2026-06-12): in sync/SDLC mode the LLAP byte loop
+	// polls TxEmpty per frame byte and has NO timeout — gating it post-loopback
+	// deadlocks the 7.x LAP open (the ROM 'atlk' self-test always runs loopback
+	// first, so post_loopback is true by then). MAME's truthful z80scc boots
+	// both 6.0.8 and 7.x; sync mode now reports the real latch.
+	wire tx_empty_gated_a = (post_loopback_a && !sync_mode_a) ? 1'b0 : tx_empty_latch_a;
+	wire tx_empty_gated_b = (post_loopback_b && !sync_mode_b) ? 1'b0 : tx_empty_latch_b;
 
 	/* RR0
 	 * Bit 7 (Break/Abort) and bit 4 (Sync/Hunt) MUST be 0 in async mode per
@@ -887,9 +940,9 @@ module scc
 	 * commit a89c671 (docs/bootproblems.md:138-156).
 	 */
 	assign rr0_a = { 1'b0,           /* Break/Abort — async: always 0 */
-			 eom_latch_a,           /* Tx Underrun/EOM */
+			 sync_mode_a & eom_latch_a, /* Tx Underrun/EOM — SDLC only (async: 0, as pre-fix) */
 			 rr0_cts_a,             /* CTS */
-			 1'b0,                  /* Sync/Hunt — async: always 0 */
+			 sync_mode_a & hunt_a,  /* Sync/Hunt — live in sync mode, 0 in async */
 			 rr0_dcd_a,             /* DCD */
 			 tx_empty_gated_a,      /* Tx Empty (post_loopback gated) */
 			 1'b0,                  /* Zero Count */
@@ -905,9 +958,9 @@ module scc
 		end
 	end
 	assign rr0_b = { 1'b0,           /* Break/Abort — async: always 0 (see rr0_a) */
-			 eom_latch_b,           /* Tx Underrun/EOM */
+			 sync_mode_b & eom_latch_b, /* Tx Underrun/EOM — SDLC only (async: 0, as pre-fix) */
 			 rr0_cts_b,             /* CTS */
-			 1'b0,                  /* Sync/Hunt — async: always 0 (see rr0_a) */
+			 sync_mode_b & hunt_b,  /* Sync/Hunt — live in sync mode, 0 in async */
 			 rr0_dcd_b,             /* DCD */
 			 tx_empty_gated_b,      /* Tx Empty (post_loopback gated) */
 			 1'b0,                  /* Zero Count */
@@ -1278,8 +1331,14 @@ end
 			if (wreg_a && rindex_latch == 0 && wdata[7:6] == 2'b11) begin
 				eom_latch_a <= 1'b0;  // Clear EOM latch
 			end
-			// Future enhancement: Set EOM on actual transmit underrun
-			// if (tx_underrun_detected_a) eom_latch_a <= 1'b1;
+			// Set on transmit underrun — SYNC MODE ONLY (2026-06-12 LocalTalk
+			// fix). The LLAP transmit tail does WR0=$C0 (reset latch) then
+			// polls RR0 bit 6 until set ("CRC+closing flag went out"); an
+			// idle/drained transmitter IS the underrun condition here. Async
+			// keeps the historical constant-0 behavior.
+			else if (sync_mode_a && tx_empty_latch_a) begin
+				eom_latch_a <= 1'b1;
+			end
 		end
 	end
 
@@ -1294,8 +1353,10 @@ end
 			if (wreg_b && rindex_latch == 0 && wdata[7:6] == 2'b11) begin
 				eom_latch_b <= 1'b0;  // Clear EOM latch
 			end
-			// Future enhancement: Set EOM on actual transmit underrun
-			// if (tx_underrun_detected_b) eom_latch_b <= 1'b1;
+			// Set on transmit underrun — sync mode only (see channel A note).
+			else if (sync_mode_b && tx_empty_latch_b) begin
+				eom_latch_b <= 1'b1;
+			end
 		end
 	end
 

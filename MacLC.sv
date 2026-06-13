@@ -819,18 +819,29 @@ module emu
 		.vblank_irq(v8_vblank),
 		.slot_irq(pds_slot_irq),
 		.asc_irq(asc_irq),
-		// SCSI flags RE-WIRED (2026-06-12, level-driven per lbmactwo 1ee80e8):
-		// the 06-11 tie-off blamed these for "System 7.x crashed+restarted
-		// ~1s after Happy Mac" — that crash is now root-caused to the phantom
-		// PDS card (24-bit aliasing of the ROM's $FE000000 slot probe; fixed
-		// by the $F1-$FE open-bus window). With the flags tied off, the
-		// 7.x-era on-disk HD SC driver's ASYNC path sleeps forever on its
-		// completion flag (live-decoded spin at RAM $xxAA38: tst.b $60a(a2)/
-		// bne) because the pseudo-VIA SCSI interrupt never arrives. System 6
-		// uses the sync driver path and never needed it; MAME wires these
-		// and boots the same disk image.
-		.scsi_irq(scsiIRQ),
-		.scsi_drq(scsiDREQ),
+		// SCSI flags RE-TIED-OFF (2026-06-12 evening). History of reversals:
+		// - 06-11 (1f6c8d5): tied off — wiring them gave "System 7.x crash+
+		//   restart ~1s after Happy Mac, deterministic, dack_beats=14592";
+		//   System 6 survives (IER masks). MAME maclc.cpp does NOT connect
+		//   the 5380 irq_handler and boots LC System 7 — LC ground truth.
+		// - 06-12 morning: re-wired, on the theory the phantom PDS card
+		//   explained ALL the 06-11 evidence. WRONG CONFLATION: the phantom
+		//   card explained the Sad Macs (slot-init illegals — fixed,
+		//   validated); the crash-restart at dack=14592 was a SEPARATE
+		//   mechanism, and it returned tonight on every build carrying this
+		//   wiring (7.1 + 7.5.5, post-Happy-Mac, 6.0.8 immune — IER masks).
+		//   Likely a race: the NCR phase-mismatch irq_latch fires at a fresh
+		//   READ(10) command boundary (dack=14592 = first longword of one)
+		//   into IPL2 while System 7 is mid-install of its dispatch vectors
+		//   — probabilistic, which is why two afternoon runs threaded it.
+		// - The 06-12-morning re-wire rationale (async driver sleeps without
+		//   the IRQ) was WRONG too: MAME proves the LC boot path completes
+		//   with zero SCSI interrupts; the real sleep was the LocalTalk LAP
+		//   defer (SCC RR0 hunt bit — fixed in scc.v, the sccv2 change).
+		// Do NOT re-wire without MAME-grade evidence the LC V8 delivers
+		// these flags on real hardware.
+		.scsi_irq(1'b0),
+		.scsi_drq(1'b0),
 		.irq_out(pseudovia_irq),
 		.ram_config(configRAMSize),
 		.monitor_id(v8_monitor_id),

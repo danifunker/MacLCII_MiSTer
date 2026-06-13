@@ -610,12 +610,13 @@ module emu
 		.vblank_irq(v8_vblank),
 		.slot_irq(pds_slot_irq),
 		.asc_irq(asc_irq),
-		// SCSI flags RE-WIRED (2026-06-12) — matches MacLC.sv (rationale
-		// there: the crash that motivated the 06-11 tie-off was the phantom
-		// PDS card; the async HD SC driver needs this interrupt or it spins
-		// on its completion flag forever).
-		.scsi_irq(scsiIRQ),
-		.scsi_drq(scsiDREQ),
+		// SCSI flags RE-TIED-OFF (2026-06-12 evening) — matches MacLC.sv
+		// (full reversal history there: the dack=14592 post-Happy-Mac
+		// crash-restart tracks THIS wiring, not the phantom card; the
+		// "driver sleeps without it" rationale was actually the LocalTalk
+		// LAP defer, fixed in scc.v).
+		.scsi_irq(1'b0),
+		.scsi_drq(1'b0),
 		.irq_out(pseudovia_irq),
 		.ram_config(configRAMSize),
 		.monitor_id(v8_monitor_id),
