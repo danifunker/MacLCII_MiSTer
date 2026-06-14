@@ -587,6 +587,32 @@ module emu
 		end else if (selectSCSIDMA)
 			sdma_stall_ctr <= 0;     // DREQ arrived
 	end
+
+	// --- Active pseudo-DMA stall snapshot (PSDS/PSD2/PSD3) --------------------
+	// Latch the live SCSI engine state the FIRST time a pseudo-DMA DACK access is
+	// DREQ-starved past SDMA_SNAP_THRESH (well above a normal HPS sector-fetch
+	// bridge, far below the 250 ms sdma_berr). With the deeper read prefetch
+	// (rtl/scsi.v RING_LOG) this should rarely fire; when it does it captures
+	// whether a residual stall is H1 (phase=DATA_OUT, io_rd=1, io_ack=0,
+	// io_busy=1), H2 (pmatch=0 / phase!=DATA_OUT) or H3 (dma_en=0) — see
+	// docs/findings_scsi_dma_stall_offline_2026-06-14.md. Sticky until reset;
+	// reuses sdma_stall_ctr. Read via scripts/read_probes.sh (PSDS block).
+	localparam SDMA_SNAP_THRESH = 23'd520000;   // ~16 ms @ 32.5 MHz (tunable)
+	reg        sdma_snapped    = 1'b0;
+	reg [15:0] sdma_snap_scsi2 = 16'd0;
+	reg [31:0] sdma_snap_ncr   = 32'd0;
+	reg [31:0] sdma_snap_wr    = 32'd0;
+	always @(posedge clk_sys) begin
+		if (!_cpuReset)
+			sdma_snapped <= 1'b0;
+		else if (!sdma_snapped && sdma_stall_ctr == SDMA_SNAP_THRESH) begin
+			sdma_snap_scsi2 <= dbg_scsi2_w;   // phase0/1, io_rd, io_wr, io_ack
+			sdma_snap_ncr   <= dbg_ncr_w;     // dreq/dma_en/dma_ack/holdoff/mr_dma/pmatch/tcr
+			sdma_snap_wr    <= dbg_wr_w;      // data_cnt/phase/io_busy/sd_buff_sel/data_complete
+			sdma_snapped    <= 1'b1;
+		end
+	end
+
 	assign      _cpuVPA = fc7_iack ? 1'b0 : ((fc7_berr || slot_space) ? 1'b1 : ~(!_cpuAS && cpuAddr[23:21] == 3'b111 && !selectVRAM && !selectSCSIDMA));
 	assign      _cpuDTACK = fc7_berr ? 1'b1 :
 	                        (slot_space && !_cpuAS) ? 1'b0 :
@@ -878,6 +904,22 @@ module emu
 		.instance_id ("PSDT"), .probe_width (32), .source_width(1),
 		.sld_auto_instance_index ("YES")
 	) cp_psdt (.probe({sdma_berr_cnt, 1'b0, sdma_stall_max}), .source(), .source_clk(clk_sys), .source_ena(1'b1));
+
+	// PSDS/PSD2/PSD3: active pseudo-DMA stall snapshot (latched at SDMA_SNAP_THRESH).
+	// PSDS[16]=snapped flag, PSDS[15:0]=dbg_scsi2 layout; PSD2=dbg_ncr (PSNC layout);
+	// PSD3=dbg_wr (PSCW layout). Decoded by scripts/cpu_state.tcl.
+	altsource_probe #(
+		.instance_id ("PSDS"), .probe_width (32), .source_width(1),
+		.sld_auto_instance_index ("YES")
+	) cp_psds (.probe({15'd0, sdma_snapped, sdma_snap_scsi2}), .source(), .source_clk(clk_sys), .source_ena(1'b1));
+	altsource_probe #(
+		.instance_id ("PSD2"), .probe_width (32), .source_width(1),
+		.sld_auto_instance_index ("YES")
+	) cp_psd2 (.probe(sdma_snap_ncr), .source(), .source_clk(clk_sys), .source_ena(1'b1));
+	altsource_probe #(
+		.instance_id ("PSD3"), .probe_width (32), .source_width(1),
+		.sld_auto_instance_index ("YES")
+	) cp_psd3 (.probe(sdma_snap_wr), .source(), .source_clk(clk_sys), .source_ena(1'b1));
 
 	dbg_probes probes(
 		.clk(clk_sys),

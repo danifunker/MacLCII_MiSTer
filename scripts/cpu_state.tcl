@@ -202,6 +202,33 @@ puts [format "PSNC dma engine : dreq=%d req=%d ack=%d dma_en=%d dma_ack=%d ack_b
     [expr {($n>>10)&1}] [expr {($n>>11)&1}] [expr {($n>>12)&1}] [expr {($n>>14)&0xF}] \
     [expr {($n>>18)&0x3FFF}]]
 
+# ---- PSDS/PSD2/PSD3: active pseudo-DMA stall snapshot -------------------------
+# Sticky latch of the live SCSI state the first time a DACK access is DREQ-starved
+# past ~16 ms. Discriminates a residual stall: H1 (phase=DATA_OUT io_rd=1 io_ack=0
+# io_busy=1), H2 (pmatch=0 / phase!=DATA_OUT), H3 (dma_en=0). See
+# docs/findings_scsi_dma_stall_offline_2026-06-14.md.
+if {[info exists idx(PSDS)]} {
+    set s [rd PSDS]
+    if {[expr {($s>>16)&1}]} {
+        puts [format "PSDS stall-snap : CAPTURED  phase1=%s phase0=%s io_rd=%d%d io_wr=%d%d io_ack=%d%d" \
+            [lindex $phn [expr {($s>>11)&7}]] [lindex $phn [expr {($s>>8)&7}]] \
+            [expr {($s>>5)&1}] [expr {($s>>4)&1}] [expr {($s>>3)&1}] [expr {($s>>2)&1}] \
+            [expr {($s>>1)&1}] [expr {$s&1}]]
+        set sn [rd PSD2]
+        puts [format "  PSD2 ncr-snap : dreq=%d req=%d ack=%d dma_en=%d dma_ack=%d ack_busy=%d holdoff=%d mr_dma=%d pmatch=%d word=%d long=%d tcr=%X" \
+            [expr {$sn&1}] [expr {($sn>>1)&1}] [expr {($sn>>2)&1}] [expr {($sn>>3)&1}] \
+            [expr {($sn>>4)&1}] [expr {($sn>>5)&1}] [expr {($sn>>6)&7}] [expr {($sn>>9)&1}] \
+            [expr {($sn>>10)&1}] [expr {($sn>>11)&1}] [expr {($sn>>12)&1}] [expr {($sn>>14)&0xF}]]
+        set sw [rd PSD3]
+        puts [format "  PSD3 wr-snap  : data_cnt=%d phase=%s done=%d io_wr=%d io_ack=%d io_busy=%d buf_sel=%d cmd_write=%d tlen=%d req=%d" \
+            [expr {$sw&0xFFFF}] [lindex $phn [expr {($sw>>16)&7}]] \
+            [expr {($sw>>19)&1}] [expr {($sw>>20)&1}] [expr {($sw>>21)&1}] [expr {($sw>>22)&1}] \
+            [expr {($sw>>23)&1}] [expr {($sw>>24)&1}] [expr {($sw>>25)&0x3F}] [expr {($sw>>31)&1}]]
+    } else {
+        puts "PSDS stall-snap : (no deep stall captured since reset)"
+    }
+}
+
 set l [rd PSWL]
 puts [format "PSWL irq/defer  : req_deferred=%d req_bus=%d irq_latch=%d dma_armed=%d eodma=%d dreq=%d pmatch=%d dma_en=%d blind_wr=%d req_drops=%d" \
     [expr {($l>>15)&1}] [expr {($l>>14)&1}] [expr {($l>>13)&1}] [expr {($l>>12)&1}] \

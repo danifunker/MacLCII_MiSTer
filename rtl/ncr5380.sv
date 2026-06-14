@@ -691,8 +691,12 @@ module ncr5380
 	always begin : pscw_mux
 		integer j;
 		dbg_wr_mux = target_wrstall[DEVS-1];
+		// Route whichever target is in a DATA phase — WRITE (PHASE_DATA_IN=3) or
+		// READ (PHASE_DATA_OUT=2). The read case was added for the pseudo-DMA
+		// stall snapshot (PSDS/PSD3) so data_cnt/io_busy/phase are valid during a
+		// READ stall, not just a write.
 		for (j = 0; j < DEVS; j = j + 1)
-			if (target_phase[j] == 3'd3) dbg_wr_mux = target_wrstall[j];
+			if (target_phase[j] == 3'd3 || target_phase[j] == 3'd2) dbg_wr_mux = target_wrstall[j];
 	end
 	assign dbg_wr = dbg_wr_mux;
 
