@@ -796,6 +796,8 @@ module emu
 
 		.insertDisk({dsk_ext_ins, dsk_int_ins}),
 		.diskSides({dsk_ext_ds, dsk_int_ds}),
+		.diskMFM(2'b00),   // sim: MFM/ISM floppy path not exercised
+		.diskHD(2'b00),
 		.diskEject(diskEject),
 		.dskReadAddrInt(dskReadAddrInt),
 		.dskReadAckInt(dskReadAckInt),
@@ -943,7 +945,12 @@ module emu
 	wire [15:0] ram_do_patched =
 		(!_romOE && memoryAddr == 23'h52322F && ram_do_raw == 16'h6600) ? 16'h6000 : ram_do_raw;
 	wire [15:0] ram_do   = download_cycle ? 16'hffff : (dskReadAckInt || dskReadAckExt) ? extra_rom_data_demux : ram_do_patched;
-	wire [15:0] extra_rom_data_demux = memoryAddr[0] ?
+	// Disk byte-parity select: must be dskReadAddr[0], NOT memoryAddr[0] (which
+	// is dskReadAddr[1] after the >>1 word conversion drops bit 0). See the long
+	// note at the matching demux in MacLC.sv — the old bit selected the wrong
+	// byte on odd addresses and corrupted every floppy sector. Keep in sync.
+	wire dsk_byte_odd = dskReadAckExt ? dskReadAddrExt[0] : dskReadAddrInt[0];
+	wire [15:0] extra_rom_data_demux = dsk_byte_odd ?
 						   {ram_do_raw[7:0],ram_do_raw[7:0]}:{ram_do_raw[15:8],ram_do_raw[15:8]};
 
 	sim_ram ram

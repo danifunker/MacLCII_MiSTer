@@ -1126,6 +1126,8 @@ module emu
 		// floppy disk interface
 		.insertDisk({dsk_ext_ins, dsk_int_ins}),
 		.diskSides({dsk_ext_ds, dsk_int_ds}),
+		.diskMFM({dsk_ext_mfm, dsk_int_mfm}),
+		.diskHD({dsk_ext_hd, dsk_int_hd}),
 		.diskEject(diskEject),
 		.dskReadAddrInt(dskReadAddrInt),
 		.dskReadAckInt(dskReadAckInt),
@@ -1182,6 +1184,8 @@ module emu
 	// good floppy image sizes are 819200 bytes and 409600 bytes
 	reg dsk_int_ds, dsk_ext_ds;
 	reg dsk_int_ss, dsk_ext_ss;  // single sided image inserted
+	reg dsk_int_mfm, dsk_ext_mfm;  // MFM-format image (ISM/SWIM path): 720K or 1.44MB
+	reg dsk_int_hd,  dsk_ext_hd;   // 1.44MB HD (vs 720K DD)
 
 	// DiskCopy 4.2 (.dsk/.image) support: an 84-byte (42-word) header precedes
 	// the raw logical-order sector data (tags trail the data; they land past
@@ -1193,27 +1197,32 @@ module emu
 	// of a bootable HFS floppy is 'L' (76 > 63) or $00 for blank media.
 	reg dc42_name_ok;
 	reg dc42_skip;
+	reg [7:0] dc42_disk_format;  // DC42 byte 0x50: 0=400K GCR,1=800K GCR,2=720K MFM,3=1440K MFM
 
 	// any known type of disk image inserted?
-	wire dsk_int_ins = dsk_int_ds || dsk_int_ss;
-	wire dsk_ext_ins = dsk_ext_ds || dsk_ext_ss;
+	wire dsk_int_ins = dsk_int_ds || dsk_int_ss || dsk_int_mfm;
+	wire dsk_ext_ins = dsk_ext_ds || dsk_ext_ss || dsk_ext_mfm;
 	// at the end of a download latch file size
 	// diskEject is set by macos on eject
 	always @(posedge clk_sys) begin
 		reg old_down;
 		old_down <= dio_download;
 		if(old_down && ~dio_download && dio_index == 1) begin
-			// raw sizes, plus DC42 sizes (header 42 + data + optional 12B/sector tags)
-			dsk_int_ds <= (dio_addr == 409600) ||
-			              (dc42_skip && (dio_addr == 409642 || dio_addr == 419242));
-			// double sides disk, addr counts words, not bytes
-			dsk_int_ss <= (dio_addr == 204800) ||
-			              (dc42_skip && (dio_addr == 204842 || dio_addr == 209642));
+			// GCR (IWM path) — raw word count, or DC42 disk_format byte (rusty-backup
+			// dc42.rs: 0x50 = 0/1/2/3 = 400G/800G/720M/1440M, authoritative + tag-agnostic).
+			dsk_int_ds  <= (dio_addr == 409600) || (dc42_skip && dc42_disk_format == 8'd1);
+			dsk_int_ss  <= (dio_addr == 204800) || (dc42_skip && dc42_disk_format == 8'd0);
+			// MFM (ISM path): 720K DD (368640 words) / 1.44MB HD (737280 words)
+			dsk_int_mfm <= (dio_addr == 368640) || (dio_addr == 737280) ||
+			               (dc42_skip && (dc42_disk_format == 8'd2 || dc42_disk_format == 8'd3));
+			dsk_int_hd  <= (dio_addr == 737280) || (dc42_skip && dc42_disk_format == 8'd3);
 		end
 
 		if(diskEject[0]) begin
 			dsk_int_ds <= 0;
 			dsk_int_ss <= 0;
+			dsk_int_mfm <= 0;
+			dsk_int_hd <= 0;
 		end
 	end	
 
@@ -1222,16 +1231,18 @@ module emu
 
 		old_down <= dio_download;
 		if(old_down && ~dio_download && dio_index == 2) begin
-			dsk_ext_ds <= (dio_addr == 409600) ||
-			              (dc42_skip && (dio_addr == 409642 || dio_addr == 419242));
-			// double sided disk, addr counts words, not bytes
-			dsk_ext_ss <= (dio_addr == 204800) ||
-			              (dc42_skip && (dio_addr == 204842 || dio_addr == 209642));
+			dsk_ext_ds  <= (dio_addr == 409600) || (dc42_skip && dc42_disk_format == 8'd1);
+			dsk_ext_ss  <= (dio_addr == 204800) || (dc42_skip && dc42_disk_format == 8'd0);
+			dsk_ext_mfm <= (dio_addr == 368640) || (dio_addr == 737280) ||
+			               (dc42_skip && (dc42_disk_format == 8'd2 || dc42_disk_format == 8'd3));
+			dsk_ext_hd  <= (dio_addr == 737280) || (dc42_skip && dc42_disk_format == 8'd3);
 		end
 
 		if(diskEject[1]) begin
 			dsk_ext_ds <= 0;
 			dsk_ext_ss <= 0;
+			dsk_ext_mfm <= 0;
+			dsk_ext_hd <= 0;
 		end
 	end
 
@@ -1254,7 +1265,9 @@ module emu
 				if (dio_addr[19:0] == 20'd0) begin
 					dc42_skip    <= 1'b0;
 					dc42_name_ok <= (ioctl_data[7:0] >= 8'd1) && (ioctl_data[7:0] <= 8'd63);
-				end else if (dio_addr[19:0] == 20'd41 && dc42_name_ok && ioctl_data == 16'h0001)
+				end else if (dio_addr[19:0] == 20'd40)
+					dc42_disk_format <= ioctl_data[7:0];  // byte 0x50 (low byte of word 40)
+				else if (dio_addr[19:0] == 20'd41 && dc42_name_ok && ioctl_data == 16'h0001)
 					dc42_skip <= 1'b1;
 			end
 			dio_data <= {ioctl_data[7:0], ioctl_data[15:8]};
@@ -1302,7 +1315,20 @@ module emu
 	// during rom/disk download ffff is returned so the screen is black during download
 	// "extra rom" is used to hold the disk image. It's expected to be byte wide and
 	// we thus need to properly demultiplex the word returned from sdram in that case
-	wire [15:0] extra_rom_data_demux = memoryAddr[0]?
+	// Disk image is packed 2 bytes per SDRAM word (download byte-swaps so the
+	// EVEN file byte is the high lane, the ODD byte the low lane). The byte to
+	// return is picked by the disk byte-address parity bit, dskReadAddr[0] —
+	// but the word-address conversion in addrController (`+ dskReadAddr[21:1]`)
+	// DROPS bit 0, so `memoryAddr[0]` here is really dskReadAddr[1] and selected
+	// the wrong byte on every odd address: reads came back 0,0,3,3,4,4,7,7,…
+	// (each odd byte duplicated, its even partner skipped), shredding the GCR
+	// data field so every sector failed checksum ("drive responds, data
+	// unreadable"). Select on the live parity bit of whichever drive is being
+	// serviced; the track encoder holds dskReadAddr stable across the whole
+	// fetch window, so the live bit is coherent with the returning word. Keep in
+	// sync with verilator/sim.v.
+	wire dsk_byte_odd = dskReadAckExt ? dskReadAddrExt[0] : dskReadAddrInt[0];
+	wire [15:0] extra_rom_data_demux = dsk_byte_odd?
 							 {sdram_out[7:0],sdram_out[7:0]}:{sdram_out[15:8],sdram_out[15:8]};
 	wire [15:0] sdram_out;
 

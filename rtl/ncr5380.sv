@@ -352,13 +352,19 @@ module ncr5380
 		end else begin
 			old_rst_rd <= rst_rd;
 			pmatch_d   <= bsr_pmatch;
-			if (!mr[`MR_DMA_MODE])
-				dma_armed <= 1'b0;
-			else if (reg_wr && (bus_rs == `WREG_DMAS || bus_rs == `WREG_IDMAR))
+			// Completion-IRQ latch — fixes the System 7 "Welcome" wedge. Keep
+			// dma_armed across a DMA-mode clear and latch the IRQ on the target's
+			// DATA->STATUS phase-mismatch regardless of MR.DMA_MODE (the real 5380
+			// latches EOP/phase-mismatch in HW). The driver often clears DMA mode
+			// just before the phase change; the old MR.DMA_MODE-gated latch dropped
+			// the IRQ and the HD SC 4.3 async path slept on a completion that never
+			// came (ParamBlockRec.ioResult never cleared). Cleared on the latch, a
+			// reg-7 read, or bus reset.
+			if (reg_wr && (bus_rs == `WREG_DMAS || bus_rs == `WREG_IDMAR))
 				dma_armed <= 1'b1;
 			if (~old_rst_rd & rst_rd)
 				irq_latch <= 1'b0;
-			if (mr[`MR_DMA_MODE] && dma_armed && pmatch_d && !bsr_pmatch) begin
+			if (dma_armed && pmatch_d && !bsr_pmatch) begin
 				irq_latch <= 1'b1;
 				dma_armed <= 1'b0;
 			end
