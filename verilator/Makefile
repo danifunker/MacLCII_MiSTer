@@ -63,8 +63,6 @@ CC_OPT =
 V_SRC = \
 	sim.v \
 	sim_ram.v \
-	$(RTL)/tg68k/TG68K_ALU.v \
-	$(RTL)/tg68k/TG68K_Pack.sv \
 	$(RTL)/tg68k/TG68KdotC_Kernel.v \
 	$(RTL)/tg68k/tg68k.v \
 	$(RTL)/addrController_top.v \

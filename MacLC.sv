@@ -714,7 +714,7 @@ module emu
 		.reset      ( !_cpuReset ),
 		.phi1       ( cpu_en_p  ),
 		.phi2       ( cpu_en_n  ),
-		.cpu        ( {status_cpu[1], |status_cpu} ),
+		.cpu        ( 2'b10 ),  // 68030 (Mac LC II); old selectable form: {status_cpu[1], |status_cpu}
 
 		.dtack_n    ( _cpuDTACK  ),
 		.rw_n       ( tg68_rw    ),

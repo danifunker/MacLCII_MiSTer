@@ -233,7 +233,7 @@ end
 		.IPL_autovector ( 1'b0          ),
 		.berr           ( berr_held     ),
 		.clr_berr       ( /*tg68_clr_berr*/ ),
-		.CPU            ( cpu           ), // 00->68000  01->68010  11->68020(only some parts - yet)
+		.CPU            ( cpu           ), // 00->68000  01->68010  10->68030 (PMMU+caches, 030_mmu branch)
 		.addr_out       ( tg68_addr     ),
 		.data_write     ( dout          ),
 		.nUDS           ( tg68_uds_n    ),
@@ -242,7 +242,23 @@ end
 		.busstate       ( tg68_busstate ), // 00-> fetch code 10->read data 11->write data 01->no memaccess
 		.longword       ( longword      ),
 		.nResetOut      ( reset_n       ),
-		.FC             ( fc            )
+		.FC             ( fc            ),
+
+		// 68030 PMMU table-walker memory interface. Tied off here: the Mac LC
+		// bus wrapper does not (yet) serve descriptor fetches, so paged MMU
+		// translation is unavailable and the PMMU passes addresses through
+		// (identity / transparent translation), which is what classic Mac OS
+		// uses for early LC II boot. Wire these to a memory arbiter to enable
+		// full page-table walking (see TG68K.C README "Integration notes").
+		.pmmu_walker_ack  ( 1'b0   ),
+		.pmmu_walker_data ( 32'h0  ),
+		.pmmu_walker_berr ( 1'b0   )
+
+		// All other new 030 ports (skipFetch, regin_out, CACR_out, VBR_out,
+		// cache_*/cacr_*, pmmu_reg_*/pmmu_addr_*, pmmu_walker_req/we/addr/wdat,
+		// cache_op_addr and the debug_* bus) are outputs left intentionally
+		// unconnected. The on-chip caches (TG68K_Cache_030) are not instantiated
+		// in this wrapper; the kernel runs uncached via the normal Mac bus.
 	);
 
 	`ifdef VERBOSE_TRACE
