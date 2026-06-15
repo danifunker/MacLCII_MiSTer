@@ -71,6 +71,12 @@ reg  [31:0] pmmu_walker_data;
 wire        pmmu_walker_berr = 1'b0;   // walker bus errors unreported (PMMU has a 500-cycle timeout)
 wire [15:0] tg68_dout_k;               // kernel data_write, muxed with walker write data
 
+// Kernel bus-error status (from the kernel's debug outputs). Used by the berr
+// hold logic below to release the held berr the instant the kernel latches the
+// fault, so the 030 double-bus-fault detector doesn't see the same fault twice.
+wire        kernel_make_berr;
+wire        kernel_trap_berr;
+
 reg         walk_cycle;   // 1 = a walker word transfer is borrowing the bus
 reg         walk_word;    // 0 = high word @addr, 1 = low word @addr+2
 reg  [15:0] walk_hi;      // captured high word (big-endian: bits 31:16)
@@ -251,18 +257,24 @@ end
 	// is gated on AS being asserted, but AS deasserts at s_state 6 while the kernel
 	// only samples berr at s_state 7 (when tg68_clkena pulses). Without holding it,
 	// the kernel sees berr=0 at the sample point and never latches make_berr, so the
-	// bus-error exception is missed. Latch berr for the duration of the cycle and
-	// clear it at the next cycle boundary (s_state 0).
+	// bus-error exception is missed. Latch berr for the duration of the cycle.
+	//
+	// CRITICAL for the 68030 kernel: release the hold as soon as the kernel latches
+	// the fault (make_berr) or starts the trap (trap_berr). Otherwise the held berr
+	// is still asserted when the kernel enters its bus-error exception window
+	// (berr_exception_active), where it re-samples make_berr and mistakes the SAME
+	// fault for a *second* one -> double bus fault -> cpu_halted. (The old 68000/020
+	// kernel had no double-fault detector, so holding to s_state 0 was harmless.)
 	reg berr_hold;
 	always @(posedge clk) begin
 		if (reset)
 			berr_hold <= 1'b0;
-		else if (phi1 && s_state == 0)
+		else if (kernel_make_berr || kernel_trap_berr || (phi1 && s_state == 0))
 			berr_hold <= 1'b0;
 		else if (berr)
 			berr_hold <= 1'b1;
 	end
-	wire berr_held = berr | berr_hold;
+	wire berr_held = (berr | berr_hold) & ~(kernel_make_berr | kernel_trap_berr);
 
 	TG68KdotC_Kernel tg68k (
 		.clk            ( clk           ),
@@ -292,7 +304,12 @@ end
 		.pmmu_walker_wdat ( pmmu_walker_wdat ),
 		.pmmu_walker_ack  ( pmmu_walker_ack  ),
 		.pmmu_walker_data ( pmmu_walker_data ),
-		.pmmu_walker_berr ( pmmu_walker_berr )
+		.pmmu_walker_berr ( pmmu_walker_berr ),
+
+		// Bus-error status used by the berr-hold release logic above (prevents a
+		// spurious 030 double bus fault on the ROM's FC=7 MOVES probe).
+		.debug_make_berr ( kernel_make_berr ),
+		.debug_trap_berr ( kernel_trap_berr )
 
 		// All other new 030 ports (skipFetch, regin_out, CACR_out, VBR_out,
 		// cache_*/cacr_*, pmmu_reg_*/pmmu_addr_*, cache_op_addr and the debug_*
