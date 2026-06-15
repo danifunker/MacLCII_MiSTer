@@ -86,18 +86,23 @@ module addrDecoder(
                                   (ram_config_phys[7:6] == 2'b10) ? 24'h400000 :  // 4MB
                                                                     24'h800000;   // 8MB
 
-    // Motherboard RAM placement (match MAME v8.cpp ram_size()): the 2MB
-    // motherboard RAM is ALWAYS installed at mb_location, which sits directly
-    // after any SIMM (mb_location = SIMM size). With no SIMM (config[7:6]=00)
-    // the motherboard RAM lands at $000000-$1FFFFF. It is additionally
-    // mirrored at $800000-$9FFFFF (the always-present V8 image). Only the 8MB
-    // SIMM config (config[7:6]=11) drops the low motherboard placement.
+    // Motherboard RAM placement (match MAME v8.cpp ram_size()): the soldered
+    // motherboard RAM (mb_size: 2MB or 4MB) is ALWAYS installed at mb_location,
+    // which sits directly after any SIMM (mb_location = SIMM size). With no SIMM
+    // (config[7:6]=00) the motherboard RAM lands at $000000-$1FFFFF (2MB) or
+    // $000000-$3FFFFF (4MB, LC II base). Its first 2MB is additionally mirrored
+    // at $800000-$9FFFFF (the always-present V8 image). Only the 8MB SIMM config
+    // (config[7:6]=11) drops the low motherboard placement.
     wire [23:0] mb_location = simm_byte_size;          // == 0 when no SIMM
     wire        mb_present  = (ram_config[7:6] != 2'b11);
+    // Soldered motherboard-bank size (V8 config bit5: 0 = 4MB, 1 = 2MB). The
+    // LC II solders 4MB; the LC and the 2MB/10MB configs are 2MB. Taken from the
+    // PHYSICAL config so it is stable across the ROM's transient config writes.
+    wire [23:0] mb_size     = (ram_config_phys[5] == 1'b0) ? 24'h400000 : 24'h200000;
 
     // Valid RAM ranges:
     //   SIMM:            $000000 to simm_byte_size-1 (only if SIMM present)
-    //   Motherboard low: [mb_location, mb_location+2MB) (the soldered 2MB)
+    //   Motherboard low: [mb_location, mb_location+mb_size) (the soldered 2MB/4MB)
     //   Motherboard high:$800000-$9FFFFF (always-present 2MB mirror)
     wire in_simm_range = (ram_config_phys[7:6] != 2'b00) && (address[23:0] < simm_byte_size);
     // The motherboard-low mirror (e.g. $0-$1FFFFF when no SIMM) is gated on
@@ -109,7 +114,7 @@ module addrDecoder(
     // gated: for SIMM configs MAME maps the real SIMM at $0 during enumeration.)
     wire in_motherboard_low = ram_configured && mb_present &&
                               (address[23:0] >= mb_location) &&
-                              (address[23:0] <  (mb_location + 24'h200000));
+                              (address[23:0] <  (mb_location + mb_size));
     wire in_motherboard_range = (address[23:21] == 3'b100);  // $800000-$9FFFFF
 
     always @(*) begin

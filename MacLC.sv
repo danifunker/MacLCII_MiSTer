@@ -68,7 +68,7 @@ module emu
 		"OCD,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
 		"OA,Monitor,640x480 VGA,512x384 12in RGB;",
 		"-;",
-		"O4,Memory,2MB,10MB;",
+		"O23,Memory,4MB,2MB,10MB;",
 		"-;",
 		"R5,Interrupt (NMI / MacsBug);",
 		"R6,Reset PRAM & Core;",
@@ -107,7 +107,7 @@ module emu
 	reg rom_loaded = 1'b0;
 	always @(posedge clk_sys) if (dio_download && dio_index == 0) rom_loaded <= 1'b1;
 
-	reg       status_mem = 1'b1;
+	reg [1:0] status_mem = 2'b00;        // latched memory selection (status[3:2])
 	localparam [1:0] status_cpu = 2'b10; // 68020
 	reg       n_reset = 0;
 	reg       pram_force_reset = 1'b0;  // "Reset PRAM & Core" -> system reset pulse
@@ -134,7 +134,7 @@ module emu
 			end
 			else if(rst_cnt) begin
 				rst_cnt    <= rst_cnt - 1'd1;
-				status_mem <= status[4];
+				status_mem <= status[3:2];
 			end
 			else begin
 				n_reset <= 1;
@@ -395,21 +395,21 @@ module emu
 	assign AUDIO_S = 1;
 	assign AUDIO_MIX = 0;
 
-	// Mac LC memory configuration
+	// Mac LC II memory configuration
 	// V8 RAM config byte (MAME encoding):
 	//   Bits 7:6 = SIMM bank A size (00=0MB, 01=2MB, 10=4MB, 11=8MB)
 	//   Bit 5 = Motherboard bank B (0=4MB, 1=2MB)
 	//   Bit 2 = Always set on read (handled in pseudovia)
-	// The Mac LC has 2MB soldered (bank B, bit5=1) plus TWO 30-pin SIMM sockets
-	// (bank A). The V8 reports bank A as a single linear size; "8MB" bank A is
-	// physically two 4MB SIMMs. Populated configs:
-	//   2MB  = $24  (2MB board, no SIMMs)
-	//   4MB  = $64  (2MB board + 2MB SIMM bank A)
-	//   6MB  = $A4  (2MB board + 4MB SIMM bank A)
-	//   10MB = $E4  (2MB board + 4MB + 4MB SIMMs => 8MB bank A)
-	// NOTE: currently only the 2MB config is validated against MAME (-ramsize 2M).
-	// The 10MB path is not yet verified — see docs and addrController_top.v.
-	wire [7:0] configRAMSize = status[4] ? 8'hE4 : 8'h24; // 1=10MB (2MB board + 4MB+4MB SIMM), 0=2MB (board only)
+	// The Mac LC II solders 4MB (bank B, bit5=0); MAME's maclc2 sets baseram_is_4M.
+	// Supported menu configs (status[3:2]):
+	//   4MB  = $04  (4MB board, no SIMM)            <- LC II base / default
+	//   2MB  = $24  (2MB board, no SIMM)            <- 2MB-board fallback
+	//   10MB = $E4  (2MB board used + 8MB SIMM)     <- bank B forced to 2MB (MAME)
+	// NOTE: the 10MB path is not yet verified against MAME (-ramsize 10M); only
+	// the base configs are exercised. See docs and addrController_top.v.
+	wire [7:0] configRAMSize = (status[3:2] == 2'b00) ? 8'h04 :  // 4MB (LC II base)
+	                           (status[3:2] == 2'b01) ? 8'h24 :  // 2MB
+	                                                    8'hE4;   // 10MB
 	wire [7:0] pvia_ram_config_out;   // Active RAM config from pseudovia
 	wire       pvia_ram_configured;   // ROM has programmed V8 RAM config ($0 mirror enable)
 				  

@@ -63,3 +63,13 @@ verilator/sim_stdout.log
 # python tooling artifacts
 __pycache__/
 *.pyc
+
+# repo-root runtime / build scratch (sim + MiSTer state — not source)
+/build_stdout.log
+/build_stderr.log
+/all2bpp.txt
+/cfg/
+/nvram/
+/snap/
+/diff/
+/.claude/

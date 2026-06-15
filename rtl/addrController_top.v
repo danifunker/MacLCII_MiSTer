@@ -136,7 +136,9 @@ module addrController_top(
 	// All outputs are 23-bit SDRAM word addresses
 	//
 	// SDRAM Layout (word addresses):
-	//   $000000-$0FFFFF  Motherboard RAM (2MB)
+	//   $000000-$0FFFFF  Motherboard RAM (2MB; 4MB on the LC II base config, where
+	//                    it extends to $1FFFFF into the otherwise-unused low SIMM
+	//                    window — the 4MB-base config never populates a SIMM)
 	//   $100000-$4FFFFF  SIMM RAM (up to 8MB)
 	//   $500000-$53FFFF  ROM (512KB)
 	//   $580000-$5BFFFF  VRAM (512KB)
@@ -168,16 +170,24 @@ module addrController_top(
 	// CPU byte addr -> word addr
 	wire [21:0] cpu_word = cpuAddr[22:1];
 
-	// Motherboard mirror offset: (cpu_word - simm_words) mod 2MB
+	// Soldered motherboard-bank size from V8 config bit5 (MAME v8.cpp: 0 = 4MB,
+	// 1 = 2MB). The LC II solders 4MB (configRAMSize bit5=0); the LC, and the
+	// LC II's 2MB/10MB configs, are 2MB (bit5=1). Only the 4MB-base, no-SIMM
+	// config exercises the wider wrap — for it the motherboard's upper 2MB lands
+	// in the (unused) low SIMM SDRAM window, so there is no aliasing.
+	wire board_is_4M = (ram_config_phys[5] == 1'b0);
+
+	// Motherboard mirror offset: (cpu_word - simm_words) mod board size
 	// (dead when the SIMM fills the whole lower bank, e.g. 8MB, but kept width-clean)
 	wire [22:0] mb_mirror_offset_raw = {1'b0, cpu_word} - simm_word_size;
-	wire [19:0] mb_mirror_offset = mb_mirror_offset_raw[19:0];  // Wrap to 2MB (1M words)
+	wire [20:0] mb_mirror_offset = board_is_4M ? mb_mirror_offset_raw[20:0]         // Wrap to 4MB (2M words)
+	                                           : {1'b0, mb_mirror_offset_raw[19:0]}; // Wrap to 2MB (1M words)
 
 	// V8 RAM translation to SDRAM word address
 	wire [22:0] ram_sdram_word =
 		motherboard_high ? {3'b000, cpuAddr[20:1]} :                          // → Motherboard at SDRAM $000000
 		in_simm          ? (23'h100000 + {1'b0, cpu_word}) :                  // → SIMM at SDRAM $100000+
-		                   {3'b000, mb_mirror_offset};                        // → Motherboard mirror at SDRAM $000000+
+		                   {2'b00, mb_mirror_offset};                         // → Motherboard mirror at SDRAM $000000+
 
 	// ROM translation: SDRAM word $500000 + offset within 512KB
 	wire [22:0] rom_sdram_word = {5'b10100, cpuAddr[18:1]};  // $500000 + offset
