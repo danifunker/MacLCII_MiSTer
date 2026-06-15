@@ -78,7 +78,15 @@ parameter [2:0] ID = 0;
 // docs/findings_scsi_dma_stall_offline_2026-06-14.md). RING_LOG=1 reproduces the
 // original two-sector double buffer exactly. WRITES are unchanged: they stay on
 // the original two-slot double buffer (slots 0/1) regardless of RING_LOG.
-parameter  RING_LOG    = 3;             // log2(sectors); 3 => 8-sector read ring
+parameter  RING_LOG    = 5;             // log2(sectors); 5 => 32-sector / 16KB read ring
+                                        // (was 3/8-sector; deepened 2026-06-15 for the #2
+                                        // heavy-read stall: cold 7.5.5 extension loading drains
+                                        // the ring faster than the HPS refills -> pseudo-DMA
+                                        // stall -> driver I/O fail. 32 sectors hides more HPS
+                                        // latency. RING_LOG=6 (32KB) needs 600 M10K > 553 avail
+                                        // (cache = 3 mirror RAMs x 2 buffers x 2 disks); 5 fits
+                                        // at ~504/553. For >16KB, drop the look-ahead mirror
+                                        // RAMs (ram_c/ram_d) -> ~1/3 the M10K -> room for 48KB+.)
 localparam RING_BLOCKS = 1 << RING_LOG; // sectors buffered for reads
 localparam BUF_AW      = 8 + RING_LOG;  // dpram word-address width (256 words/sector)
 

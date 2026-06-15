@@ -6,6 +6,17 @@ see the companion handoff `docs/handoff_cold_boot_reboot_2026-06-15.md`.*
 
 ---
 
+> **⚠️ 2026-06-15 LATE CORRECTION (read first).** The §3.3/§4 hypothesis that a marginal
+> **`TimeDBRA`-gated poll timeout** vs. target/HPS latency causes #3 has been **DISPROVEN by direct
+> measurement**: a JTAG latch read **`TimeDBRA ($0B24) = 781` (NORMAL)**, and over a *full-length*
+> poll the CPU read the SCSI CSR 255+ times seeing **BSY=0 every time while the boot disk held
+> CMD_IN/BSY=1** (JTAG-confirmed). So the target responds correctly and the poll is not degenerate —
+> **#3 is the CPU's VPA read of the SCSI status register marginally failing to observe `scsi_bsy`**
+> (a fit-sensitive timing/signal path; STA reports MET but it fails in HW). Registering the CSR/BSR
+> read did not help. The fix targets the SCSI status-read path (constraint/register/restructure), not
+> the timeout. Full detail + the (separate, FIXED) #2 prefetch-ring deepening are in
+> `docs/handoff_cold_boot_reboot_2026-06-15.md` (top section). Treat §3.3/§4 below as superseded.
+
 ## 1. Summary
 
 On a **cold** boot the Mac LC core intermittently **reboots itself once, right at

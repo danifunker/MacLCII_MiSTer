@@ -8,6 +8,53 @@ this handoff is the action plan).*
 
 ---
 
+## ★ 2026-06-15 LATE UPDATE — TimeDBRA theory DEAD; #3 is a marginal SCSI status-READ
+
+Later probe builds this day **overturned the leading hypothesis** below and re-aimed the fix:
+
+- **`TimeDBRA ($0B24)` measured = 781 (0x30D) — NORMAL, not ~0.** A JTAG latch on the word the
+  SCSI poll reads from `$0B24` proved the poll runs its **full** length ⟹ **"root #1: TimeDBRA
+  miscalibrated" is DEAD.** The poll is not degenerate. (`cmd_cyc=1` earlier was a red herring —
+  the `btst`/`dbne` poll doesn't re-fetch `$A0786A` each iteration.)
+- **#3 = the CPU's read of the SCSI status register failing to observe BSY.** Over a full-length
+  poll the CPU read CSR (`$F10040`) **255+ times and saw BSY=0 every time**, while the JTAG showed
+  the boot disk **holding CMD_IN with BSY=1** the whole time. The boot-disk hardware is fine; the
+  CPU's **VPA read of `scsi_bsy` marginally fails** (bit1/`scsi_sel` reads right, bit6/`scsi_bsy`
+  wrong, in the *same* read). STA reports MET (worst slack +0.22–0.44 ns) yet it fails in HW and is
+  **extremely fit-sensitive** — a marginal timing / signal-integrity path on the long combinational
+  VPA read (target FSM → 8-way peripheral mux → CPU `din`), NOT a logic bug.
+- **Ruled out this session:** write-path / mount-WRITE (cmd_write=0, pre-pseudo-DMA); CPU SCSI IRQ
+  (tied 0, completion is polled); BERR (dead); and a **combinational read-hazard** — registering the
+  CSR/BSR reads in ncr5380 had **zero** effect on the symptom (slack even improved), so the
+  divergence is upstream or it's the VPA sampling itself.
+- **Tried & reverted: core-side late-mount** (gate the target's selection on a ~6 s post-cold-reset
+  timer, automating the user's empty-then-assign trick). Test was inconclusive (no disk attached
+  during the `load_core` boot). Reverted to baseline.
+- **User HW workaround:** boot with the slot EMPTY, assign the disk at the "?" phase → boots (works
+  for 6.0.8; 7.1/7.5.5 reboot before reaching "?", so untested there).
+
+**Fix direction (open — next session):** make the SCSI **status-read** robust. The VPA peripheral
+read is sampled at the slow E-edge (≈CPU/20), so it does **not** need single-cycle timing — yet
+`MacLC.sdc` deliberately leaves CPU↔peripheral paths single-cycle ("must stay single-cycle"). Options:
+(a) a correct multicycle/false-path constraint on the peripheral-read → CPU-`din` path; (b) latch the
+SCSI peripheral read into a register like RAM/ROM uses `cpu_data` (note: registering *csr* alone did
+NOT help — the divergence is upstream or it's the VPA sample point); (c) shorten the 8-way mux. The
+diagnostic probes tap `scsi_bsy` and add fanout that can **worsen** this read (observer effect), so
+clean baseline-probe builds may behave better — consistent with 7.5.5 booting on the clean RING_LOG=5
+build. Probe deck is reverted to baseline (PRST/PRC0/PRT/PFR); the SER/CMP findings are documented
+here + in memory `cold-boot-reboot-welcome-handoff`.
+
+**#2 (separate, FIXED this day):** the heavy-read I/O stall (cold 7.5.5 extension loading) was cleared
+by deepening the read-prefetch ring `RING_LOG` **3→5** (8→32 sectors = **16 KB/disk**). HW-validated
+2026-06-15: **7.5.5 boots to the Finder desktop, extensions load, Tattle Tech 2.8x runs.**
+`PSDT max_stall` = 8.3 ms (moderate; `berr_fires=0`, no deep stall), `bus_resets=1`. M10K is the hard
+limit: `RING_LOG=6` (32 KB) needs **600 M10K > 553** available (Fitter Error 170048); `RING_LOG=5` ≈
+527/553. For >16 KB, drop the `ram_c`/`ram_d` look-ahead mirror RAMs (≈⅓ the M10K). Note the 8.3 ms
+worst stall is the cold HPS first-sector fetch latency (same on 4 KB and 16 KB) — a deeper ring lowers
+stall *frequency*, not that floor. See memory `scsi-dma-stall-offline-analysis`.
+
+---
+
 ## TL;DR — what we know
 
 **Symptom (user, HW-precise):** chime → basic init → mouse → Happy Mac →
