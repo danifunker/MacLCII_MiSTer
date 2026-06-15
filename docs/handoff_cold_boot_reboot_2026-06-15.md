@@ -183,9 +183,8 @@ PSCW/PSNC/PSWL/PSC6/PVID) + SCSI stall (PSDT/PSDS/PSD2-3) + **#3 probes**:
 
 ## Git
 Branch `fix-os7-scsi-welcome-wedge`. #2 SCSI-prefetch fix committed (`1a732bf`);
-the #3 probe RTL (PRST/PRC0/PRT, removed PBER/PRIN) is **uncommitted** working-tree
-scaffolding (diagnostic — keep or revert once #3 is fixed). User merges PRs
-themselves.
+the #3 diagnostic probes (PRST/PRC0/PRT) + these docs committed (`1530824`,
+diagnostic-only — keep or revert once #3 is fixed). User merges PRs themselves.
 
 ## Related memory
 `cold-boot-reboot-welcome-handoff` (this issue), `scsi-dma-stall-offline-analysis`
