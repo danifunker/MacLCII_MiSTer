@@ -62,6 +62,15 @@ HAS_MEM_CLEAR=$(echo "$TRACE_LINES" | grep -c "00A4685E" || true)
 # Check last 1000 lines for stuck loop (same PC repeated)
 LAST_UNIQUE=$(echo "$TRACE_LINES" | tail -1000 | awk '{print substr($2,1,8)}' | sort -u | wc -l | tr -d ' ')
 
+# The ASC startup-chime feeds its FIFO by POLLING FIFOSTAT in a tiny 3-4-PC wait
+# loop at $A45E3A (read $804) .. $A45E44 (jmp). That loop legitimately spins tens
+# of thousands of times per refill — MAME's maclc2 does it 792k times across the
+# chime (docs/findings_asc_chime_mame_2026-06-15.md). Stopping mid-chime (e.g.
+# --run 90; the chime spans ~frames 28-94) therefore looks like a 3-PC "LOOP"
+# even though boot is fine. Detect that case so it is not mistaken for a hang.
+LAST_PCS=$(echo "$TRACE_LINES" | tail -1000 | awk '{print substr($2,1,8)}' | sort -u | tr -d ':' | tr '\n' ' ')
+IS_CHIME_WAIT=$(echo "$LAST_PCS" | grep -c "00A45E3A" || true)
+
 echo "=== CPU Boot Progress ==="
 echo "Total instructions: $TOTAL_LINES"
 echo "First PC: $FIRST_PC"
@@ -76,7 +85,11 @@ echo "Boot stages:"
 [ "$HAS_MEM_CLEAR" -gt 0 ]   && echo "  [x] Memory clear (A4685E)"     || echo "  [ ] Memory clear (A4685E)"
 echo ""
 
-if [ "$LAST_UNIQUE" -le 3 ]; then
+if [ "$LAST_UNIQUE" -le 4 ] && [ "$IS_CHIME_WAIT" -gt 0 ]; then
+    echo "Status: CHIME WAIT (normal — in the ASC FIFO poll at \$A45E3A; the chime"
+    echo "        ends ~frame 94. Re-run with more frames, e.g. --run 150, to see"
+    echo "        boot continue past it. NOT a hang — see docs/findings_asc_chime_mame_2026-06-15.md)"
+elif [ "$LAST_UNIQUE" -le 3 ]; then
     echo "Status: LOOP (last 1000 insns only $LAST_UNIQUE unique PCs)"
 else
     echo "Status: ADVANCING ($LAST_UNIQUE unique PCs in last 1000 insns)"
