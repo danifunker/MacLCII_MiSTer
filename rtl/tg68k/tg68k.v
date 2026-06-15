@@ -40,13 +40,51 @@ module tg68k (
 );
 
 wire  [1:0] tg68_busstate;
-wire        tg68_clkena = phi1 && (s_state == 7 || tg68_busstate == 2'b01);
+// Suppress clkena while the walker is borrowing the bus so the (stalled) CPU
+// pipeline does not advance during a page-table walk.
+wire        tg68_clkena = phi1 && (s_state == 7 || tg68_busstate == 2'b01) && !walk_cycle;
 wire [31:0] tg68_addr;
 wire [15:0] tg68_din;
 reg  [15:0] tg68_din_r;
 wire        tg68_uds_n;
 wire        tg68_lds_n;
 wire        tg68_rw;
+
+// ---------------------------------------------------------------------------
+// 68030 PMMU table-walk bus master
+//
+// On an ATC miss the kernel's PMMU walks the page tables: it asserts
+// pmmu_walker_req with a 32-bit *physical* descriptor address (page tables live
+// in RAM) and waits for pmmu_walker_ack + pmmu_walker_data; pmmu_walker_we marks
+// a descriptor write-back (Used/Modified bits). While walking, the kernel forces
+// busstate="01" and deasserts UDS/LDS, so the main bus state machine below is
+// parked (s_state stays 0, AS high). We borrow the Mac 68K bus during that
+// window to transfer the 32-bit descriptor as two big-endian 16-bit cycles,
+// reusing the proven s_state timing via the eff_* overrides.
+// ---------------------------------------------------------------------------
+wire        pmmu_walker_req;
+wire        pmmu_walker_we;
+wire [31:0] pmmu_walker_addr;
+wire [31:0] pmmu_walker_wdat;
+reg         pmmu_walker_ack;
+reg  [31:0] pmmu_walker_data;
+wire        pmmu_walker_berr = 1'b0;   // walker bus errors unreported (PMMU has a 500-cycle timeout)
+wire [15:0] tg68_dout_k;               // kernel data_write, muxed with walker write data
+
+reg         walk_cycle;   // 1 = a walker word transfer is borrowing the bus
+reg         walk_word;    // 0 = high word @addr, 1 = low word @addr+2
+reg  [15:0] walk_hi;      // captured high word (big-endian: bits 31:16)
+
+wire [31:0] walk_word_addr = walk_word ? (pmmu_walker_addr | 32'd2) : (pmmu_walker_addr & ~32'd2);
+wire [15:0] walk_dout_word = walk_word ? pmmu_walker_wdat[15:0]     : pmmu_walker_wdat[31:16];
+
+// Effective bus controls: the walker drives the (otherwise parked) main bus
+// during a walk; outside a walk these are exactly the kernel's signals.
+wire [1:0]  eff_busstate = walk_cycle ? (pmmu_walker_we ? 2'b11 : 2'b10) : tg68_busstate;
+wire        eff_rw       = walk_cycle ? ~pmmu_walker_we : tg68_rw;
+wire        eff_uds_n    = walk_cycle ? 1'b0 : tg68_uds_n;
+wire        eff_lds_n    = walk_cycle ? 1'b0 : tg68_lds_n;
+wire [31:0] eff_addr     = walk_cycle ? walk_word_addr : tg68_addr;
 
 // The tg68k core doesn't reliably support mixed usage of autovector and non-autovector
 // interrupts, so the TG68K kernel switched to non-autovector interrupts, and the 
@@ -75,27 +113,27 @@ always @(posedge clk) begin
 		uds_n_r <= 1;
 		lds_n_r <= 1;
 	end else begin
-		addr <= tg68_addr;
+		addr <= eff_addr;
 
 		if (phi1) begin
 
 			if (s_state != 4) s_state <= s_state + 1'd1;
 			if (busreq_ack || bus_granted) s_state <= s_state;
-			if (tg68_busstate == 2'b01) s_state <= 0;
+			if (eff_busstate == 2'b01) s_state <= 0;
 
 			case (s_state)
-				1: if (tg68_busstate != 2'b01) begin
-					rw_r <= tg68_rw;
-					if (tg68_rw) begin
-						uds_n_r <= tg68_uds_n;
-						lds_n_r <= tg68_lds_n;
+				1: if (eff_busstate != 2'b01) begin
+					rw_r <= eff_rw;
+					if (eff_rw) begin
+						uds_n_r <= eff_uds_n;
+						lds_n_r <= eff_lds_n;
 					end
 					as_n_r <= 0;
 				end
-				3: if (tg68_busstate != 2'b01) begin
-					if (!tg68_rw) begin
-						uds_n_r <= tg68_uds_n;
-						lds_n_r <= tg68_lds_n;
+				3: if (eff_busstate != 2'b01) begin
+					if (!eff_rw) begin
+						uds_n_r <= eff_uds_n;
+						lds_n_r <= eff_lds_n;
 					end
 				end
 				7: rw_r <= 1;
@@ -104,15 +142,17 @@ always @(posedge clk) begin
 
 		end else if (phi2) begin
 
-			if (s_state != 4 || tg68_busstate == 2'b01 || !dtack_n || xVma || berr)
+			if (s_state != 4 || eff_busstate == 2'b01 || !dtack_n || xVma || berr)
 				s_state <= s_state + 1'd1;
 			if ((busreq_ack || bus_granted) && !busrel_ack) s_state <= s_state;
-			if (tg68_busstate == 2'b01) s_state <= 0;
+			if (eff_busstate == 2'b01) s_state <= 0;
 
 			case (s_state)
 
 				6: begin
-					tg68_din_r <= tg68_din;
+					// During a walk the descriptor word is captured by the walker
+					// FSM (from din); don't clobber the CPU's data_in latch.
+					if (!walk_cycle) tg68_din_r <= tg68_din;
 					uds_n_r <= 1;
 					lds_n_r <= 1;
 					as_n_r <= 1;
@@ -235,7 +275,7 @@ end
 		.clr_berr       ( /*tg68_clr_berr*/ ),
 		.CPU            ( cpu           ), // 00->68000  01->68010  10->68030 (PMMU+caches, 030_mmu branch)
 		.addr_out       ( tg68_addr     ),
-		.data_write     ( dout          ),
+		.data_write     ( tg68_dout_k   ),
 		.nUDS           ( tg68_uds_n    ),
 		.nLDS           ( tg68_lds_n    ),
 		.nWr            ( tg68_rw       ),
@@ -244,22 +284,63 @@ end
 		.nResetOut      ( reset_n       ),
 		.FC             ( fc            ),
 
-		// 68030 PMMU table-walker memory interface. Tied off here: the Mac LC
-		// bus wrapper does not (yet) serve descriptor fetches, so paged MMU
-		// translation is unavailable and the PMMU passes addresses through
-		// (identity / transparent translation), which is what classic Mac OS
-		// uses for early LC II boot. Wire these to a memory arbiter to enable
-		// full page-table walking (see TG68K.C README "Integration notes").
-		.pmmu_walker_ack  ( 1'b0   ),
-		.pmmu_walker_data ( 32'h0  ),
-		.pmmu_walker_berr ( 1'b0   )
+		// 68030 PMMU table-walker memory interface — wired to the Mac bus via the
+		// walker bus master below, so page-table walks read/write real RAM.
+		.pmmu_walker_req  ( pmmu_walker_req  ),
+		.pmmu_walker_we   ( pmmu_walker_we   ),
+		.pmmu_walker_addr ( pmmu_walker_addr ),
+		.pmmu_walker_wdat ( pmmu_walker_wdat ),
+		.pmmu_walker_ack  ( pmmu_walker_ack  ),
+		.pmmu_walker_data ( pmmu_walker_data ),
+		.pmmu_walker_berr ( pmmu_walker_berr )
 
 		// All other new 030 ports (skipFetch, regin_out, CACR_out, VBR_out,
-		// cache_*/cacr_*, pmmu_reg_*/pmmu_addr_*, pmmu_walker_req/we/addr/wdat,
-		// cache_op_addr and the debug_* bus) are outputs left intentionally
-		// unconnected. The on-chip caches (TG68K_Cache_030) are not instantiated
-		// in this wrapper; the kernel runs uncached via the normal Mac bus.
+		// cache_*/cacr_*, pmmu_reg_*/pmmu_addr_*, cache_op_addr and the debug_*
+		// bus) are outputs left intentionally unconnected. The on-chip caches
+		// (TG68K_Cache_030) are not instantiated; the kernel runs uncached.
 	);
+
+	// Drive the Mac data bus from the walker during descriptor write-backs,
+	// otherwise from the kernel.
+	assign dout = walk_cycle ? walk_dout_word : tg68_dout_k;
+
+	// Walker control FSM: sequence two 16-bit transfers per 32-bit descriptor.
+	// Starts only when the kernel requests a walk AND the main bus is parked
+	// (busstate="01" while pmmu_busy), guaranteeing no conflict with a CPU cycle.
+	always @(posedge clk) begin
+		if (reset) begin
+			walk_cycle       <= 1'b0;
+			walk_word        <= 1'b0;
+			walk_hi          <= 16'h0;
+			pmmu_walker_ack  <= 1'b0;
+			pmmu_walker_data <= 32'h0;
+		end else begin
+			pmmu_walker_ack <= 1'b0;   // single-cycle ack pulse
+
+			if (!walk_cycle) begin
+				if (pmmu_walker_req && !pmmu_walker_ack &&
+				    s_state == 3'd0 && tg68_busstate == 2'b01) begin
+					walk_cycle <= 1'b1;
+					walk_word  <= 1'b0;   // high word first
+				end
+			end else begin
+				// Capture the read word at the data phase (s_state 6, phi2).
+				if (phi2 && s_state == 3'd6) begin
+					if (!walk_word) walk_hi          <= din;
+					else            pmmu_walker_data <= {walk_hi, din};
+				end
+				// Word transfer completes at s_state 7 (phi1).
+				if (phi1 && s_state == 3'd7) begin
+					if (!walk_word) begin
+						walk_word <= 1'b1;        // proceed to low word
+					end else begin
+						walk_cycle      <= 1'b0;  // descriptor done
+						pmmu_walker_ack <= 1'b1;  // data already latched at s_state 6
+					end
+				end
+			end
+		end
+	end
 
 	`ifdef VERBOSE_TRACE
 	always @(posedge clk) begin
