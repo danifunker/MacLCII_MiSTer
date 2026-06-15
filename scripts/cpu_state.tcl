@@ -157,6 +157,61 @@ if {[info exists idx(PSDT)]} {
         [expr {($sd>>24)&0xFF}] $mx [expr {$mx / 32500.0}]]
 }
 
+# ---- PRC0 / PRT1-3: #3 reboot isolation (SCSI-abort trail + init entry) -------
+# busrst = # of SCSI bus resets (driver aborts). sr2700 = # of boot-inits seen by
+# opcode (move #$2700,sr; cold boot = 1, +1 if the reboot re-runs SR setup).
+# When trail_frozen: PRT1/PRT2 = the 2 PCs at the 2nd SCSI bus reset (the driver
+# abort path — disassemble these). PRT3 = the latest boot-init entry PC (where
+# init re-enters). Disassemble all three against boot0.rom (off = addr & 0x7FFFF).
+if {[info exists idx(PRC0)]} {
+    set c [rd PRC0]
+    puts [format "PRC0 reboot-iso : scsi_bus_resets=%d  boot_inits(move#2700,sr)=%d  trail_frozen=%d" \
+        [expr {($c>>24)&0xFF}] [expr {($c>>16)&0xFF}] [expr {$c&1}]]
+    puts [format "  PRT3 latest init-entry pc        = %06X  (where ROM init (re-)enters)" [expr {[rd PRT3]&0xFFFFFF}]]
+    if {[expr {$c&1}]} {
+        puts [format "  PRT1 cpu pc @ 2nd SCSI bus reset = %06X  (driver abort path)" [expr {[rd PRT1]&0xFFFFFF}]]
+        puts [format "  PRT2 prev fetch                  = %06X" [expr {[rd PRT2]&0xFFFFFF}]]
+    } else {
+        puts "  PRT1/2 trail not frozen (< 2 SCSI bus resets since config)"
+    }
+}
+
+# ---- PRST: reset-source recorder (#3 spontaneous reboot after Happy Mac) ------
+# The CPU reset (dataController_top.sv:189) is forced ONLY by _systemReset
+# (n_reset) low OR the Egret asserting egret_reset_680x0. PRST latches WHICH
+# source pulled the line on the first reboot after the CPU started running.
+#   first_src bits: [7]EGRET [6]pll_unlock [5]rom_notloaded [4]OSD/status0
+#                   [3]button [2]pram_force_reset [1]RESET_in [0]rom_download
+# first_src==0x80 (EGRET only, n_reset still high) ⟹ the Egret HC05 rebooted it.
+proc _prst_srcname {s} {
+    set n {}
+    if {$s & 0x80} {lappend n EGRET}
+    if {$s & 0x40} {lappend n pll_unlock}
+    if {$s & 0x20} {lappend n rom_notloaded}
+    if {$s & 0x10} {lappend n OSD_status0}
+    if {$s & 0x08} {lappend n button}
+    if {$s & 0x04} {lappend n pram_force_reset}
+    if {$s & 0x02} {lappend n RESET_in}
+    if {$s & 0x01} {lappend n rom_download}
+    if {[llength $n] == 0} { return "(none)" }
+    return [join $n +]
+}
+if {[info exists idx(PRST)]} {
+    set p [rd PRST]
+    set fsrc [expr {($p>>16)&0xFF}]
+    set seen [expr {($p>>6)&1}]
+    puts [format "PRST reset-src  : reboots=%d armed=%d seen=%d first_nreset=%d n_reset=%d" \
+        [expr {($p>>24)&0xFF}] [expr {($p>>7)&1}] $seen [expr {($p>>5)&1}] [expr {($p>>4)&1}]]
+    if {$seen} {
+        puts [format "  FIRST reboot cause = %s (first_src=0x%02X)%s" \
+            [_prst_srcname $fsrc] $fsrc \
+            [expr {(($fsrc & 0x80) && !($fsrc & 0x7F)) ? "  <== EGRET HC05 asserted 68k reset" : ""}]]
+    } else {
+        puts "  FIRST reboot = (none captured since the CPU started running)"
+    }
+    puts [format "  live reset_src = %s (0x%02X)" [_prst_srcname [expr {($p>>8)&0xFF}]] [expr {($p>>8)&0xFF}]]
+}
+
 # ---- SCSI -----------------------------------------------------------------
 set scs [rd PSCS]
 set regnames {CDR/ODR ICR MR TCR CSR BSR IDR RST}

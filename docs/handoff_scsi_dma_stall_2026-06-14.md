@@ -162,6 +162,49 @@ shows the happy Mac then reboots/Sad-Macs; **clears after 1–2 warm boots** fro
 within the core. Persists WITH the welcome-wedge fix (the fix neither helps nor
 hurts it — different mechanism).
 
+**🔬 UPDATE 2026-06-14 PM — root-cause investigation (HW probes on .143).**
+
+**Precise symptom (user):** chime → basic init → mouse → Happy Mac → **spontaneous
+reboot, JUST BEFORE the "Welcome to Macintosh" screen** → basic init → mouse →
+"?" disk (then sits at "?"). The USER manually resets to retry; a *fraction* of
+attempts "miss" — **rate scales with System size (6.0.8 rare < 7.1 ≈once < 7.5.5
+many)** but it is a **GENERAL cold-init race, all OSes**, NOT 7.5.5-specific. The
+"just before Welcome" timing = the **boot-block → System handoff** (the System's
+earliest init code is running; SCSI Manager / driver bring-up).
+
+**RULED OUT by probes (do NOT re-chase these):**
+- **NOT a hardware reset:** PRST `reboots=0`, PFR `rst_falls=0` → no `_cpuReset`
+  edge → it is **not** `n_reset` and **not** the Egret (`egret_reset_680x0`); both
+  pull `_cpuReset`.
+- **NOT a RESET instruction:** PFR `instr_falls=0`.
+- **NOT a bus error:** PBER showed `sdma_berr=0`, `cpu_berr`=100% routine `fc7`
+  probes, `berr→reset=0`. The earlier "unrecoverable-BERR / sdma_berr" hypothesis
+  is **DEAD**. (PBER/PBEA probes since removed.)
+- **NOT an overlay re-assert:** `addrController_top.v:294` only re-enables the
+  overlay on `_cpuReset`, which never fires.
+
+⟹ **The reboot is a pure SOFTWARE re-entry into ROM boot/init** (no HW signature),
+running from high ROM with the overlay off. That's why it's been invisible.
+
+**Other findings:** the CPU, in the failure, sits in a **SCSI bus-handshake
+poll-with-timeout loop at `A0786A`** (`btst #6,$40(a3)` = poll **CSR bit6=BSY**;
+companion polls **bit5=REQ**; `a3`→SCSI base, `$40(a3)`=CSR `$F10040`), and **2
+SCSI bus resets** occur (driver aborts) — strongly implicating the System's early
+SCSI activity at the handoff. The cold boot runs init in the **overlay at
+`$00008C`** (reset PC `$2A`→`$8C`); first live high-ROM fetch is **`$A02E3E`**.
+Address-based re-init detection (PRIN, `$A0008C`/`$A02E00`) **missed** (wrong
+addresses; restart entry still unknown) — so detection moved to opcode-based.
+
+**Current probe (RBF building):** `PRC0/PRT1-3` in `dbg_probes.sv` —
+ (1) **SCSI-abort PC trail**: freeze the 2 IF PCs at the **2nd SCSI bus reset**
+ (`PRT1`/`PRT2` = the driver abort path — disassemble); (2) **boot-init entry by
+ OPCODE** `move.w #$2700,sr` ($46FC $2700, address-independent): `PRC0.boot_inits`
+ count + `PRT3` = the init re-entry PC. Plus the **DIFFERENTIAL method**: cold-boot
+ repeatedly, classify each by screenshot (desktop=success / "?"=miss), read probes
+ per attempt, and **diff success vs miss** (boot_inits 1-vs-2, bus_resets, PRT3
+ entry, PEXC/PIFA/PADR end state). Goal: name the ROM/System routine that
+ re-enters init, then write a targeted fix. Decode in `scripts/cpu_state.tcl`.
+
 **Signature → cold-boot state/init, not the completion path.** "cold fails →
 warm boot fixes it" means first-config state is bad and a warm reset (ROM +
 SDRAM retained) is clean. Matches `MacLC.sv:99-108` (rom_loaded latch; cold
@@ -187,8 +230,10 @@ state); compare cold vs warm. Decode Sad Mac codes against the maclc ROM.
 
 ## Shared context / tools / ops crib
 
-- **Diagnostic deck:** `rtl/dbg_probes.sv` (JTAG In-System Probes — PADR/PSTA/
-  PIFA/PIFD/PEXC/PFR/PSDT/PSCS/PSC2/PSC3/PSCW/PSNC/PSWL/PSC6/PVID). Read:
+- **Diagnostic deck:** `rtl/dbg_probes.sv` + `MacLC.sv` (JTAG In-System Probes —
+  PADR/PSTA/PIFA/PIFD/PEXC/PFR/PSCS/PSC2/PSC3/PSCW/PSNC/PSWL/PSC6/PVID; SCSI
+  stall: PSDT + PSDS/PSD2/PSD3 snapshot; **BERR: PBER/PBEA** added 2026-06-14).
+  Read:
   `bash scripts/read_probes.sh` (decoded), `scripts/sample_loop.tcl` +
   `scripts/loop_disasm.py`, `scripts/sample_padr.tcl`. JTAG via local
   USB-Blaster; **don't run while a Quartus compile uses the cable.** Occasional

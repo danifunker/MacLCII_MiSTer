@@ -9,6 +9,26 @@
 > build + HW deploy). The `{ca2,ca1,ca0,SEL}` bit-order was a red herring. Read
 > the findings doc; the original analysis below is kept for history.
 
+> **HW RE-TEST 2026-06-14 (parked by user) — symptom UNCHANGED.** On RBF
+> `270c24d4` (today's SCSI-prefetch build off `fix-os7-scsi-welcome-wedge`,
+> commit `1a732bf`), floppy re-tested: **`TETRIS MAX` (a 1.4 MB MFM disk)** →
+> "*This disk is unreadable — Eject / One-Sided / Two-Sided*" dialog; a
+> **System 6.0.7 disk** (800K) → the **same** dialog. A 1.4 MB disk getting the
+> One-/Two-Sided **GCR** prompt = bug #1 below (SuperDrive not recognized → OS
+> never enters MFM); the 800K disk = bug #2 (GCR data path garbage). No change vs
+> 06-13. **The three 06-13 ISM/drive-ID fixes ARE in this build** (verified in
+> tree): Fix A SuperDrive `x011` signature `rtl/floppy.v:122-134`, Fix B ISM
+> `n&7` decode `rtl/swim.v:258`, Fix C mode-bit5 head-select `rtl/swim.v:144`.
+> So they are **necessary-but-not-sufficient** — with all three in, the OS still
+> does NOT enter MFM mode and still reads garbage. The remaining blocker is the
+> **read DATAPATH + the deeper drive-ID handshake** (does the OS need the
+> MFM-mode phase strobe `$9`-on/`$D`-off reflected in `MFMModeOn`? is the ISM
+> FIFO/Setup read path needed? is_2m/DRVIN polarity?), per "Still open" in
+> `docs/findings_mame_floppy_driveid_2026-06-13.md`. **NEXT SESSION:** get a MAME
+> runtime trace of the drive-ID phase→register reads AND a clean sector read with
+> a *bootable* disk image (the 06-13 attempt failed because the test images
+> weren't bootable, so MAME bailed before a sector read).
+
 # Handoff — MAME ground-truth: floppy drive-ID + GCR/MFM read (for 1.44 MB)
 
 *2026-06-13. The 1.44 MB MFM read build (`MacLC.rbf` md5 `49e69e55`) is deployed.

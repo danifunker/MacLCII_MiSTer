@@ -111,6 +111,7 @@ module emu
 	localparam [1:0] status_cpu = 2'b10; // 68020
 	reg       n_reset = 0;
 	reg       pram_force_reset = 1'b0;  // "Reset PRAM & Core" -> system reset pulse
+	wire      egret_reset_680x0_w;      // Egret HC05 holding 68k in reset (#3 probe)
 	// Mac LC always runs at C15M (~15.67 MHz) - use 16 MHz clock enables
 	always @(posedge clk_sys) begin
 		reg [15:0] rst_cnt;
@@ -921,6 +922,46 @@ module emu
 		.sld_auto_instance_index ("YES")
 	) cp_psd3 (.probe(sdma_snap_wr), .source(), .source_clk(clk_sys), .source_ena(1'b1));
 
+	// --- PRST: reset-source recorder (#3 spontaneous-reboot-after-Happy-Mac) ----
+	// The reboot is a NON-bus-error CPU reset (PBER berr->reset=0 proved it). The
+	// CPU reset (_cpuReset, dataController_top.sv:189) is forced by exactly two
+	// things: _systemReset (n_reset) low, OR the Egret HC05 asserting
+	// egret_reset_680x0. This latches WHICH source pulled the line on the FIRST
+	// reset AFTER the CPU started running (armed once n_reset releases), so the
+	// cold-boot reset itself is skipped. reset_src bit = that source demanding
+	// reset at the _cpuReset falling edge:
+	//   [7]=egret_reset_680x0 (Egret firmware — prime suspect)
+	//   [6]=~pll_locked_s [5]=~rom_loaded [4]=status[0](OSD) [3]=buttons[1]
+	//   [2]=pram_force_reset [1]=RESET [0]=ROM-download(index0)
+	// first_src==0x80 ⟹ the Egret rebooted it; any [6:0] bit ⟹ a system reset.
+	wire [7:0] reset_src = { egret_reset_680x0_w, ~pll_locked_s, ~rom_loaded,
+	                         status[0], buttons[1], pram_force_reset, RESET,
+	                         (dio_download && dio_index == 0) };
+	reg        prst_armed     = 1'b0;
+	reg        cpuReset_d_p   = 1'b1;
+	reg [7:0]  reboot_cnt     = 8'd0;
+	reg [7:0]  first_src      = 8'd0;
+	reg        first_rst_seen = 1'b0;
+	reg        first_nreset   = 1'b1;
+	always @(posedge clk_sys) begin
+		cpuReset_d_p <= _cpuReset;
+		if (n_reset) prst_armed <= 1'b1;                    // CPU out of cold-boot reset
+		if (prst_armed && cpuReset_d_p && !_cpuReset) begin // _cpuReset fell while armed
+			if (reboot_cnt != 8'hFF) reboot_cnt <= reboot_cnt + 8'd1;
+			if (!first_rst_seen) begin
+				first_rst_seen <= 1'b1;
+				first_src      <= reset_src;
+				first_nreset   <= n_reset;    // 1 ⟹ Egret reset (n_reset still high)
+			end
+		end
+	end
+	altsource_probe #(
+		.instance_id ("PRST"), .probe_width (32), .source_width(1),
+		.sld_auto_instance_index ("YES")
+	) cp_prst (.probe({reboot_cnt, first_src, reset_src,
+	                   prst_armed, first_rst_seen, first_nreset, n_reset, 4'd0}),
+	           .source(), .source_clk(clk_sys), .source_ena(1'b1));
+
 	dbg_probes probes(
 		.clk(clk_sys),
 		.cpuAddr(cpuAddr[23:0]),
@@ -963,7 +1004,13 @@ module emu
 		.asc_irq(asc_irq),
 		.asc_sample_l(asc_sample_l),
 		.pvia_video_config(pvia_video_config),
-		.v8_vblank(v8_vblank)
+		.v8_vblank(v8_vblank),
+		// BERR investigation (#3 cold-boot reboot loop): the ACTUAL bus-error
+		// signals, not the vector-read inference PEXC/PFR use.
+		.cpu_berr(cpu_berr),
+		.fc7_berr(fc7_berr && !_cpuAS),
+		.sdma_berr(sdma_berr),
+		.memoryOverlayOn(memoryOverlayOn)
 	);
 
 	maclc_v8_video v8_video(
@@ -1198,7 +1245,9 @@ module emu
 		.pram_save_addr(pram_save_addr),
 		.pram_save_data(pram_save_data),
 		.pram_wr_stb(pram_wr_stb),
-		.pram_ready(pram_ready)
+		.pram_ready(pram_ready),
+		// #3 reset-source probe: expose the Egret's 68k-reset line (Port C bit 3)
+		.egret_dbg_reset_680x0(egret_reset_680x0_w)
 	);
 
 	reg disk_act;
