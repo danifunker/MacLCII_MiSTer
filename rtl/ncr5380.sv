@@ -352,13 +352,19 @@ module ncr5380
 		end else begin
 			old_rst_rd <= rst_rd;
 			pmatch_d   <= bsr_pmatch;
-			if (!mr[`MR_DMA_MODE])
-				dma_armed <= 1'b0;
-			else if (reg_wr && (bus_rs == `WREG_DMAS || bus_rs == `WREG_IDMAR))
+			// Completion-IRQ latch — fixes the System 7 "Welcome" wedge. Keep
+			// dma_armed across a DMA-mode clear and latch the IRQ on the target's
+			// DATA->STATUS phase-mismatch regardless of MR.DMA_MODE (the real 5380
+			// latches EOP/phase-mismatch in HW). The driver often clears DMA mode
+			// just before the phase change; the old MR.DMA_MODE-gated latch dropped
+			// the IRQ and the HD SC 4.3 async path slept on a completion that never
+			// came (ParamBlockRec.ioResult never cleared). Cleared on the latch, a
+			// reg-7 read, or bus reset.
+			if (reg_wr && (bus_rs == `WREG_DMAS || bus_rs == `WREG_IDMAR))
 				dma_armed <= 1'b1;
 			if (~old_rst_rd & rst_rd)
 				irq_latch <= 1'b0;
-			if (mr[`MR_DMA_MODE] && dma_armed && pmatch_d && !bsr_pmatch) begin
+			if (dma_armed && pmatch_d && !bsr_pmatch) begin
 				irq_latch <= 1'b1;
 				dma_armed <= 1'b0;
 			end
@@ -685,8 +691,12 @@ module ncr5380
 	always begin : pscw_mux
 		integer j;
 		dbg_wr_mux = target_wrstall[DEVS-1];
+		// Route whichever target is in a DATA phase — WRITE (PHASE_DATA_IN=3) or
+		// READ (PHASE_DATA_OUT=2). The read case was added for the pseudo-DMA
+		// stall snapshot (PSDS/PSD3) so data_cnt/io_busy/phase are valid during a
+		// READ stall, not just a write.
 		for (j = 0; j < DEVS; j = j + 1)
-			if (target_phase[j] == 3'd3) dbg_wr_mux = target_wrstall[j];
+			if (target_phase[j] == 3'd3 || target_phase[j] == 3'd2) dbg_wr_mux = target_wrstall[j];
 	end
 	assign dbg_wr = dbg_wr_mux;
 

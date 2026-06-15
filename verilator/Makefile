@@ -84,6 +84,7 @@ V_SRC = \
 	$(RTL)/swim.v \
 	$(RTL)/floppy.v \
 	$(RTL)/floppy_track_encoder.v \
+	$(RTL)/mfm_track_encoder.v \
 	$(RTL)/scsi.v \
 	$(RTL)/ncr5380.sv \
 	$(RTL)/scc.v \

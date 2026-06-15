@@ -85,6 +85,8 @@ module dataController_top(
 	// misc
 	input [1:0] insertDisk,
 	input [1:0] diskSides,
+	input [1:0] diskMFM,    // disk is MFM-format (ISM path): {ext,int}
+	input [1:0] diskHD,     // disk is 1.44MB HD (vs 720K DD): {ext,int}
 	output [1:0] diskEject,
 	output [1:0] diskMotor,
 	output [1:0] diskAct,
@@ -935,6 +937,8 @@ module dataController_top(
 		.dataOut(swimDataOut),
 		.insertDisk(insertDisk),
 		.diskSides(diskSides),
+		.diskMFM(diskMFM),
+		.diskHD(diskHD),
 		.diskEject(diskEject),
 		.diskMotor(diskMotor),
 		.diskAct(diskAct),

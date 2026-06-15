@@ -111,6 +111,7 @@ module emu
 	localparam [1:0] status_cpu = 2'b10; // 68020
 	reg       n_reset = 0;
 	reg       pram_force_reset = 1'b0;  // "Reset PRAM & Core" -> system reset pulse
+	wire      egret_reset_680x0_w;      // Egret HC05 holding 68k in reset (#3 probe)
 	// Mac LC always runs at C15M (~15.67 MHz) - use 16 MHz clock enables
 	always @(posedge clk_sys) begin
 		reg [15:0] rst_cnt;
@@ -587,6 +588,32 @@ module emu
 		end else if (selectSCSIDMA)
 			sdma_stall_ctr <= 0;     // DREQ arrived
 	end
+
+	// --- Active pseudo-DMA stall snapshot (PSDS/PSD2/PSD3) --------------------
+	// Latch the live SCSI engine state the FIRST time a pseudo-DMA DACK access is
+	// DREQ-starved past SDMA_SNAP_THRESH (well above a normal HPS sector-fetch
+	// bridge, far below the 250 ms sdma_berr). With the deeper read prefetch
+	// (rtl/scsi.v RING_LOG) this should rarely fire; when it does it captures
+	// whether a residual stall is H1 (phase=DATA_OUT, io_rd=1, io_ack=0,
+	// io_busy=1), H2 (pmatch=0 / phase!=DATA_OUT) or H3 (dma_en=0) — see
+	// docs/findings_scsi_dma_stall_offline_2026-06-14.md. Sticky until reset;
+	// reuses sdma_stall_ctr. Read via scripts/read_probes.sh (PSDS block).
+	localparam SDMA_SNAP_THRESH = 23'd520000;   // ~16 ms @ 32.5 MHz (tunable)
+	reg        sdma_snapped    = 1'b0;
+	reg [15:0] sdma_snap_scsi2 = 16'd0;
+	reg [31:0] sdma_snap_ncr   = 32'd0;
+	reg [31:0] sdma_snap_wr    = 32'd0;
+	always @(posedge clk_sys) begin
+		if (!_cpuReset)
+			sdma_snapped <= 1'b0;
+		else if (!sdma_snapped && sdma_stall_ctr == SDMA_SNAP_THRESH) begin
+			sdma_snap_scsi2 <= dbg_scsi2_w;   // phase0/1, io_rd, io_wr, io_ack
+			sdma_snap_ncr   <= dbg_ncr_w;     // dreq/dma_en/dma_ack/holdoff/mr_dma/pmatch/tcr
+			sdma_snap_wr    <= dbg_wr_w;      // data_cnt/phase/io_busy/sd_buff_sel/data_complete
+			sdma_snapped    <= 1'b1;
+		end
+	end
+
 	assign      _cpuVPA = fc7_iack ? 1'b0 : ((fc7_berr || slot_space) ? 1'b1 : ~(!_cpuAS && cpuAddr[23:21] == 3'b111 && !selectVRAM && !selectSCSIDMA));
 	assign      _cpuDTACK = fc7_berr ? 1'b1 :
 	                        (slot_space && !_cpuAS) ? 1'b0 :
@@ -879,6 +906,62 @@ module emu
 		.sld_auto_instance_index ("YES")
 	) cp_psdt (.probe({sdma_berr_cnt, 1'b0, sdma_stall_max}), .source(), .source_clk(clk_sys), .source_ena(1'b1));
 
+	// PSDS/PSD2/PSD3: active pseudo-DMA stall snapshot (latched at SDMA_SNAP_THRESH).
+	// PSDS[16]=snapped flag, PSDS[15:0]=dbg_scsi2 layout; PSD2=dbg_ncr (PSNC layout);
+	// PSD3=dbg_wr (PSCW layout). Decoded by scripts/cpu_state.tcl.
+	altsource_probe #(
+		.instance_id ("PSDS"), .probe_width (32), .source_width(1),
+		.sld_auto_instance_index ("YES")
+	) cp_psds (.probe({15'd0, sdma_snapped, sdma_snap_scsi2}), .source(), .source_clk(clk_sys), .source_ena(1'b1));
+	altsource_probe #(
+		.instance_id ("PSD2"), .probe_width (32), .source_width(1),
+		.sld_auto_instance_index ("YES")
+	) cp_psd2 (.probe(sdma_snap_ncr), .source(), .source_clk(clk_sys), .source_ena(1'b1));
+	altsource_probe #(
+		.instance_id ("PSD3"), .probe_width (32), .source_width(1),
+		.sld_auto_instance_index ("YES")
+	) cp_psd3 (.probe(sdma_snap_wr), .source(), .source_clk(clk_sys), .source_ena(1'b1));
+
+	// --- PRST: reset-source recorder (#3 spontaneous-reboot-after-Happy-Mac) ----
+	// The reboot is a NON-bus-error CPU reset (PBER berr->reset=0 proved it). The
+	// CPU reset (_cpuReset, dataController_top.sv:189) is forced by exactly two
+	// things: _systemReset (n_reset) low, OR the Egret HC05 asserting
+	// egret_reset_680x0. This latches WHICH source pulled the line on the FIRST
+	// reset AFTER the CPU started running (armed once n_reset releases), so the
+	// cold-boot reset itself is skipped. reset_src bit = that source demanding
+	// reset at the _cpuReset falling edge:
+	//   [7]=egret_reset_680x0 (Egret firmware — prime suspect)
+	//   [6]=~pll_locked_s [5]=~rom_loaded [4]=status[0](OSD) [3]=buttons[1]
+	//   [2]=pram_force_reset [1]=RESET [0]=ROM-download(index0)
+	// first_src==0x80 ⟹ the Egret rebooted it; any [6:0] bit ⟹ a system reset.
+	wire [7:0] reset_src = { egret_reset_680x0_w, ~pll_locked_s, ~rom_loaded,
+	                         status[0], buttons[1], pram_force_reset, RESET,
+	                         (dio_download && dio_index == 0) };
+	reg        prst_armed     = 1'b0;
+	reg        cpuReset_d_p   = 1'b1;
+	reg [7:0]  reboot_cnt     = 8'd0;
+	reg [7:0]  first_src      = 8'd0;
+	reg        first_rst_seen = 1'b0;
+	reg        first_nreset   = 1'b1;
+	always @(posedge clk_sys) begin
+		cpuReset_d_p <= _cpuReset;
+		if (n_reset) prst_armed <= 1'b1;                    // CPU out of cold-boot reset
+		if (prst_armed && cpuReset_d_p && !_cpuReset) begin // _cpuReset fell while armed
+			if (reboot_cnt != 8'hFF) reboot_cnt <= reboot_cnt + 8'd1;
+			if (!first_rst_seen) begin
+				first_rst_seen <= 1'b1;
+				first_src      <= reset_src;
+				first_nreset   <= n_reset;    // 1 ⟹ Egret reset (n_reset still high)
+			end
+		end
+	end
+	altsource_probe #(
+		.instance_id ("PRST"), .probe_width (32), .source_width(1),
+		.sld_auto_instance_index ("YES")
+	) cp_prst (.probe({reboot_cnt, first_src, reset_src,
+	                   prst_armed, first_rst_seen, first_nreset, n_reset, 4'd0}),
+	           .source(), .source_clk(clk_sys), .source_ena(1'b1));
+
 	dbg_probes probes(
 		.clk(clk_sys),
 		.cpuAddr(cpuAddr[23:0]),
@@ -921,7 +1004,13 @@ module emu
 		.asc_irq(asc_irq),
 		.asc_sample_l(asc_sample_l),
 		.pvia_video_config(pvia_video_config),
-		.v8_vblank(v8_vblank)
+		.v8_vblank(v8_vblank),
+		// BERR investigation (#3 cold-boot reboot loop): the ACTUAL bus-error
+		// signals, not the vector-read inference PEXC/PFR use.
+		.cpu_berr(cpu_berr),
+		.fc7_berr(fc7_berr && !_cpuAS),
+		.sdma_berr(sdma_berr),
+		.memoryOverlayOn(memoryOverlayOn)
 	);
 
 	maclc_v8_video v8_video(
@@ -1126,6 +1215,8 @@ module emu
 		// floppy disk interface
 		.insertDisk({dsk_ext_ins, dsk_int_ins}),
 		.diskSides({dsk_ext_ds, dsk_int_ds}),
+		.diskMFM({dsk_ext_mfm, dsk_int_mfm}),
+		.diskHD({dsk_ext_hd, dsk_int_hd}),
 		.diskEject(diskEject),
 		.dskReadAddrInt(dskReadAddrInt),
 		.dskReadAckInt(dskReadAckInt),
@@ -1154,7 +1245,9 @@ module emu
 		.pram_save_addr(pram_save_addr),
 		.pram_save_data(pram_save_data),
 		.pram_wr_stb(pram_wr_stb),
-		.pram_ready(pram_ready)
+		.pram_ready(pram_ready),
+		// #3 reset-source probe: expose the Egret's 68k-reset line (Port C bit 3)
+		.egret_dbg_reset_680x0(egret_reset_680x0_w)
 	);
 
 	reg disk_act;
@@ -1182,6 +1275,8 @@ module emu
 	// good floppy image sizes are 819200 bytes and 409600 bytes
 	reg dsk_int_ds, dsk_ext_ds;
 	reg dsk_int_ss, dsk_ext_ss;  // single sided image inserted
+	reg dsk_int_mfm, dsk_ext_mfm;  // MFM-format image (ISM/SWIM path): 720K or 1.44MB
+	reg dsk_int_hd,  dsk_ext_hd;   // 1.44MB HD (vs 720K DD)
 
 	// DiskCopy 4.2 (.dsk/.image) support: an 84-byte (42-word) header precedes
 	// the raw logical-order sector data (tags trail the data; they land past
@@ -1193,27 +1288,32 @@ module emu
 	// of a bootable HFS floppy is 'L' (76 > 63) or $00 for blank media.
 	reg dc42_name_ok;
 	reg dc42_skip;
+	reg [7:0] dc42_disk_format;  // DC42 byte 0x50: 0=400K GCR,1=800K GCR,2=720K MFM,3=1440K MFM
 
 	// any known type of disk image inserted?
-	wire dsk_int_ins = dsk_int_ds || dsk_int_ss;
-	wire dsk_ext_ins = dsk_ext_ds || dsk_ext_ss;
+	wire dsk_int_ins = dsk_int_ds || dsk_int_ss || dsk_int_mfm;
+	wire dsk_ext_ins = dsk_ext_ds || dsk_ext_ss || dsk_ext_mfm;
 	// at the end of a download latch file size
 	// diskEject is set by macos on eject
 	always @(posedge clk_sys) begin
 		reg old_down;
 		old_down <= dio_download;
 		if(old_down && ~dio_download && dio_index == 1) begin
-			// raw sizes, plus DC42 sizes (header 42 + data + optional 12B/sector tags)
-			dsk_int_ds <= (dio_addr == 409600) ||
-			              (dc42_skip && (dio_addr == 409642 || dio_addr == 419242));
-			// double sides disk, addr counts words, not bytes
-			dsk_int_ss <= (dio_addr == 204800) ||
-			              (dc42_skip && (dio_addr == 204842 || dio_addr == 209642));
+			// GCR (IWM path) — raw word count, or DC42 disk_format byte (rusty-backup
+			// dc42.rs: 0x50 = 0/1/2/3 = 400G/800G/720M/1440M, authoritative + tag-agnostic).
+			dsk_int_ds  <= (dio_addr == 409600) || (dc42_skip && dc42_disk_format == 8'd1);
+			dsk_int_ss  <= (dio_addr == 204800) || (dc42_skip && dc42_disk_format == 8'd0);
+			// MFM (ISM path): 720K DD (368640 words) / 1.44MB HD (737280 words)
+			dsk_int_mfm <= (dio_addr == 368640) || (dio_addr == 737280) ||
+			               (dc42_skip && (dc42_disk_format == 8'd2 || dc42_disk_format == 8'd3));
+			dsk_int_hd  <= (dio_addr == 737280) || (dc42_skip && dc42_disk_format == 8'd3);
 		end
 
 		if(diskEject[0]) begin
 			dsk_int_ds <= 0;
 			dsk_int_ss <= 0;
+			dsk_int_mfm <= 0;
+			dsk_int_hd <= 0;
 		end
 	end	
 
@@ -1222,16 +1322,18 @@ module emu
 
 		old_down <= dio_download;
 		if(old_down && ~dio_download && dio_index == 2) begin
-			dsk_ext_ds <= (dio_addr == 409600) ||
-			              (dc42_skip && (dio_addr == 409642 || dio_addr == 419242));
-			// double sided disk, addr counts words, not bytes
-			dsk_ext_ss <= (dio_addr == 204800) ||
-			              (dc42_skip && (dio_addr == 204842 || dio_addr == 209642));
+			dsk_ext_ds  <= (dio_addr == 409600) || (dc42_skip && dc42_disk_format == 8'd1);
+			dsk_ext_ss  <= (dio_addr == 204800) || (dc42_skip && dc42_disk_format == 8'd0);
+			dsk_ext_mfm <= (dio_addr == 368640) || (dio_addr == 737280) ||
+			               (dc42_skip && (dc42_disk_format == 8'd2 || dc42_disk_format == 8'd3));
+			dsk_ext_hd  <= (dio_addr == 737280) || (dc42_skip && dc42_disk_format == 8'd3);
 		end
 
 		if(diskEject[1]) begin
 			dsk_ext_ds <= 0;
 			dsk_ext_ss <= 0;
+			dsk_ext_mfm <= 0;
+			dsk_ext_hd <= 0;
 		end
 	end
 
@@ -1254,7 +1356,9 @@ module emu
 				if (dio_addr[19:0] == 20'd0) begin
 					dc42_skip    <= 1'b0;
 					dc42_name_ok <= (ioctl_data[7:0] >= 8'd1) && (ioctl_data[7:0] <= 8'd63);
-				end else if (dio_addr[19:0] == 20'd41 && dc42_name_ok && ioctl_data == 16'h0001)
+				end else if (dio_addr[19:0] == 20'd40)
+					dc42_disk_format <= ioctl_data[7:0];  // byte 0x50 (low byte of word 40)
+				else if (dio_addr[19:0] == 20'd41 && dc42_name_ok && ioctl_data == 16'h0001)
 					dc42_skip <= 1'b1;
 			end
 			dio_data <= {ioctl_data[7:0], ioctl_data[15:8]};
@@ -1302,7 +1406,20 @@ module emu
 	// during rom/disk download ffff is returned so the screen is black during download
 	// "extra rom" is used to hold the disk image. It's expected to be byte wide and
 	// we thus need to properly demultiplex the word returned from sdram in that case
-	wire [15:0] extra_rom_data_demux = memoryAddr[0]?
+	// Disk image is packed 2 bytes per SDRAM word (download byte-swaps so the
+	// EVEN file byte is the high lane, the ODD byte the low lane). The byte to
+	// return is picked by the disk byte-address parity bit, dskReadAddr[0] —
+	// but the word-address conversion in addrController (`+ dskReadAddr[21:1]`)
+	// DROPS bit 0, so `memoryAddr[0]` here is really dskReadAddr[1] and selected
+	// the wrong byte on every odd address: reads came back 0,0,3,3,4,4,7,7,…
+	// (each odd byte duplicated, its even partner skipped), shredding the GCR
+	// data field so every sector failed checksum ("drive responds, data
+	// unreadable"). Select on the live parity bit of whichever drive is being
+	// serviced; the track encoder holds dskReadAddr stable across the whole
+	// fetch window, so the live bit is coherent with the returning word. Keep in
+	// sync with verilator/sim.v.
+	wire dsk_byte_odd = dskReadAckExt ? dskReadAddrExt[0] : dskReadAddrInt[0];
+	wire [15:0] extra_rom_data_demux = dsk_byte_odd?
 							 {sdram_out[7:0],sdram_out[7:0]}:{sdram_out[15:8],sdram_out[15:8]};
 	wire [15:0] sdram_out;
 

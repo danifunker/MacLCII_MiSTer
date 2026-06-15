@@ -73,7 +73,17 @@ module dbg_probes (
 
     // video (V8 / Ariel)
     input wire [7:0]  pvia_video_config,
-    input wire        v8_vblank
+    input wire        v8_vblank,
+
+    // BERR investigation (#3 cold-boot reboot loop): the real hardware
+    // bus-error signals (NOT the $8-vector-read inference PEXC/PFR use, which
+    // false-alarms on routine supervisor reads).
+    input wire        cpu_berr,    // asserted BERR to the CPU (fc7_berr | sdma_berr)
+    input wire        fc7_berr,    // FC=7 CPU-space probe BERR (already gated by !AS)
+    input wire        sdma_berr,   // SCSI pseudo-DMA watchdog BERR (the suspected #3 killer)
+
+    // #3 ROM re-init detector
+    input wire        memoryOverlayOn  // ROM overlay active (1 = ROM mapped at $0)
 );
 
     // ---- PADR / PSTA / PACT: where is the CPU, what bus state, is it alive
@@ -309,6 +319,82 @@ module dbg_probes (
         .instance_id ("PFR3"), .probe_width (32), .source_width(1),
         .sld_auto_instance_index ("YES")
     ) cp_pfr3 (.probe({fr_berr_trigs, fr_rte_pc1}), .source(), .source_clk(clk), .source_ena(1'b1));
+
+    // (PBER/PBEA bus-error probes removed 2026-06-14 — they PROVED #3 is not a
+    // bus error: sdma_berr never fired, cpu_berr was 100% routine fc7 probes, and
+    // there was no BERR->reset correlation. Their probe budget is reused by the
+    // PRC0/PRT re-init trail below. cpu_berr/fc7_berr/sdma_berr inputs are now
+    // unused here; PSDT.berr_fires + PEXC still cover bus-error visibility.)
+
+    // ---- PRC0 / PRT1-3: #3 reboot isolation (SCSI-abort trail + init entry) ----
+    // The reboot has NO clean HW signature (no _cpuReset/RESET/BERR/overlay), and
+    // address-based boot-entry detection missed (cold boot runs the overlay at
+    // $00008C, the restart re-enters at an unknown high-ROM point). So capture two
+    // complementary things, address-independently:
+    //  (1) SCSI-ABORT PC TRAIL — freeze the 2 most recent IF PCs at the 2nd SCSI
+    //      bus reset (dbg_rst_count = scsi_dbg4[15:8] increments). The driver
+    //      asserts RST when it ABORTS a transfer; that abort is the prime suspect
+    //      for what drives the System restart. PRT1 = CPU PC asserting the reset,
+    //      PRT2 = the fetch before it -> disassemble = the SCSI driver abort path.
+    //  (2) BOOT-INIT ENTRY BY OPCODE — detect `move.w #$2700,sr` ($46FC then
+    //      $2700) in the fetch stream (the init's first instruction, wherever it
+    //      enters). sr2700_cnt = how many inits ran (cold boot = 1; +1 if the
+    //      reboot re-runs SR setup); PRT3 = the latest such entry PC = where init
+    //      (re-)enters. (Replaced the address-based PRC0/PRT.)
+    wire fetch_cplt = ifd_wait && !cpuAS_n_d && cpuAS_n;   // a fetch completed (PIFD commit pt)
+    reg [15:0] op_prev = 16'd0;
+    reg [23:0] pc_prev = 24'd0, pc_prev2 = 24'd0;
+    reg [7:0]  sr2700_cnt = 8'd0;
+    reg [23:0] sr_entry = 24'd0;          // latest move#$2700,sr PC (the init entry)
+    reg [7:0]  rstc_d = 8'd0, busrst_cnt = 8'd0;
+    reg        trail_frozen = 1'b0;
+    reg [23:0] trail_pc1 = 24'd0, trail_pc2 = 24'd0;
+    always @(posedge clk) begin
+        // (2) opcode-based boot-init detection (address-independent)
+        if (fetch_cplt) begin
+            if (op_prev == 16'h46FC && cpu_din == 16'h2700) begin
+                if (sr2700_cnt != 8'hFF) sr2700_cnt <= sr2700_cnt + 8'd1;
+                sr_entry <= pc_prev;       // pc_prev = PC of the $46FC = init entry
+            end
+            op_prev  <= cpu_din;
+            pc_prev2 <= pc_prev;
+            pc_prev  <= if_addr;
+        end
+        // (1) SCSI bus-reset PC trail
+        rstc_d <= scsi_dbg4[15:8];
+        if (scsi_dbg4[15:8] != rstc_d) begin       // a SCSI bus reset occurred
+            if (busrst_cnt != 8'hFF) busrst_cnt <= busrst_cnt + 8'd1;
+            if (busrst_cnt >= 8'd1 && !trail_frozen) begin   // freeze at the 2nd
+                trail_frozen <= 1'b1;
+                trail_pc1 <= if_addr;
+                trail_pc2 <= pc_prev;
+            end
+        end
+    end
+    reg [31:0] prc_r, pt1_r, pt2_r, pt3_r;
+    always @(posedge clk) begin
+        prc_r <= {busrst_cnt, sr2700_cnt, 15'd0, trail_frozen};
+        pt1_r <= {8'd0, trail_pc1};
+        pt2_r <= {8'd0, trail_pc2};
+        pt3_r <= {8'd0, sr_entry};
+    end
+
+    altsource_probe #(
+        .instance_id ("PRC0"), .probe_width (32), .source_width(1),
+        .sld_auto_instance_index ("YES")
+    ) cp_prc0 (.probe(prc_r), .source(), .source_clk(clk), .source_ena(1'b1));
+    altsource_probe #(
+        .instance_id ("PRT1"), .probe_width (32), .source_width(1),
+        .sld_auto_instance_index ("YES")
+    ) cp_prt1 (.probe(pt1_r), .source(), .source_clk(clk), .source_ena(1'b1));
+    altsource_probe #(
+        .instance_id ("PRT2"), .probe_width (32), .source_width(1),
+        .sld_auto_instance_index ("YES")
+    ) cp_prt2 (.probe(pt2_r), .source(), .source_clk(clk), .source_ena(1'b1));
+    altsource_probe #(
+        .instance_id ("PRT3"), .probe_width (32), .source_width(1),
+        .sld_auto_instance_index ("YES")
+    ) cp_prt3 (.probe(pt3_r), .source(), .source_clk(clk), .source_ena(1'b1));
 
     // ---- PDRD: live atomic {I/O-read addr field, data} ---------------------
     // Same end-of-cycle commit for DATA-space reads in the $F00000 I/O region.

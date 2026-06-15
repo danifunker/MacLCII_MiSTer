@@ -85,7 +85,15 @@ module floppy
 
 	output [21:0] dskReadAddr,
 	input dskReadAck,
-	input [7:0] dskReadData
+	input [7:0] dskReadData,
+
+	// MFM (ISM/SWIM) read path — 720K/1.44MB
+	input        mfm_disk,   // this disk is MFM (use the MFM generator for fetch+bytes)
+	input        mfm_hd,     // 1.44MB HD (18 spt) vs 720K DD (9 spt)
+	input        mfm_pull,   // SWIM ISM read: advance one decoded byte
+	output [7:0] mfm_byte,   // current decoded MFM byte
+	output       mfm_mark,   // current byte is an address-mark (A1)
+	output       mfm_crc0    // current byte completes a valid CRC field
 );
 
 	assign motor = ~driveRegs[`DRIVE_REG_MOTORON];
@@ -97,14 +105,32 @@ module floppy
 	reg [7:0] diskDataIn; // incoming byte from the floppy disk
 	
 	// read drive registers
+	// Drive-ID sense bits. Our register index = {ca2,ca1,ca0,SEL}; physically the
+	// same wires as MAME's m_reg = {ss,ca2,ca1,ca0} (floppy.cpp mac_floppy::wpt_r).
+	// THE OS IDENTIFIES THE DRIVE by reading sense regs 0xC,0xD,0xE,0xF and matching
+	// a 4-bit pattern (wpt_r comment "Initial state of bits f-c = 2M,ready,MFM,rd1"):
+	//   0000=400K GCR, 1010=800K GCR, x011=SuperDrive (x=HD hole of inserted disk).
+	// => SuperDrive+HD = 1011, SuperDrive+DD = 0011. So we must report:
+	//   reg 0xF (our [15] DRVIN)     = is_2m  = mfm_hd   (1 = 1.44MB HD disk)
+	//   reg 0xE (our [13] READY)     = 0      (0 = ready, Apple active-low)
+	//   reg 0xD (our [11] MFMModeOn) = 1      (m_mfm dflt = has_mfm on a SuperDrive)
+	//   reg 0xC (our [9]  RDDATA1)   = 1      (motor-off RdData reads 1)
+	//   reg 0x5 (our [10] SUPERDR)   = 1      (the drive IS a SuperDrive)
+	// Previously [9]=0 and [11]=mfm_disk, giving signature 0000(800K)/1010(1.44M) =
+	// "GCR drive" -> the OS never saw a SuperDrive, never tried MFM. FIXED below.
+	// See docs/findings_mame_floppy_driveid_2026-06-13.md (MAME 0.264 ground truth).
+	// HW-VALIDATE: is_2m/DRVIN polarity; whether MFMModeOn must track $9/$D strobes.
 	wire [15:0] driveRegsAsRead = {
-		1'b0, // DRVIN = yes
+		mfm_hd,   // DRVIN ($F) = HD/is_2m sense
 		1'b0, // INSTALLED = yes
 		1'b0, // READY = yes
 		1'b1, // SIDES = double-sided drive
-		1'b0, // UNUSED
-		1'b0, // SUPERDR
-		1'b0, // RDDATA1
+		1'b1,     // ($B = MAME reg 0xD MFMModeOn) = 1. Part of the SuperDrive
+		          // identify signature x011 (bits f-c). m_mfm defaults to has_mfm=1
+		          // on a SuperDrive; ideally tracks $9(on)/$D(off) strobes (TODO).
+		1'b1, // SUPERDR = yes (SuperDrive/FDHD)  (MAME reg 0x5)
+		1'b1,     // RDDATA1 ($9 here = MAME reg 0xC). = 1: the other '1' in the
+		          // SuperDrive identify signature x011 (motor-off RdData1 reads 1).
 		1'b0, // RDDATA0
 		driveRegs[`DRIVE_REG_TACH], // TACH: 60 pules for each rotation of the drive motor
 		1'b0, // disk switched?
@@ -124,11 +150,13 @@ module floppy
 	always @(posedge clk) if(cep && dskReadAckD) dskReadDataLatch <= dskReadData;
 		
 	wire [7:0] dskReadDataEnc;
-	
+	wire [21:0] gcrReadAddr;   // GCR (IWM) encoder fetch addr
+	wire [21:0] mfmReadAddr;   // MFM (ISM) encoder fetch addr
+
 	reg old_newByteReady;
 	always @(posedge clk) old_newByteReady <= newByteReady;
-	
-	// include track encoder
+
+	// GCR (IWM-mode) track encoder — 400K/800K
 	floppy_track_encoder enc
 	(
 
@@ -136,15 +164,40 @@ module floppy
 		.ready	( ~old_newByteReady & newByteReady ),
 
 		.rst     ( !_reset ),
-		
+
 		.side    ( driveSide ),
 		.sides   ( doubleSidedDisk ),
 		.track   ( driveTrack ),
 
-		.addr    ( dskReadAddr ),
+		.addr    ( gcrReadAddr ),
 		.idata   ( dskReadDataLatch ),
 		.odata   ( dskReadDataEnc )
 	);
+
+	// MFM (ISM-mode) track encoder — 720K/1.44MB. Advances one decoded byte each
+	// time the SWIM pulls (mfm_pull rising edge); shares the same SDRAM fetch latch
+	// (dskReadDataLatch) and head position (driveTrack/driveSide) as the GCR path.
+	reg mfm_pull_d;
+	always @(posedge clk) mfm_pull_d <= mfm_pull;
+	wire mfm_adv = mfm_pull & ~mfm_pull_d;
+
+	mfm_track_encoder menc
+	(
+		.clk   ( clk ),
+		.ready ( mfm_adv ),
+		.rst   ( !_reset ),
+		.side  ( driveSide ),
+		.track ( driveTrack ),
+		.hd    ( mfm_hd ),
+		.addr  ( mfmReadAddr ),
+		.idata ( dskReadDataLatch ),
+		.odata ( mfm_byte ),
+		.omark ( mfm_mark ),
+		.ocrc0 ( mfm_crc0 )
+	);
+
+	// SDRAM fetch address: the MFM generator for MFM disks, else the GCR encoder.
+	assign dskReadAddr = mfm_disk ? mfmReadAddr : gcrReadAddr;
 	
 	// TODO: auto-detect doubleSidedDisk from image file size
 	wire doubleSidedDisk = diskSides;

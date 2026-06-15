@@ -14,6 +14,17 @@ silently diverge. (This has bitten us before — e.g. sim once hardwired
 
 Last audited: 2026-06-12 (cold-load reset hardening added FPGA-only — see below).
 
+**2026-06-13 — floppy byte-demux fix (both tops, kept identical):** the disk
+image is packed 2 bytes/SDRAM-word; the byte returned to the track encoder must
+be selected by `dskReadAddr[0]`, but both tops used `memoryAddr[0]` — which is
+`dskReadAddr[1]` after addrController's `>>1` word conversion drops bit 0. Odd
+disk bytes were duplicated and their even partners skipped, corrupting every GCR
+data field (drive mounts, data unreadable — the long-standing "floppy read"
+limitation). Fixed in `MacLC.sv` and `verilator/sim.v` identically
+(`dsk_byte_odd = dskReadAckExt ? dskReadAddrExt[0] : dskReadAddrInt[0]`). Present
+since core init (`93cf1ad`). NB: a separate 16 MHz IWM read-timing risk may still
+affect reads — to be evaluated on HW after this fix.
+
 **2026-06-12 — intentional FPGA-only additions (cold-load reset hardening):**
 all in `MacLC.sv` / `rtl/sdram.v`, none applicable to sim:
 - `rom_loaded` latch: system reset is held from FPGA config until the first

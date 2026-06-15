@@ -72,6 +72,8 @@ module swim
 	input [1:0] insertDisk,
 	output [1:0] diskEject,
 	input [1:0] diskSides,
+	input [1:0] diskMFM,    // disk is MFM-format (ISM path): {ext,int}
+	input [1:0] diskHD,     // disk is 1.44MB HD: {ext,int}
 
 	output [1:0] diskMotor,
 	output [1:0] diskAct,
@@ -126,6 +128,21 @@ module swim
 	wire [7:0] readDataExt;
 	wire senseExt = readDataExt[7]; // bit 7 doubles as the sense line here
 
+	// MFM (ISM) read stream from each drive + the pull/advance one-shot
+	wire [7:0] mfm_byte_int, mfm_byte_ext;
+	wire mfm_mark_int, mfm_mark_ext, mfm_crc0_int, mfm_crc0_ext;
+	reg  mfm_advance;    // 1-cen pull to the active drive's MFM generator
+	reg  ism_rd_armed;   // one advance per ISM reg0/1 read access
+	wire mfm_pull_int = mfm_advance && !selectExternalDrive;
+	wire mfm_pull_ext = mfm_advance &&  selectExternalDrive;
+
+	// Head-select (SEL/HDSEL) source: in ISM mode it is Mode-register bit5
+	// (MAME swim1.cpp: m_hdsel_cb((m_ism_mode>>5)&1)); in IWM mode it is VIA PA5.
+	// floppy.v indexes the drive-sense register as {ca2,ca1,ca0,SEL}; sense regs
+	// 0xC-0xF (the SuperDrive identify nibble) all need SEL=1, which in ISM mode
+	// the ROM asserts via Mode bit5, not the VIA. See findings doc.
+	wire effSEL = ism_mode ? ism_mode_reg[5] : SEL;
+
 	floppy floppyInt
 	(
 		.clk(clk),
@@ -136,7 +153,7 @@ module swim
 		.ca0(ca0),
 		.ca1(ca1),
 		.ca2(ca2),
-		.SEL(SEL),
+		.SEL(effSEL),
 		.lstrb(lstrb),
 		._enable(~(diskEnableInt & driveSel)),
 		.writeData(writeData),
@@ -152,7 +169,13 @@ module swim
 
 		.dskReadAddr(dskReadAddrInt),
 		.dskReadAck(dskReadAckInt),
-		.dskReadData(dskReadData)
+		.dskReadData(dskReadData),
+		.mfm_disk(diskMFM[0]),
+		.mfm_hd(diskHD[0]),
+		.mfm_pull(mfm_pull_int),
+		.mfm_byte(mfm_byte_int),
+		.mfm_mark(mfm_mark_int),
+		.mfm_crc0(mfm_crc0_int)
 	);
 
 	floppy floppyExt
@@ -165,7 +188,7 @@ module swim
 		.ca0(ca0),
 		.ca1(ca1),
 		.ca2(ca2),
-		.SEL(SEL),
+		.SEL(effSEL),
 		.lstrb(lstrb),
 		._enable(~diskEnableExt),
 		.writeData(writeData),
@@ -181,11 +204,25 @@ module swim
 
 		.dskReadAddr(dskReadAddrExt),
 		.dskReadAck(dskReadAckExt),
-		.dskReadData(dskReadData)
+		.dskReadData(dskReadData),
+		.mfm_disk(diskMFM[1]),
+		.mfm_hd(diskHD[1]),
+		.mfm_pull(mfm_pull_ext),
+		.mfm_byte(mfm_byte_ext),
+		.mfm_mark(mfm_mark_ext),
+		.mfm_crc0(mfm_crc0_ext)
 	);
 
 	wire [7:0] readData = selectExternalDrive ? readDataExt : readDataInt;
 	wire newByteReady = selectExternalDrive ? newByteReadyExt : newByteReadyInt;
+
+	// active drive's MFM (ISM) decoded byte + flags
+	wire [7:0] mfm_byte_sel = selectExternalDrive ? mfm_byte_ext : mfm_byte_int;
+	wire mfm_mark_sel = selectExternalDrive ? mfm_mark_ext : mfm_mark_int;
+	wire mfm_crc0_sel = selectExternalDrive ? mfm_crc0_ext : mfm_crc0_int;
+	wire mfm_sense    = selectExternalDrive ? senseExt : senseInt;  // write-protect/sense
+	// ISM MFM-read active: ISM personality + ACTION (mode bit3) + read (mode bit4=0)
+	wire ism_read_active = ism_mode && ism_mode_reg[3] && !ism_mode_reg[4];
 
 	reg [4:0] iwmMode;
 	/* IWM mode register: S C M H L
@@ -212,8 +249,13 @@ module swim
 		Should be 0 for 5.25 and 1 for 3.5.
 	*/
 
-	// ISM register address (lower 3 bits of cpuAddrRegHi)
-	wire [2:0] ism_reg_addr = cpuAddrRegHi[3:1];
+	// ISM register address = (addr>>9)&7 = the LOW 3 bits of cpuAddrRegHi.
+	// MAME swim1.cpp ism_read/ism_write use `offset & 7`, and the maclc ROM's own
+	// behaviour confirms it: it does WR $F16800(n=4) then RD $F17800(n=12) and the
+	// value reads back, so both alias to ISM reg 4 (Phases) — only n&7 makes 4==12.
+	// (Was cpuAddrRegHi[3:1] = n>>1, which scrambled every ISM register and broke
+	// all ISM-mode floppy access.  See docs/findings_mame_floppy_driveid_2026-06-13.md.)
+	wire [2:0] ism_reg_addr = cpuAddrRegHi[2:0];
 
 	// ================================================================
 	// IWM bit register updates (active in IWM mode only)
@@ -266,18 +308,15 @@ module swim
 		if (ism_mode) begin
 			// ISM mode reads
 			case (ism_reg_addr)
-				3'h0: begin // FIFO data pop
-					if (ism_fifo_pos == 0)
-						dataOutLo = 8'h00; // empty
-					else
-						dataOutLo = ism_fifo[0][7:0];
-				end
-				3'h1: begin // FIFO mark pop
-					if (ism_fifo_pos == 0)
-						dataOutLo = 8'h00;
-					else
-						dataOutLo = ism_fifo[0][7:0];
-				end
+				// Data ($0) / Mark ($1): during an MFM read, return the generator's
+				// current decoded byte (mark status is in the handshake); otherwise
+				// the legacy CPU-written FIFO.
+				3'h0:
+					dataOutLo = ism_read_active ? mfm_byte_sel
+					          : (ism_fifo_pos == 0) ? 8'h00 : ism_fifo[0][7:0];
+				3'h1:
+					dataOutLo = ism_read_active ? mfm_byte_sel
+					          : (ism_fifo_pos == 0) ? 8'h00 : ism_fifo[0][7:0];
 				3'h2: // Error register
 					dataOutLo = ism_error;
 				3'h3: // Param[idx]
@@ -288,20 +327,15 @@ module swim
 					dataOutLo = ism_setup;
 				3'h6: // Mode register
 					dataOutLo = ism_mode_reg;
-				3'h7: begin // Handshake
-					// Bit 7: FIFO has data (not empty)
-					// Bit 6: FIFO not full (can accept more)
-					// Bit 5: Error occurred
-					// Bit 3: Write protect (from sense line)
-					dataOutLo = {
-						(ism_fifo_pos != 0),     // bit 7: data available
-						(ism_fifo_pos < 2),      // bit 6: not full
-						(ism_error != 0),         // bit 5: error
-						1'b0,                     // bit 4: reserved
-						(selectExternalDrive ? senseExt : senseInt), // bit 3: write protect
-						3'b000                    // bits 2-0: reserved
-					};
-				end
+				// Handshake ($7), MAME swim1.cpp: b7 data-avail, b6 full, b5 error,
+				// b3/b2 sense/wprot (SWIM1 drives both), b1 CRC (0=good), b0 mark.
+				// In MFM read a byte is always ready, so b7/b6=1.
+				3'h7:
+					dataOutLo = ism_read_active
+						? {1'b1, 1'b1, (ism_error != 0), 1'b0,
+						   mfm_sense, mfm_sense, ~mfm_crc0_sel, mfm_mark_sel}
+						: {(ism_fifo_pos != 0), (ism_fifo_pos < 2), (ism_error != 0),
+						   1'b0, mfm_sense, 3'b000};
 			endcase
 		end
 		else begin
@@ -345,6 +379,8 @@ module swim
 			selectExternalDrive <= 0;
 			q6 <= 0;
 			q7 <= 0;
+			mfm_advance <= 1'b0;
+			ism_rd_armed <= 1'b1;
 		end
 		else if(cen) begin
 			// Default: update IWM bit registers from combinational next-state
@@ -497,6 +533,22 @@ module swim
 						ism_fifo_pos <= ism_fifo_pos - 1'b1;
 					end
 				end
+			end
+
+			// ISM MFM-read: advance the generator once per reg0/1 read access (one-
+			// shot, re-armed between accesses). A reg0 read of a mark byte flags
+			// Error bit1 (mark-read-from-data), per MAME swim1.cpp.
+			if (ism_read_active && _cpuRW && selectSWIM && (_cpuUDS == 1'b0) &&
+			    (ism_reg_addr == 3'h0 || ism_reg_addr == 3'h1)) begin
+				if (ism_rd_armed) begin
+					ism_rd_armed <= 1'b0;
+					mfm_advance  <= 1'b1;
+					if (ism_reg_addr == 3'h0 && mfm_mark_sel) ism_error[1] <= 1'b1;
+				end else
+					mfm_advance <= 1'b0;
+			end else begin
+				ism_rd_armed <= 1'b1;
+				mfm_advance  <= 1'b0;
 			end
 		end
 	end
