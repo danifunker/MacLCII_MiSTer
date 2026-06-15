@@ -188,8 +188,8 @@ module emu
 	assign AUDIO_L = asc_sample_l;
 	assign AUDIO_R = asc_sample_r;
 
-	// Mac LC memory configuration
-	wire [7:0] configRAMSize = 8'h24; // 2MB: no SIMM, 2MB board only
+	// Mac LC II memory configuration
+	wire [7:0] configRAMSize = 8'h04; // 4MB: no SIMM, 4MB soldered board (LC II base)
 	wire [7:0] pvia_ram_config_out;   // Active RAM config from pseudovia
 	wire       pvia_ram_configured;   // ROM has programmed V8 config ($0 mirror enable)
 
@@ -276,6 +276,31 @@ module emu
 			if (!_cpuAS & ((cpuBusControl & mem_latch_d) | (!selectROM & !selectRAM & !selectVRAM))) dtack_en <= 1;
 		end
 	end
+
+`ifdef PMMU_TRACE
+	// DTACK-side probe (pairs with the PMMU walker probe in tg68k.v). Counts, per
+	// ~262k-cycle window, how often the dtack_en SET condition's terms are true,
+	// to explain why a stalled walker read never gets DTACK. During the stall the
+	// last windows show the frozen picture.
+	reg [31:0] dbg_dcyc, c_aslow, c_slot, c_setcond, c_den, c_selram;
+	always @(posedge clk_sys) begin
+		if (!_cpuReset) begin
+			dbg_dcyc<=0; c_aslow<=0; c_slot<=0; c_setcond<=0; c_den<=0; c_selram<=0;
+		end else begin
+			dbg_dcyc <= dbg_dcyc + 1'b1;
+			if (!_cpuAS)                                     c_aslow   <= c_aslow + 1'b1;
+			if (cpuBusControl && mem_latch_d)                c_slot    <= c_slot + 1'b1;
+			if (!_cpuAS && cpuBusControl && mem_latch_d)     c_setcond <= c_setcond + 1'b1;
+			if (dtack_en)                                    c_den     <= c_den + 1'b1;
+			if (selectRAM)                                   c_selram  <= c_selram + 1'b1;
+			if (dbg_dcyc[17:0] == 18'd0) begin
+				$display("DTACK WIN cyc=%0d aslow=%0d slot=%0d setcond=%0d den=%0d selram=%0d cpuAddr=%h selROM=%b selVRAM=%b dtack=%b @%0t",
+				         dbg_dcyc, c_aslow, c_slot, c_setcond, c_den, c_selram, cpuAddr, selectROM, selectVRAM, _cpuDTACK, $time);
+				c_aslow<=0; c_slot<=0; c_setcond<=0; c_den<=0; c_selram<=0;
+			end
+		end
+	end
+`endif
 
 	// VRAM ($F40000-$FBFFFF, cpuAddr[23:21]==111) must use async DTACK like RAM,
 	// not the 6800 E-clock VPA peripheral path — the VPA path samples on a fixed

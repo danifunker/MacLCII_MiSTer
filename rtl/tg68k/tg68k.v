@@ -123,7 +123,19 @@ always @(posedge clk) begin
 
 		if (phi1) begin
 
-			if (s_state != 4) s_state <= s_state + 1'd1;
+			// The cycle micro-sequencer relies on a fixed parity: AS is asserted at
+			// s_state 1 in THIS phi1 branch and deasserted at s_state 6 in the phi2
+			// branch, i.e. odd s_state must fall on phi1 and even on phi2. The
+			// variable-length wait at s_state 4 (DTACK is slot-aligned, so it can
+			// last an ODD number of phi edges) and PMMU walks (clkena suppressed)
+			// can flip that parity; a subsequent cycle then passes s_state 1 on a
+			// phi2 edge, the AS-assert is skipped, and the access runs to s_state 4
+			// with AS deasserted and never gets DTACK (LC II PMMU-enable deadlock,
+			// docs/findings_pmmu_walk_stall_2026-06-15.md). Re-sync every cycle by
+			// only LEAVING s_state 0 on phi2 (`s_state != 0` here), exactly as a
+			// clkena-gated kernel cycle already does — guaranteeing s_state 1 lands
+			// on phi1 and AS asserts, regardless of any prior parity flip.
+			if (s_state != 4 && s_state != 3'd0) s_state <= s_state + 1'd1;
 			if (busreq_ack || bus_granted) s_state <= s_state;
 			if (eff_busstate == 2'b01) s_state <= 0;
 
@@ -335,7 +347,15 @@ end
 			pmmu_walker_ack <= 1'b0;   // single-cycle ack pulse
 
 			if (!walk_cycle) begin
-				if (pmmu_walker_req && !pmmu_walker_ack &&
+				// Start the walk cycle ONLY on phi1, matching the kernel's own
+				// clkena (phi1) cycle-start alignment. The main bus FSM asserts AS
+				// at s_state 1 in its phi1 branch only; if walk_cycle instead rises
+				// on a phi2 sub-edge, s_state passes through 1 on a phi2 edge where
+				// the AS-assert is skipped, so the walker read runs to s_state 4
+				// (wait-DTACK) with AS deasserted, never gets a DTACK, and deadlocks
+				// the page-table walk (the second back-to-back descriptor read hung
+				// exactly this way — see docs/findings_pmmu_walk_stall_2026-06-15.md).
+				if (phi1 && pmmu_walker_req && !pmmu_walker_ack &&
 				    s_state == 3'd0 && tg68_busstate == 2'b01) begin
 					walk_cycle <= 1'b1;
 					walk_word  <= 1'b0;   // high word first
@@ -363,6 +383,51 @@ end
 	always @(posedge clk) begin
 		if (tg68_clkena && tg68_busstate == 2'b00)
 			$display("TG68: FETCH PC=%h opcode=%h @%0t", tg68_addr, tg68_din_r, $time);
+	end
+	`endif
+
+	`ifdef PMMU_TRACE
+	// Focused PMMU table-walk + stall probe (does NOT spam per-fetch).
+	//  * logs each walk request/ack (capped) with the descriptor addr/data,
+	//  * logs make_berr/trap_berr edges,
+	//  * a heartbeat dump of the CPU/walker bus state so a post-pmove(tc) stall
+	//    is visible (the main cpu_trace goes blind once the kernel parks the bus
+	//    in a never-completing walk). Enable with +define+PMMU_TRACE.
+	reg        walk_cycle_d, mberr_d, tberr_d, wreq_d;
+	reg [31:0] dbg_cyc;
+	reg [31:0] dbg_walks;
+	always @(posedge clk) begin
+		if (reset) begin
+			walk_cycle_d <= 0; mberr_d <= 0; tberr_d <= 0; wreq_d <= 0;
+			dbg_cyc <= 0; dbg_walks <= 0;
+		end else begin
+			dbg_cyc      <= dbg_cyc + 1'b1;
+			walk_cycle_d <= walk_cycle;
+			wreq_d       <= pmmu_walker_req;
+			mberr_d      <= kernel_make_berr;
+			tberr_d      <= kernel_trap_berr;
+
+			// walk request edge (kernel asked for a descriptor)
+			if (pmmu_walker_req && !wreq_d && dbg_walks < 32'd400) begin
+				$display("PMMU REQ #%0d addr=%h we=%b (kernel PC~%h) @%0t",
+				         dbg_walks, pmmu_walker_addr, pmmu_walker_we, tg68_addr, $time);
+				dbg_walks <= dbg_walks + 1'b1;
+			end
+			// walk completion (ack pulse)
+			if (pmmu_walker_ack && dbg_walks < 32'd400)
+				$display("PMMU ACK  data=%h @%0t", pmmu_walker_data, $time);
+
+			if (kernel_make_berr && !mberr_d)
+				$display("PMMU make_berr  addr=%h s_state=%0d busstate=%b @%0t", tg68_addr, s_state, tg68_busstate, $time);
+			if (kernel_trap_berr && !tberr_d)
+				$display("PMMU trap_berr  addr=%h @%0t", tg68_addr, $time);
+
+			// heartbeat: periodic bus-state dump (catches a stalled/looping walk)
+			if (dbg_cyc[17:0] == 18'd0)
+				$display("PMMU HB cyc=%0d kpc=%h sstate=%0d bs=%b walk=%b wreq=%b waddr=%h berrh=%b dtack=%b @%0t",
+				         dbg_cyc, tg68_addr, s_state, tg68_busstate, walk_cycle,
+				         pmmu_walker_req, pmmu_walker_addr, berr_held, dtack_n, $time);
+		end
 	end
 	`endif
 // Expose busstate for debugging
