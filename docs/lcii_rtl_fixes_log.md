@@ -428,3 +428,40 @@ the kernel's translation+ATC for the ROM-alias region (or the in-progress real M
 Egret/VIA-SR chipset is fully exonerated (its SR response is byte-perfect vs MAME after fixes
 #1/#2). Verify next: dump the PMMU descriptor/translation for VA `$40A0010E` (compare to MAME's
 mapping) — expected to map to ROM physical, ours yields 0.
+
+### bug #3 ROOT MECHANISM (2026-06-16, +define+PMMU_TRACE) — bus error on first translated fetch
+
+Enabled the PMMU walker probe (`tg68k.v` `+define+PMMU_TRACE`) and ran to F157. At the
+`jmp ($40A0010E)` (`$a416b6`, the first fetch after `pmove tc` enables the MMU) the trace shows:
+
+```
+PMMU REQ #0 addr=003fee00  (root)            -> ACK 0009fc0a
+PMMU REQ #1 addr=003fee04                    -> ACK 003fedd0   (level-1 table pointer)
+PMMU trap_berr addr=00a416b6                 <-- BUS ERROR on the jmp's translated fetch
+... (later, the same VA re-walks and CAN resolve: 003fee00->003fedd0->003fedd4->00100019,
+     i.e. a valid page descriptor -> physical ~0x00100000) ...
+```
+
+So: the page tables are VALID (a walk DOES resolve to a real page descriptor `00100019` =>
+phys ~`$00100000`), but the FIRST MMU-translated access **spuriously bus-errors** (`trap_berr`
+at `$a416b6`). Then — because `$a416a0 movec D5,VBR` set **VBR=0** — the 68030 bus-error
+exception vector (#2) is at physical `$08`, which is in **zeroed RAM**, so the handler address
+is `0` => PC jumps to `000000`, executes the reset vectors as garbage, and walks to `$FFFFFFAA`
+-> `$00007FF8`.
+
+TWO coupled CPU-side defects (both in `rtl/tg68k/`):
+1. **Spurious bus error on the first MMU-translated fetch** — the translated physical access
+   (phys `~$00100000`) or the table walk faults when it should succeed. Smells like the same
+   bus-FSM / DTACK class as the earlier phi-parity walk-stall fix (`findings_pmmu_walk_stall`),
+   not fully cured for the translated-data access; or the `$40xxxxxx` VA index/limit (TC IS)
+   handling. Compare our walk to MAME's translation of `$40A0010E`.
+2. **The fault is unrecoverable** because the exception vector table at physical `$0` is zeroed
+   (VBR=0 + un-init low RAM), so any early bus error -> PC=0 -> wedge. (Stock ROM populates low
+   RAM; the fast-mem patch path here apparently does not by this point — but the PRIMARY bug is
+   #1: there should be no bus error.)
+
+This is firmly a CPU/PMMU bug (`TG68K_PMMU_030.vhd` / `tg68k.v` bus FSM), NOT the Egret/chipset
+(SR response byte-perfect vs MAME). It is the "second bug after PMMU-enable" the post-PMMU
+handoff suspected, now mechanistically located. Next: trace WHY the translated fetch of
+phys `~$0010010E` bus-errors (DTACK timing on the walk/translated access) vs MAME; dovetails
+with the in-progress real MC68030 import (MacIIvi repo).
