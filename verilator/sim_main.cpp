@@ -325,18 +325,16 @@ int verilate() {
 				uint32_t pc = VERTOPINTERN->debug_pc & 0xFFFFFF;
 				if (pc >= 0xA03124 && pc <= 0xA03150 && lb_logs < 400) {
 					uint32_t ca  = top->debug_cpuAddr & 0xFFFFFF;
-					unsigned rw  = VERTOPINTERN->debug_cpuRW;
 					uint32_t din = VERTOPINTERN->debug_cpuDataIn;
-					uint32_t dot = VERTOPINTERN->debug_cpuDataOut;
+					uint32_t drd = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__debug_data_read;
+					uint32_t op1b = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__op1outbrief;
 					unsigned srin = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__srin;
 					unsigned cond = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__exe_condition;
-					// only log on completed bus cycles (dtack) writes (RW=0) at $F01C00, + the cmp commit
-					unsigned dt = VERTOPINTERN->debug_cpu_dtack;
 					static uint32_t lastkey = 0xFFFFFFFF;
-					uint32_t key = pc ^ (din << 1) ^ (dot << 9) ^ (srin << 13) ^ (cond << 29) ^ (rw << 28) ^ (ca << 4) ^ (dt<<30);
+					uint32_t key = pc ^ (din << 1) ^ (drd << 5) ^ (op1b << 9) ^ (srin << 13) ^ (cond << 29) ^ (ca << 4);
 					if (key != lastkey) {
-						DLOG( "[LOOPBACK] pc=%06X addr=%06X RW=%u din=%08X dout=%08X srin=%04X Z=%u cond=%u dtack=%u F%d\n",
-							pc, ca, rw, din, dot, srin & 0xFFFF, (srin >> 2) & 1, cond, dt, video.count_frame);
+						DLOG( "[LOOPBACK] pc=%06X addr=%06X din=%08X data_read=%08X op1b=%08X srin=%04X Z=%u cond=%u F%d\n",
+							pc, ca, din, drd, op1b, srin & 0xFFFF, (srin >> 2) & 1, cond, video.count_frame);
 						lb_logs++; lastkey = key;
 					}
 				}
