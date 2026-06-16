@@ -87,6 +87,10 @@ const int cpu_trace_max = 0;  // 0 = unlimited
 int post_download_delay = 0;  // Delay after ROM load before tracing
 uint32_t cpu_trace_last_pc = 0xFFFFFFFF;  // For edge detection (new instruction)
 int cpu_trace_last_frame = -1;  // Track frame transitions in trace log
+// --trace-frames A,B: only WRITE trace lines for frames in [A,B] (skip the slow
+// chime so a focused window like the bank-scan stays small). Default = all.
+int trace_from_frame = 0;
+int trace_to_frame = 0x7FFFFFFF;
 
 // Fetch buffer: sliding window of recent code-space fetches (PC -> word).
 // Used to (a) skip extension-word fetches so only opcodes are logged and
@@ -463,7 +467,7 @@ int verilate() {
 							int words = len / 2;
 							cpu_trace_count++;
 							console.AddLog("[F%d] %08X: %04X  %s  @%06X", e.frame, e.pc, e.word, disasm, e.data_addr);
-							if (cpu_trace_file) {
+							if (cpu_trace_file && e.frame >= trace_from_frame && e.frame <= trace_to_frame) {
 								if (e.frame != cpu_trace_last_frame) {
 									fprintf(cpu_trace_file, "--- frame %d ---\n", e.frame);
 									cpu_trace_last_frame = e.frame;
@@ -491,7 +495,7 @@ int verilate() {
 						if (words > FETCH_BUF_SIZE) words = FETCH_BUF_SIZE;
 						cpu_trace_count++;
 						console.AddLog("[F%d] %08X: %04X  %s  @%06X", e.frame, e.pc, e.word, disasm, e.data_addr);
-						if (cpu_trace_file) {
+						if (cpu_trace_file && e.frame >= trace_from_frame && e.frame <= trace_to_frame) {
 							if (e.frame != cpu_trace_last_frame) {
 								fprintf(cpu_trace_file, "--- frame %d ---\n", e.frame);
 								cpu_trace_last_frame = e.frame;
@@ -810,6 +814,14 @@ int main(int argc, char** argv, char** env) {
 		} else if (strcmp(argv[i], "--no-cpu-trace") == 0) {
 			cpu_trace_disabled = true;
 			printf("Per-instruction CPU trace disabled (cpu_trace.log will not be written)\n");
+		} else if (strcmp(argv[i], "--trace-frames") == 0 && i + 1 < argc) {
+			// "A,B" — only write trace lines for frames in [A,B]
+			std::string s = argv[++i];
+			size_t comma = s.find(',');
+			trace_from_frame = std::stoi(s.substr(0, comma));
+			trace_to_frame = (comma == std::string::npos) ? trace_from_frame
+			                                              : std::stoi(s.substr(comma + 1));
+			printf("CPU trace restricted to frames [%d,%d]\n", trace_from_frame, trace_to_frame);
 		} else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
 			verbose_diag = true;
 			printf("Verbose bring-up diagnostics enabled\n");

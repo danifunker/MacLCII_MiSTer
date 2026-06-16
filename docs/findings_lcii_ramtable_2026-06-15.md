@@ -85,16 +85,48 @@ in order:
    being zeroed through the alias.
 3. The table-pointer push itself (whoever sets `[SP]` before `$A4657E`).
 
+## Update — the bank-scan probe, traced to ground truth
+
+Added `--trace-frames A,B` to `sim_main.cpp` (gate trace writes to a frame window,
+so the bank-scan window stays small without the chime). Traced F88–96 of
+`boot0-fastmem.rom`. The trace (`@data_addr` is the reliable signal; a register-dump
+detector's `rf[]` indexing proved **unreliable** for this core — trust the trace):
+
+1. `$A4A5D2`: writes `'PanD'` to CPU `$1FFFFE`, reads it back OK (motherboard-low is
+   mapped here, `ram_cfg=$04`), takes the success path. Fine.
+2. `$A4A5EC`: `ram_cfg → C4` (bits[7:6]=11). In our `addrDecoder` that makes
+   `mb_present=false`, and `in_simm` is false (physical config `$04` = no SIMM), so
+   **all of CPU `$0–$7FFFFF` is `selectUnmapped`.**
+3. `$A4A6C4` top-of-RAM probe then walks **`@7FFFFE → @6FFFFE → … → @3FFFFE →
+   @2FFFFE → @1FFFFE → @0FFFFE`**, stepping down 1 MB, and **every readback fails** —
+   including `$0–$3FFFFF`, the real 4 MB, because it's unmapped under `ram_cfg=C4`.
+   Probe concludes "no RAM," `ram_cfg → 84`.
+4. The data-bus-width test `$A4A6E6` then runs at **CPU `$400000`** (writes `@400000…
+   @400006`). `$400000` is the *exclusive* top of the 4 MB motherboard region
+   (`[0,$400000)`), so it's `selectUnmapped` too (and `addrController` would *wrap*
+   it to SDRAM `$0` if `selectRAM` were ever asserted there).
+
+Net: RAM is never correctly detected, the region list / table-base pointer comes out
+garbage, `A4=0`, the table is null.
+
+**Whether each of these matches real V8/MAME is the open question.** The C4 probe
+finding nothing is *plausibly* correct (no 8 MB SIMM). The divergence that yields the
+null table is somewhere in the `84`/`04` phase or the `$400000` boundary handling —
+our `addrDecoder`/`addrController` V8 RAM-config decode vs MAME `v8.cpp ram_size()`.
+
 ## Recommended next step
 
-Get the one missing fact: trace the **bank-scan `$A4A590…$A4A8FA` window** (it runs
-at ~F94 with `boot0-fastmem.rom`) and watch for **writes with `@9FFFExx`/`@1FFFExx`**
-— i.e. does the enumeration ever write a *valid* descriptor table, or push a
-non-zero pointer? That distinguishes "never built" from "built-then-clobbered".
-A focused detector (log CPU writes to SDRAM word `$0FFFF0`, plus the value pushed
-at the `$A4657E` table-pointer load) is cheaper than a full chime-through trace.
-Then fix the probe/enumeration so the 4 MB-no-SIMM config builds a real table —
-which should fix the slowness **and** the crash together.
+Run the **MAME `maclc2` oracle** (see memory `mame-maclc-oracle-setup`) with a CPU
+trace over the same bank-scan window and **diff it against our F88–96 trace** to find
+the first address where the RAM-presence / bus-width result diverges. That pinpoints
+exactly which V8 decode case (the `ram_cfg` C4/84 remap, the `$400000` boundary, or an
+unmapped-read return value) to fix in `addrDecoder.v` / `addrController_top.v`. Fixing
+it so the 4 MB-no-SIMM config is correctly enumerated should fix the slowness **and**
+the crash together.
+
+Tooling: `./obj_dir/Vemu --trace-frames 88,96 --verbose --stop-at-frame 97` with
+`boot0-fastmem.rom` swapped in produces the ~1.8k-line window used above
+(`cpu_trace.log`); grep `'] 00A4A5'`/`'] 00A4A6'` for the probe.
 
 ## Repro / state
 
