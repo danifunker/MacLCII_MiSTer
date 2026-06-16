@@ -322,19 +322,21 @@ int verilate() {
 			// aliased write value, it's a wrong-read-value bug.
 			{
 				static int lb_logs = 0;
-				uint32_t ca = top->debug_cpuAddr & 0xFFFFFF;
-				bool is_lb = ((ca & 0xF00000) == 0xF00000) && ((ca & 0x01FFFF) == 0x01C00);
-				if (is_lb && lb_logs < 300) {
+				uint32_t pc = VERTOPINTERN->debug_pc & 0xFFFFFF;
+				if (pc >= 0xA03124 && pc <= 0xA03150 && lb_logs < 400) {
+					uint32_t ca  = top->debug_cpuAddr & 0xFFFFFF;
 					unsigned rw  = VERTOPINTERN->debug_cpuRW;
 					uint32_t din = VERTOPINTERN->debug_cpuDataIn;
 					uint32_t dot = VERTOPINTERN->debug_cpuDataOut;
-					unsigned dt  = VERTOPINTERN->debug_cpu_dtack;
-					uint32_t pc  = VERTOPINTERN->debug_pc & 0xFFFFFF;
+					unsigned srin = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__srin;
+					unsigned cond = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__exe_condition;
+					// only log on completed bus cycles (dtack) writes (RW=0) at $F01C00, + the cmp commit
+					unsigned dt = VERTOPINTERN->debug_cpu_dtack;
 					static uint32_t lastkey = 0xFFFFFFFF;
-					uint32_t key = ca ^ (rw << 28) ^ (din << 1) ^ (dot << 2) ^ (dt << 30) ^ (pc << 3);
+					uint32_t key = pc ^ (din << 1) ^ (dot << 9) ^ (srin << 13) ^ (cond << 29) ^ (rw << 28) ^ (ca << 4) ^ (dt<<30);
 					if (key != lastkey) {
-						DLOG( "[LOOPBACK] pc=%06X addr=%06X RW=%u din=%08X dout=%08X dtack=%u F%d\n",
-							pc, ca, rw, din, dot, dt, video.count_frame);
+						DLOG( "[LOOPBACK] pc=%06X addr=%06X RW=%u din=%08X dout=%08X srin=%04X Z=%u cond=%u dtack=%u F%d\n",
+							pc, ca, rw, din, dot, srin & 0xFFFF, (srin >> 2) & 1, cond, dt, video.count_frame);
 						lb_logs++; lastkey = key;
 					}
 				}

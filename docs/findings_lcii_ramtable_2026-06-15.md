@@ -278,13 +278,34 @@ thing left is the CPU: the `cmp.b`/`Bcc` at `$A0313A`/`$A0313E` mishandles the f
 `cmp.l (An)` race fixed on the OLD core in `MacLC_MiSTer` `42ae7a6` (`ld_An1` defer) but
 NEVER ported to our `030_LCii` TG68K.C 030_mmu core. Confirms the dev's CPU instinct.
 
-### Fix direction
-Audit the 030 kernel's `cmp`/`Bcc` flag-commit timing for the analogous race (the
-`(An)`/EA immediate-read path pushing the flag commit one cycle late so the following
-`Bcc` samples stale flags), and port the `ld_An1`-style one-cycle defer. To confirm the
-exact mechanism, expose the kernel's flags (`debug_FlagsSR`/`exe_condition` are internal,
-`=> open` at `TG68K.vhd:507` — wire them up like the old-core debug did) and watch
-`Z`/`cond` across `$A0313A→$A0313E`. Fixing it fixes the enumeration, slow POST, crash.
+### REFINED again (2026-06-16) — NOT a flag-commit race; the cmp's operand is wrong
+A `[LOOPBACK]` detector exposing `srin` (SR-in) + `exe_condition` (the accessible kernel
+signals; `flagssr` is optimized out) shows, at the failing `cmp.b`:
+
+```
+pc=A0313E addr=F21C00 din=00000000 srin=0000 Z=0 cond=0   ; cmp reads $F21C00=$00
+pc=A0313E addr=F21C00 din=00000000 srin=0004 Z=1 cond=0   ; cmp COMMITS srin=$0004 = Z=1,N=0
+pc=A0313E addr=A03140 din=00000000 srin=0004 Z=1 cond=0   ; bne reads Z=1 correctly -> not taken
+```
+
+`srin=$0004` is a **zero result** (Z=1, N=0). With the memory operand correct (`$00`),
+`D1.byte - $00 == 0` ⇒ the `cmp` saw `D1.byte = $00` — but it must be `$FE` (deterministic:
+`st`→`$FF`, neg→`$01`, add→`$02`, neg→`$FE`). And the `bne` reads the committed `Z=1`
+correctly. So it's **NOT a flag-commit race** — the `cmp.b` uses a **wrong/stale `D1`
+operand**. `tst.b` of the *same* indexed I/O read at `$A03124` works, so the indexed-EA
+read + flag path is fine; the defect is the `cmp.b`'s register operand (pipeline/timing).
+The `move.b D1,(A2)` write trace shows `st`'s `$FF` writes correctly but the next write
+diverges from MAME's `$01` — consistent with a stale/late operand in the byte-op→cmp
+chain. (Regfile rf[i] is UNRELIABLE here — rf[2] read `$2600` where D2 must be `$20000`;
+don't trust regfile dumps in this 030 build without verifying indexing.)
+
+### Fix direction (definitive)
+Expose the cmp's ALU operands (`OP1out`/`OP2out`) and `last_data_read`/`get_ea_now`
+timing via a temporary kernel debug port + `rtl/tg68k/convert_to_verilog.sh` regen
+(ghdl 6.0.0 present) — the prior `ld_An1` session's proven method — to see which value
+the `cmp.b` actually latched as `D1`. Then fix the operand-latch/timing in the 030
+kernel's `cmp`/EA path (likely an `ld_AnXn`/`get_ea_now` defer or a `last_data_read`
+alignment, analogous to `42ae7a6`). Fixing it fixes the enumeration, slow POST, and crash.
 
 ## Repro / state
 
