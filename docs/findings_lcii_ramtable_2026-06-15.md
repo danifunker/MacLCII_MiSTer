@@ -229,6 +229,46 @@ RTL returns for the write-then-read-back + the `(A2)` vs `(A2+$20000)` compariso
 those addresses against MAME's V8/VIA. If the loopback or the `$20000`-stride alias
 behaves differently, `d1` bit7 flips and we take the failing extensive-probe path.
 
+## CONFIRMED via MAME maincpu trace (2026-06-16) — the exact first divergence
+
+How to run MAME for ground truth (the gotchas that cost the gdbstub detour): **always
+`-skip_gameinfo`** (else with `-debug` the CPU is frozen on the info/warning screen);
+the debugger/gdbstub **defaults to the Egret HC05, not the 68030** — target it:
+`trace /tmp/x.tr,maincpu`. Tools added: `verilator/mame/maincpu_regs.lua`,
+`loopback_vals.lua`. (See memory `mame-debugger-and-cmpl-bug` + sibling-repo
+`MacLC_MiSTer:mame-ground-truth-maclc`.)
+
+`trace …,maincpu` of MAME's bank-scan, diffed against our FPGA `cpu_trace.log`, shows
+the **first divergence at the `$A03124` loopback test**:
+
+```
+            MAME                              OURS
+$A0313A cmp.b (A2,D2.l),D1  reads $F21C00     reads $F21C00
+   MAME: $F21C00 = $00  -> $00 vs $FE  NEQ    OURS: reads == D1 ($FE)  -> EQUAL
+$A0313E bne $a03144        TAKEN               FALLS THROUGH to $A03140
+```
+
+MAME's captured values (`loopback_vals.lua`): writes `$FF`/`$01` to `$F01C00` (VIA1
+reg $C / PCR, which reads back the device value), but **`$F21C00` reads a clean `$00`**
+every time — it is *unmapped and separate*. Our core's `$F21C00` instead returns the
+written/aliased pattern (so the byte equals `D1`), making the loopback see **false
+aliasing at stride `$20000`** → wrong `d0/d1` → wrong RAM-enumeration path → null table.
+
+Our `addrDecoder.v` correctly decodes `$F21C00` (`address[19:12]=$21`) to
+`default: selectUnmapped`, and `dataController_top.sv:304` muxes `16'hFFFF` for
+`selectUnmapped` — but the CPU does NOT see `$FF` there (it sees the aliased pattern).
+So the bug is that **our unmapped I/O read does not actually deliver a distinct constant
+to the CPU** (stale/last-bus-value or a missing-DTACK read), unlike MAME's clean `$00`.
+
+### Fix direction
+Make our unmapped I/O read deliver a CPU-visible value distinct from the last write
+(MAME uses `$00`). Note `dataController_top.sv:304` already tried `$0000→$FFFF` to fix a
+*different* RAM-probe; the real issue is that the muxed constant isn't reaching the CPU
+for unmapped reads — check the unmapped read's DTACK / bus-cycle completion and whether
+`cpuDataOut` is actually latched (vs the CPU retaining a stale operand). Getting
+`$F21C00` to read `$00` (or any value ≠ the just-written pattern) makes the loopback
+branch match MAME, which should fix the enumeration, the slow POST, and the crash.
+
 ## Repro / state
 
 ```bash
