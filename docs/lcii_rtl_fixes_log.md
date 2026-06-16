@@ -120,7 +120,68 @@ VIA byte-shift bug and NOT the RAM/CPU. Candidate fix locations:
 NEXT: capture CB2 (and CB1) bit-level timing across the turnaround in both cores
 to decide which side leads/lags, then a targeted one-line timing fix.
 
+## MAME reference (the turnaround oracle) — `6522via.cpp`
+
+- `write_cb1(state)` is called on EVERY CB1 edge (Egret drives CB1 in ext mode).
+  In SO_EXT (mode7) it calls `shift_out()`, in SI_EXT/SR_DISABLED it calls
+  `shift_in()`.
+- A single `m_shift_counter` counts ALL 16 edges (0x0f→0). `shift_out` acts on
+  ODD counts (CB2 driven on falling), `shift_in` samples `m_in_cb2` on EVEN
+  counts (rising): `m_sr = (m_sr<<1) | m_in_cb2`.
+- **Key turnaround detail:** when the CPU reads/writes the SR, the counter is
+  re-initialised FROM THE CB1 LEVEL: `m_shift_counter = m_in_cb1 ? 0x0f : 0x10`
+  (6522via.cpp:772/968). Starting at 0x0f (CB1 high) means the very first edge is
+  ODD → NOT a shift-in, so the first DATA bit is sampled only on the next
+  (aligned) edge. This is what phase-aligns the first response byte to the
+  Egret's CB2 data.
+- `m_in_cb2` is the LATCHED CB2 value (`write_cb2` latches it); `shift_in` uses
+  the latched value, not a live sample.
+
+Our `via6522.sv` differs: it arms `bit_cnt<=7` on SR trigger regardless of CB1
+level, counts only 8 (relevant) edges, and shifts-in on every CB1 RISING edge
+sampling `cb2_i` LIVE. At the out→in turnaround the first rising edge can fall
+while CB2 is still idle (1) → first byte = FF (the observed bug). Subsequent
+bytes re-sync, so only the first (and the framing-dependent last) byte are wrong.
+
+### Fix plan (targeted, low regression risk — VIA-SR is only used from $A4A290+)
+Align our shift-in start to the CB1 level at SR-trigger time, matching MAME:
+when arming a shift-IN in ext-clock mode, if CB1 (`shift_clock`) is HIGH at the
+trigger, skip the first rising edge (don't sample the turnaround bit). Equivalent
+to MAME's `0x0f` (CB1 high) vs `0x10` (CB1 low) counter init. Also consider
+latching cb2_i (sample the value present before the edge) to match `m_in_cb2`.
+
+## Bit-level turnaround capture ([SRBIT], F117) — refines the culprit to the EGRET
+
+Captured CB1/CB2/bit_cnt/shift_reg per edge across the first shift-in
+(`sim_main.cpp` [SRBIT]). Decisive:
+```
+1st IN byte (pc A4A36x): CB1 clocks 8 edges, CB2=1 the WHOLE time -> SReg=FF (idle)
+2nd IN byte (pc A4A42x): CB2 toggles 0/1 (real data)            -> SReg=FE.. valid
+```
+So the VIA shifts correctly; the **Egret drives its CB2 response data one byte
+LATE** — it clocks a leading idle (CB2=1) byte, which the VIA captures as FF. The
+ROM reads FF (invalid packet type), branches to a different path (pc diverges:
+ours A4A36C vs MAME A4A374) and the `$A4A18C` loop never terminates.
+
+Our Egret runs the SAME HC05 ROM (341S0850) as MAME, so the bug is in the
+**cycle timing of `egret_wrapper`/the HC05 model** — when its CB2 port write
+takes effect relative to CB1/BYTEACK — NOT the VIA6522 (which shifts faithfully)
+and NOT the RAM/CPU. This matches the in-tree note at dataController_top.sv:692
+about an Egret CB1/handshake bug.
+
+### Status / recommended next step
+- The VIA6522 is exonerated (shift mechanism + byte transfer verified correct).
+- Fix target: `rtl/egret/egret_wrapper.sv` + the HC05 port/handshake timing (and
+  the TIP/BYTEACK sync in dataController_top.sv) so the Egret's first response
+  CB2 bit is valid on the first CB1 edge (no leading idle byte), matching MAME.
+- To pin the exact one-cell offset, get MAME's CB1/CB2/BYTEACK bit timing in this
+  window (needs MAME egret.cpp instrumentation or HC05 trace — lua taps can't see
+  the CB lines), then a targeted timing fix + re-verilate.
+
 ## RTL changes
 
-_(none yet — diagnosis points at the VIA shift-in / Egret-CB2 turnaround timing;
-capturing bit-level CB1/CB2 timing at the turnaround before the targeted edit.)_
+_(none applied yet. Root cause is the Egret HC05/handshake CB2 timing, not the
+VIA6522. VIA6522 changes are NOT required — it shifts correctly. Pending: an
+egret_wrapper/HC05 CB2-vs-CB1 timing fix; deferred to a focused Egret-timing
+session since it needs MAME bit-level co-sim to land precisely without
+regressing the working pre-$A4A290 boot.)_

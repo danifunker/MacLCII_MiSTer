@@ -609,6 +609,26 @@ int verilate() {
 				// byte stream. MAME exchanges a fixed 14-iteration packet; ours loops
 				// because the Egret returns wrong response bytes. Diff this vs a MAME
 				// lua tap on the VIA SR reg ($F01400) to find the first divergent byte.
+				// [SRBIT] bit-level CB1/CB2/bit_cnt at the FIRST shift-in turnaround
+				// (frame 117 only). Shows whether the VIA samples an idle CB2=1 bit
+				// before the Egret drives valid data (the FF first byte).
+				if (video.count_frame == 117) {
+					static uint32_t bit_key = 0xFFFFFFFF; static int bit_logs = 0;
+					uint32_t cb1b = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__shift_clock;
+					uint32_t cb2b = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__cb2_i;
+					uint32_t bcb  = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__bit_cnt;
+					uint32_t acb  = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__acr;
+					uint32_t scb  = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__shift_active;
+					uint32_t srb  = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__shift_reg;
+					bool srmode = (acb & 0x10) || (((acb>>2)&7)==3);  // any SR/ext mode
+					uint32_t bk = (cb1b)|(cb2b<<1)|(bcb<<2)|(scb<<6)|((acb&0x1C)<<8);
+					if (srmode && bk != bit_key && bit_logs < 250) {
+						DLOG("[SRBIT] F117 CB1=%u CB2=%u bcnt=%u act=%u ACR=%02X SReg=%02X pc=%06X\n",
+							cb1b, cb2b, bcb, scb, acb, srb, VERTOPINTERN->debug_pc & 0xFFFFFF);
+						bit_key = bk; bit_logs++;
+					}
+				}
+
 				static uint32_t prev_act = 0; static int byteseq = 0;
 				uint32_t sact = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__shift_active;
 				if (prev_act == 1 && sact == 0 && byteseq < 200) {  // shift just completed
