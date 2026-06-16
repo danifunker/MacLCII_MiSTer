@@ -171,16 +171,41 @@ a hardware-config subroutine). So the bug is a **hardware-response difference** 
 chipset presents during enumeration — NOT the ROM, NOT the march, NOT a fundamental
 algorithm gap.
 
+## CORRECTION + refinement (later same session)
+
+The "MAME does ZERO probe writes / doesn't run the bank-scan" reading above was an
+**artifact of lua read-taps not seeing opcode fetches**. A deduped capture of VIA1 +
+pseudovia **data** reads (which taps DO see) proves **MAME runs the bank-scan**:
+pseudovia reads occur from `pc=$A4A5CC, $A4A5E6, $A4A61A, $A4A620` (and `$A467DA/E0/FE`)
+— and `$A4A5E6` is the path *after* the `'PanD'` check passes. So both cores run
+`$A4A5xx`; the divergence is in the VALUES read / branches taken, not "MAME skips it".
+
+Registers checked at the enumeration — **all MATCH MAME**, so none is the bug:
+- pseudovia **config reg 1** = `ram_cfg|$04` = `$04` (MAME `via2_config_r` = `m_config|0x04`)
+- pseudovia **port B reg 0** = `$00` (our `port_b` inits `$00`; MAME reads `$00`)
+- VIA1 reads = `$00`; address mapping, unmapped-const, cache, PMMU (above).
+
+So the divergence is subtle (the RAM-probe data responses, or the `d0/d1` subroutine
+at `$A4A5A4`→`~$A03F18` which reads neither VIA nor pseudovia in the capture). It needs
+an **instruction-level diff**, which is currently **blocked**: MAME's headless debugger
+breakpoints do NOT fire — neither `-debug -debugscript bpset` nor gdbstub `Z1` (even a
+bp at `$A468CA`, the march, *known-executed*, missed in 60 s); and lua taps can't see
+opcode fetches. `g` over gdbstub returns `E01` at the initial halt.
+
 ## Recommended next step
 
-Get MAME's **instruction trace** of the enumeration to find the first divergent
-hardware read/branch. The headless `-debug -debugscript` route did NOT fire breakpoints
-under `-video none` (a march bp at `$a46850`, known-executed, also missed — so it's a
-debugger-backend problem, not evidence about MAME's path). Try `-debugger gdbstub`, a
-windowed `-video soft` run, or a lua per-instruction hook
-(`cpu.debug` / instruction callback) to dump `D0/D1` + the config-register reads at the
-bank-scan entry (`$A4A5A0`). Then diff against our F88–96 FPGA trace and fix the chipset
-register our enumeration reads wrong.
+Two viable routes (the lua I/O-read taps and the FPGA `--trace-frames` both work; only
+MAME *instruction* tracing is blocked):
+
+1. **Get MAME breakpoints to fire** — run MAME *windowed* (`-video soft`, not
+   `-video none`) with the internal debugger, or find the gdbstub `Z1`/`g` quirk; then
+   trace `$A4A5A0`→`$A4A638` and read `D0/D1` at the `$A4A5C2` branch.
+2. **Instrument our core's enumeration read SEQUENCE** (every VIA/pseudovia/RAM read in
+   the bank-scan, value+PC) via a sim_main.cpp detector, and diff it against MAME's
+   deduped lua capture (`bankscan_trace.lua`, already written). First divergent
+   (PC, register/address, value) is the bug.
+
+Then fix the chipset response our enumeration reads wrong → fixes slow POST + crash.
 
 ## Repro / state
 

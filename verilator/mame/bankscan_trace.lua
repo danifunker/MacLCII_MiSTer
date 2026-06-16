@@ -31,22 +31,24 @@ local function logacc(kind, off, data)
 	end
 end
 
+-- Capture every DISTINCT (pc,register) VIA1 + pseudovia READ with its value — deduped
+-- so the VIA poll loop doesn't flood it. Shows exactly which config registers the RAM
+-- enumeration reads and what MAME returns, to diff vs our core's chipset responses.
+local seen = {}
 local function install()
 	for _,t in ipairs(probe_taps) do pcall(function() t:remove() end) end
 	probe_taps = {}
-	local function win(lo, hi)
-		probe_taps[#probe_taps+1] = space:install_read_tap(lo, hi, "pr", function(o,d,m) logacc("R", o, d) end)
-		probe_taps[#probe_taps+1] = space:install_write_tap(lo, hi, "pw", function(o,d,m) logacc("W", o, d) end)
-	end
-	for x = 0, 9 do win((x << 20) | 0xFFFF0, (x << 20) | 0xFFFFF) end
-	win(0x400000, 0x40000F)
-	-- Capture d0/d1 at the bank-scan branch $A4A5C2 (btst #7,d1; beq $a4a638):
-	-- if MAME takes beq (d1 bit7 clear) it SKIPS the extensive probe our core runs.
-	probe_taps[#probe_taps+1] = space:install_read_tap(0xA4A5C2, 0xA4A5C3, "brp", function(o,d,m)
-		local d0,d1,a0v = 0,0,0
-		pcall(function() d0 = cpu.state["D0"].value; d1 = cpu.state["D1"].value; a0v = cpu.state["A0"].value end)
-		if cap < 3000 then cap = cap + 1
-			emit(string.format("BRANCH F=%d $A4A5C2 D0=%08X D1=%08X(bit7=%d) A0=%08X", frame, d0, d1, (d1>>7)&1, a0v)) end
+	probe_taps[#probe_taps+1] = space:install_read_tap(0xF00000, 0xF01FFF, "v1", function(o,d,m)
+		local p = pcnow(); local reg = (o >> 9) & 0xF
+		local k = string.format("V1.%X.%08X", reg, p)
+		if not seen[k] then seen[k] = true
+			emit(string.format("VIA1r reg=%X data=%02X pc=%08X F=%d", reg, d & 0xFF, p, frame)) end
+	end)
+	probe_taps[#probe_taps+1] = space:install_read_tap(0xF26000, 0xF27FFF, "pv", function(o,d,m)
+		local p = pcnow(); local reg = o & 0x13
+		local k = string.format("PV.%02X.%08X", reg, p)
+		if not seen[k] then seen[k] = true
+			emit(string.format("PVr reg=%02X data=%02X pc=%08X F=%d", reg, d & 0xFF, p, frame)) end
 	end)
 end
 
