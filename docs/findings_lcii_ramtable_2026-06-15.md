@@ -136,19 +136,51 @@ path (the `'PanD'` write to `$1FFFFE` and the table-ptr load `movea.l (a7),a4` w
 ODD `a7=$773F` both cross a 2 MB SDRAM-word boundary), or the `84`/`04`-phase reprobe
 of mapped RAM that this F88–96 window didn't reach.
 
+## MAME `maclc2` oracle result — the table is CORRECT in MAME; our enumeration fails
+
+Tool added: `verilator/mame/bankscan_trace.lua` (taps the RAM-probe address windows
+`$X0FFF0..$X0FFFF` + `$400000` and logs read/write VALUES + PC). Run:
+`verilator/mame/run_mame_maclc2.sh -autoboot_script verilator/mame/bankscan_trace.lua
+-seconds_to_run 8`. **The ROM is byte-identical** — MAME's `maclc2` 4-chip romset
+(`341-047{3,4,5,6}`, interleaved hh,mh,ml,ll) assembles to exactly our `boot0.rom`
+(sha `18c3de07…`).
+
+What MAME does at those windows (the decisive data; lua read/write taps DO see data
+accesses — only opcode *fetches* bypass them):
+
+```
+W pc=00A4685E addr=0FFFF0 data=6DB6DB6D   ; march FILL — REAL RAM
+W pc=00A46862 addr=1FFFF0 data=B6DB6DB6
+R pc=00A468CA addr=0FFFF0 data=6DB6DB6D   ; march eor.l reads back the pattern
+W pc=00A468CA addr=0FFFF0 data=DB6DB6DB   ; …correctly. RAM works.
+```
+
+- **MAME's POST march sweeps REAL RAM** (`$0FFFFx, $1FFFFx, $2FFFFx, …`) with correct
+  `$6DB6DB6D` pattern read-back ⇒ in MAME the **descriptor table is built correctly**
+  (real 4 MB chunks). Our core's march instead runs on garbage (`A0=$3/$97`, null table).
+- **MAME does ZERO of the extensive-probe writes our core does** — no `'PanD'`→`$1FFFFE`,
+  no `'Tina'`/top-of-RAM walk `$7FFFFE..$0FFFFE`, no `$400000` bus-width test. (Data
+  writes are caught by the working write-tap; only ~85 accesses total, all from the
+  march `$A468xx`.) So MAME's RAM enumeration **succeeds without** the extensive probe;
+  our core **falls into** that probe (and it fails) → null table.
+
+**Conclusion:** same ROM, but our core's RAM enumeration diverges from MAME's and fails.
+MAME proves a correct 4 MB-no-SIMM table is buildable here; our core mis-enumerates and
+takes the failing extensive-probe branch (~`$A4A5C2 btst #7,d1`, where `d0/d1` come from
+a hardware-config subroutine). So the bug is a **hardware-response difference** our
+chipset presents during enumeration — NOT the ROM, NOT the march, NOT a fundamental
+algorithm gap.
+
 ## Recommended next step
 
-Run the **MAME `maclc2` oracle** (see memory `mame-maclc-oracle-setup`) with a CPU
-trace over the same bank-scan window and **diff it against our F88–96 trace** to find
-the first address where the RAM-presence / bus-width result diverges. That pinpoints
-exactly which V8 decode case (the `ram_cfg` C4/84 remap, the `$400000` boundary, or an
-unmapped-read return value) to fix in `addrDecoder.v` / `addrController_top.v`. Fixing
-it so the 4 MB-no-SIMM config is correctly enumerated should fix the slowness **and**
-the crash together.
-
-Tooling: `./obj_dir/Vemu --trace-frames 88,96 --verbose --stop-at-frame 97` with
-`boot0-fastmem.rom` swapped in produces the ~1.8k-line window used above
-(`cpu_trace.log`); grep `'] 00A4A5'`/`'] 00A4A6'` for the probe.
+Get MAME's **instruction trace** of the enumeration to find the first divergent
+hardware read/branch. The headless `-debug -debugscript` route did NOT fire breakpoints
+under `-video none` (a march bp at `$a46850`, known-executed, also missed — so it's a
+debugger-backend problem, not evidence about MAME's path). Try `-debugger gdbstub`, a
+windowed `-video soft` run, or a lua per-instruction hook
+(`cpu.debug` / instruction callback) to dump `D0/D1` + the config-register reads at the
+bank-scan entry (`$A4A5A0`). Then diff against our F88–96 FPGA trace and fix the chipset
+register our enumeration reads wrong.
 
 ## Repro / state
 
