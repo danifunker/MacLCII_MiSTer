@@ -260,14 +260,31 @@ Our `addrDecoder.v` correctly decodes `$F21C00` (`address[19:12]=$21`) to
 So the bug is that **our unmapped I/O read does not actually deliver a distinct constant
 to the CPU** (stale/last-bus-value or a missing-DTACK read), unlike MAME's clean `$00`.
 
+### CORRECTION (2026-06-16) — it's a CPU bug, not the chipset value
+A `[LOOPBACK]` detector (`sim_main.cpp`, logs `debug_cpuDataIn` at the `$F_1C00`
+loopback addresses) shows our core **reads `$F21C00 = $00`** (`din=00000000`) — exactly
+like MAME. So the read value is CORRECT; the unmapped-value theory above is WRONG.
+
+```
+pc=003128 addr=F21C00 RW=1 din=00000000   ; $A03124 tst.b reads $F21C00 = $00
+pc=00313E addr=F21C00 RW=1 din=00000000   ; $A0313A cmp.b reads $F21C00 = $00
+```
+
+`D1=$FE` at `$A0313A` is deterministic (`st`→`$FF`, neg→`$01`, add→`$02`, neg→`$FE`), so
+`cmp.b $00,$FE` is unambiguously **not-equal** → the `bne` MUST be taken (it is in MAME)
+— but our core **falls through**. With correct operands AND a correct read, the only
+thing left is the CPU: the `cmp.b`/`Bcc` at `$A0313A`/`$A0313E` mishandles the flags (a
+**flag-commit-vs-branch race** / stale-flag), the SAME CLASS as the documented `tg68k`
+`cmp.l (An)` race fixed on the OLD core in `MacLC_MiSTer` `42ae7a6` (`ld_An1` defer) but
+NEVER ported to our `030_LCii` TG68K.C 030_mmu core. Confirms the dev's CPU instinct.
+
 ### Fix direction
-Make our unmapped I/O read deliver a CPU-visible value distinct from the last write
-(MAME uses `$00`). Note `dataController_top.sv:304` already tried `$0000→$FFFF` to fix a
-*different* RAM-probe; the real issue is that the muxed constant isn't reaching the CPU
-for unmapped reads — check the unmapped read's DTACK / bus-cycle completion and whether
-`cpuDataOut` is actually latched (vs the CPU retaining a stale operand). Getting
-`$F21C00` to read `$00` (or any value ≠ the just-written pattern) makes the loopback
-branch match MAME, which should fix the enumeration, the slow POST, and the crash.
+Audit the 030 kernel's `cmp`/`Bcc` flag-commit timing for the analogous race (the
+`(An)`/EA immediate-read path pushing the flag commit one cycle late so the following
+`Bcc` samples stale flags), and port the `ld_An1`-style one-cycle defer. To confirm the
+exact mechanism, expose the kernel's flags (`debug_FlagsSR`/`exe_condition` are internal,
+`=> open` at `TG68K.vhd:507` — wire them up like the old-core debug did) and watch
+`Z`/`cond` across `$A0313A→$A0313E`. Fixing it fixes the enumeration, slow POST, crash.
 
 ## Repro / state
 

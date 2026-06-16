@@ -314,6 +314,32 @@ int verilate() {
 				}
 			}
 
+			// [LOOPBACK] decisive test for the $A03124 hardware-presence loopback:
+			// MAME reads $F21C00=$00 (separate) -> cmp not-equal -> bne taken; ours
+			// bne falls through. Log the CPU's read VALUE (debug_cpuDataIn) at the
+			// loopback addresses ($F_1C00) — if it reads $FF (unmapped, distinct) the
+			// value is correct and the bug is flag-commit timing; if it reads the
+			// aliased write value, it's a wrong-read-value bug.
+			{
+				static int lb_logs = 0;
+				uint32_t ca = top->debug_cpuAddr & 0xFFFFFF;
+				bool is_lb = ((ca & 0xF00000) == 0xF00000) && ((ca & 0x01FFFF) == 0x01C00);
+				if (is_lb && lb_logs < 300) {
+					unsigned rw  = VERTOPINTERN->debug_cpuRW;
+					uint32_t din = VERTOPINTERN->debug_cpuDataIn;
+					uint32_t dot = VERTOPINTERN->debug_cpuDataOut;
+					unsigned dt  = VERTOPINTERN->debug_cpu_dtack;
+					uint32_t pc  = VERTOPINTERN->debug_pc & 0xFFFFFF;
+					static uint32_t lastkey = 0xFFFFFFFF;
+					uint32_t key = ca ^ (rw << 28) ^ (din << 1) ^ (dot << 2) ^ (dt << 30) ^ (pc << 3);
+					if (key != lastkey) {
+						DLOG( "[LOOPBACK] pc=%06X addr=%06X RW=%u din=%08X dout=%08X dtack=%u F%d\n",
+							pc, ca, rw, din, dot, dt, video.count_frame);
+						lb_logs++; lastkey = key;
+					}
+				}
+			}
+
 			// March progress counters — independent of cpu_trace gating.
 			// $A46910 = one full inner-march region pass completed (cmpi.w #21,d7)
 			// $A4694C = march fully done; $A4A590 = bank-scan driver reached.
