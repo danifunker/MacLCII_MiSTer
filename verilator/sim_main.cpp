@@ -598,6 +598,33 @@ int verilate() {
 				}
 			}
 
+			// [SR] VIA6522 shift-register + Egret handshake trace. The $A4A18C packet
+			// loop never completes in our core (MAME: 14 iters & exits). Watch whether
+			// the SR transfers bytes (bit_cnt 7->0, IFR[2] fires) and whether the Egret
+			// ever DEASSERTS TREQ (port_b_i bit3). Gated to the post-chime window and
+			// deduped by a composite key so we see edge transitions, not every clk.
+			if (video.count_frame >= 113 && !*bus.ioctl_download) {
+				// [SRBYTE] log each COMPLETED SR byte (serial_event / shift_active 1->0)
+				// with direction (ACR shift-out=$1C vs shift-in=$0C) — the CPU<->Egret
+				// byte stream. MAME exchanges a fixed 14-iteration packet; ours loops
+				// because the Egret returns wrong response bytes. Diff this vs a MAME
+				// lua tap on the VIA SR reg ($F01400) to find the first divergent byte.
+				static uint32_t prev_act = 0; static int byteseq = 0;
+				uint32_t sact = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__shift_active;
+				if (prev_act == 1 && sact == 0 && byteseq < 200) {  // shift just completed
+					uint32_t sreg = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__shift_reg;
+					uint32_t acrv = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__acr;
+					uint32_t pbi  = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via_pb_i;
+					DLOG("[SRBYTE] #%d F%d %s SReg=%02X PB=%02X(TREQ=%u BYTEACK=%u TIP=%u) pc=%06X\n",
+						byteseq, video.count_frame,
+						((acrv>>2)&7)==7 ? "OUT->Egret" : (((acrv>>2)&7)==3 ? "IN <-Egret" : "??"),
+						sreg, pbi, (pbi>>3)&1, (pbi>>4)&1, (pbi>>5)&1,
+						VERTOPINTERN->debug_pc & 0xFFFFFF);
+					byteseq++;
+				}
+				prev_act = sact;
+			}
+
 			// CPU trace output - skip while ROM is downloading
 			// TG68 issues a bus fetch for every code-space word (opcode AND extension
 			// words). We buffer consecutive sequential fetches and only emit a log
