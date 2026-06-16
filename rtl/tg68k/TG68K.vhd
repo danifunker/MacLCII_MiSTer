@@ -264,7 +264,9 @@ COMPONENT TG68KdotC_Kernel
       debug_exec_trap_chk              : out std_logic;
       debug_set_trap_chk               : out std_logic;
       debug_data_write_tmp             : out std_logic_vector(31 downto 0);
-      debug_FlagsSR                    : out std_logic_vector(7 downto 0)
+      debug_FlagsSR                    : out std_logic_vector(7 downto 0);
+      debug_OP1out                     : out std_logic_vector(31 downto 0);
+      debug_OP2out                     : out std_logic_vector(31 downto 0)
    );
    END COMPONENT;
 
@@ -569,7 +571,9 @@ cpu1: TG68KdotC_Kernel
       debug_micro_state => open,
       debug_next_micro_state => open,
       debug_memmask => open,
-      debug_sndOPC => open
+      debug_sndOPC => open,
+      debug_OP1out => open,
+      debug_OP2out => open
    );
  
    PROCESS (CLK)

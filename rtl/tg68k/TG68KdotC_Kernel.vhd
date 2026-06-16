@@ -313,7 +313,9 @@ entity TG68KdotC_Kernel is
 		debug_exec_trap_chk      : out std_logic;
 		debug_set_trap_chk       : out std_logic;
 		debug_data_write_tmp     : out std_logic_vector(31 downto 0);
-		debug_FlagsSR            : out std_logic_vector(7 downto 0)
+		debug_FlagsSR            : out std_logic_vector(7 downto 0);
+		debug_OP1out             : out std_logic_vector(31 downto 0);
+		debug_OP2out             : out std_logic_vector(31 downto 0)
 			);
 end TG68KdotC_Kernel;
 
@@ -8713,6 +8715,8 @@ debug_state <= state;
 debug_setstate <= setstate;
 debug_last_opc_read <= last_opc_read;
 debug_data_read <= data_read;
+debug_OP1out <= ea_data;          -- cmp memory operand (OP1out <= ea_data); register, survives opt
+debug_OP2out <= last_data_read;   -- the stale last-read source; register
 debug_direct_data <= '1' when direct_data='1' else '0';
 debug_setnextpass <= '1' when setnextpass='1' else '0';
 

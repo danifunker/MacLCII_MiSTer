@@ -324,3 +324,41 @@ cp /tmp/stock.rom ../releases/boot0.rom    # RESTORE (stock sha 18c3de07…)
   untracked files: `verilator/patch_fast_ramtest.py`, `releases/boot0-fastmem.rom`.
 - The handoff's `d5786182…` stock sha was a different hash convention; the
   committed LC II ROM is **`18c3de07…`** (matches HEAD `a8ad155`).
+
+## NAILED (2026-06-16) — execOPC fires before the cmp's operands settle
+
+Exposed the cmp's ALU inputs `OP1out`/`OP2out` + `ea_data`/`D1`(=rf14) via a kernel
+debug-port regen + `verilator/tg68k_debug.vlt` (`public_flat_rd` on `op1out`, `op2out`,
+`ea_data`, `last_data_read`). At the failing `cmp.b (A2,D2.l),D1` @ `$A0313A`:
+
+```
+pc=A0313E D1=000080FE OP1=50F01C00 OP2=00000000 srin=0000 Z=0  ; ALU computes flags HERE
+pc=A0313E D1=000080FE OP1=000080FE OP2=00000400 srin=0004 Z=1  ; flags COMMIT (1 cyc later)
+```
+
+Flags were computed from `OP1=$50F01C00` (the PREVIOUS instr's EA address `$F01C00`, low
+byte `$00`) and `OP2=$00` -> `$00-$00=0` -> **Z=1**. ONE CYCLE LATER the real operands
+settle: `OP1=D1=$80FE`, `OP2=ea_data=$400` -> `$FE-$00`->Z=0 (correct). So `execOPC`
+fires one cycle before `OP1out`/`OP2out` settle to the cmp's actual operands, latching
+flags from stale mid-EA-computation values. `D1` is correct (`$80FE`, low byte `$FE`;
+verified via rf14 -- **regfile is REVERSED: D0=rf15..D7=rf8, A0=rf7..A7=rf0**), the read
+is correct (`$00`); only the flag-vs-operand-settle TIMING is wrong, for the indexed
+`(An,Xn)` addressing of this `$F0xxxx` I/O read.
+
+Root: the `setexecOPC` gate (`TG68KdotC_Kernel.vhd:~2897`):
+`IF setstate="00" AND next_micro_state=idle AND set_direct_data='0' AND
+ (exec_write_back='0' OR (state="10" AND addrvalue='0')) THEN setexecOPC <= '1';`
+For a READ (`exec_write_back='0'`) it does NOT wait for the read's `state="10"` (write-
+back does). The indexed-EA `(An,Xn)` path puts transient values on `OP1out` (the EA
+address, the index) as it computes, so `execOPC` can latch flags before the operands
+settle.
+
+### Fix direction
+Targeted, `ld_An1`-class: defer `execOPC`/the execute one cycle for the indexed `(An,Xn)`
+source path so `OP1out`/`OP2out` settle to (D1, ea_data) before the flag commit -- OR
+tighten the `setexecOPC` read gate to require the read/EA to have settled (mirror the
+write-back `state="10"` guard) for this case. Delicate change on a path every instruction
+uses; verify with the `[LOOPBACK]` detector (the `bne` must take), re-run the
+SingleStepTests CPU corpus for regressions, then confirm the descriptor table builds,
+POST is fast, and the boot progresses. Debug instrumentation (kernel `debug_OP1out/OP2out`
+ports + `tg68k_debug.vlt` + `[LOOPBACK]` detector) is committed for this work.

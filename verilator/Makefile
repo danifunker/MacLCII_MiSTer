@@ -62,6 +62,7 @@ CC_OPT =
 
 # MacLC RTL source files
 V_SRC = \
+	tg68k_debug.vlt \
 	sim.v \
 	sim_ram.v \
 	$(RTL)/tg68k/TG68KdotC_Kernel.v \

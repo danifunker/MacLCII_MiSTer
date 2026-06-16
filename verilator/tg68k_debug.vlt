@@ -1,0 +1,7 @@
+`verilator_config
+// Expose the cmp's memory-operand latch (ea_data) + the stale last-read source so
+// the sim can verify whether cmp.b of an indexed I/O read uses a stale operand.
+public_flat_rd -module "TG68KdotC_Kernel" -var "ea_data"
+public_flat_rd -module "TG68KdotC_Kernel" -var "last_data_read"
+public_flat_rd -module "TG68KdotC_Kernel" -var "op1out"
+public_flat_rd -module "TG68KdotC_Kernel" -var "op2out"

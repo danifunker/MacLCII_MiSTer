@@ -326,15 +326,16 @@ int verilate() {
 				if (pc >= 0xA03124 && pc <= 0xA03150 && lb_logs < 400) {
 					uint32_t ca  = top->debug_cpuAddr & 0xFFFFFF;
 					uint32_t din = VERTOPINTERN->debug_cpuDataIn;
-					uint32_t drd = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__debug_data_read;
-					uint32_t op1b = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__op1outbrief;
+					auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
+					uint32_t d1 = (uint32_t)rf[14];   // D1 (regfile is reversed: D0=rf15..D7=rf8)
+					uint32_t op1 = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__op1out;
+					uint32_t op2 = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__op2out;
 					unsigned srin = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__srin;
-					unsigned cond = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__exe_condition;
 					static uint32_t lastkey = 0xFFFFFFFF;
-					uint32_t key = pc ^ (din << 1) ^ (drd << 5) ^ (op1b << 9) ^ (srin << 13) ^ (cond << 29) ^ (ca << 4);
+					uint32_t key = pc ^ (din << 1) ^ (op1 << 5) ^ (op2 << 9) ^ (srin << 13) ^ (d1 << 3) ^ (ca << 4);
 					if (key != lastkey) {
-						DLOG( "[LOOPBACK] pc=%06X addr=%06X din=%08X data_read=%08X op1b=%08X srin=%04X Z=%u cond=%u F%d\n",
-							pc, ca, din, drd, op1b, srin & 0xFFFF, (srin >> 2) & 1, cond, video.count_frame);
+						DLOG( "[LOOPBACK] pc=%06X addr=%06X din=%08X D1=%08X OP1=%08X OP2=%08X srin=%04X Z=%u F%d\n",
+							pc, ca, din, d1, op1, op2, srin & 0xFFFF, (srin >> 2) & 1, video.count_frame);
 						lb_logs++; lastkey = key;
 					}
 				}
