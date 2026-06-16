@@ -5,3 +5,14 @@ public_flat_rd -module "TG68KdotC_Kernel" -var "ea_data"
 public_flat_rd -module "TG68KdotC_Kernel" -var "last_data_read"
 public_flat_rd -module "TG68KdotC_Kernel" -var "op1out"
 public_flat_rd -module "TG68KdotC_Kernel" -var "op2out"
+// REAL committed CCR (flags(2)=Z) + the operand-settle gate + execute pulse, to
+// see the true flag-commit cycle vs operand settle (the prior "Z" tap was SRin=
+// OP2out(15:8), NOT the committed condition codes).
+public_flat_rd -module "TG68KdotC_Kernel" -var "flags"
+public_flat_rd -module "TG68KdotC_Kernel" -var "store_in_tmp"
+public_flat_rd -module "TG68KdotC_Kernel" -var "execopc"
+// Retire-accurate branch proof: exe_condition (NOT Flags(2) for bne) directly
+// decides take/fall-through; exe_opcode identifies the bne ($6604) at its commit.
+public_flat_rd -module "TG68KdotC_Kernel" -var "exe_condition"
+public_flat_rd -module "TG68KdotC_Kernel" -var "exe_opcode"
+public_flat_rd -module "TG68KdotC_Kernel" -var "decodeopc"

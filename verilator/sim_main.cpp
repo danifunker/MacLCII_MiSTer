@@ -75,6 +75,14 @@ int cfg_memSize = 1;       // 0=1MB, 1=4MB
 bool verbose_diag = false;
 #define DLOG(...) do { if (verbose_diag) fprintf(stderr, __VA_ARGS__); } while (0)
 
+// TG68K regfile is a packed [511:0] vector; Verilator exposes it as 16x32-bit
+// words. The kernel's debug taps prove the mapping (d0=regfile[511:480]=word15,
+// a0=regfile[255:224]=word7, a7=regfile[31:0]=word0): Dn = rf[15-n], An = rf[7-n].
+// NOTE: the older [TBL]/[MARCH]/[ERR] detectors used ascending rf[0..13] and so
+// MISLABELED every register — use these macros instead.
+#define RF_D(rf,n) ((uint32_t)(rf)[15-(n)])
+#define RF_A(rf,n) ((uint32_t)(rf)[7-(n)])
+
 // CPU trace
 // ---------
 bool cpu_trace_enable = false;  // Enable after ROM download
@@ -331,12 +339,84 @@ int verilate() {
 					uint32_t op1 = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__op1out;
 					uint32_t op2 = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__op2out;
 					unsigned srin = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__srin;
+					// REAL committed condition codes: flags = ...XNZVC, Z = bit 2.
+					unsigned flags = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__flags;
+					uint32_t eadata = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__ea_data;
+					unsigned sit   = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__store_in_tmp;
+					unsigned exopc = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__execopc;
+					// Boot-sim bus FSM (tg68k.v wrapper, one level above the kernel).
+					unsigned sstate = VERTOPINTERN->emu__DOT__tg68k__DOT__s_state;
+					uint32_t dinr   = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68_din_r;
+					unsigned ebs    = VERTOPINTERN->emu__DOT__tg68k__DOT__eff_busstate;
 					static uint32_t lastkey = 0xFFFFFFFF;
-					uint32_t key = pc ^ (din << 1) ^ (op1 << 5) ^ (op2 << 9) ^ (srin << 13) ^ (d1 << 3) ^ (ca << 4);
+					uint32_t key = pc ^ (din << 1) ^ (op1 << 5) ^ (op2 << 9) ^ (flags << 13)
+					             ^ (d1 << 3) ^ (ca << 4) ^ (eadata << 7) ^ (sstate << 17)
+					             ^ (exopc << 20) ^ (sit << 21) ^ (dinr << 11) ^ (ebs << 23);
 					if (key != lastkey) {
-						DLOG( "[LOOPBACK] pc=%06X addr=%06X din=%08X D1=%08X OP1=%08X OP2=%08X srin=%04X Z=%u F%d\n",
-							pc, ca, din, d1, op1, op2, srin & 0xFFFF, (srin >> 2) & 1, video.count_frame);
+						DLOG( "[LOOPBACK] pc=%06X addr=%06X din=%08X D1=%08X OP1=%08X OP2=%08X ea=%08X Zreal=%u CCR=%02X exOPC=%u sit=%u ss=%u dinr=%04X ebs=%u F%d\n",
+							pc, ca, din, d1, op1, op2, eadata, (flags >> 2) & 1, flags & 0x1F,
+							exopc, sit, sstate, dinr & 0xFFFF, ebs, video.count_frame);
 						lb_logs++; lastkey = key;
+					}
+				}
+			}
+
+			// [BNEPROOF] Retire-accurate proof of the bne @ $A0313E direction.
+			// exe_condition (= NOT Flags(2) for bne cc=$6) is what the kernel ACTUALLY
+			// uses to take/fall-through; decodeOPC=1 marks an instruction entering
+			// decode (= actually executed, NOT a discarded prefetch). Logged UN-DEDUPED
+			// every eval in the loop body so a transient Z=1 cannot hide. Also pairs
+			// each bne with the cmp's read stride and the live d0/d1.
+			{
+				static int bp_logs = 0;
+				uint32_t pc = VERTOPINTERN->debug_pc & 0xFFFFFF;
+				if (pc >= 0xA03124 && pc <= 0xA03150 && bp_logs < 1200) {
+					unsigned exeop = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__exe_opcode;
+					unsigned cond  = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__exe_condition;
+					unsigned dec   = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__decodeopc;
+					unsigned exopc = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__execopc;
+					unsigned flags = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__flags;
+					unsigned ss    = VERTOPINTERN->emu__DOT__tg68k__DOT__s_state;
+					uint32_t ca    = top->debug_cpuAddr & 0xFFFFFF;
+					auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
+					uint32_t d0 = (uint32_t)rf[15], d1 = (uint32_t)rf[14], d2 = (uint32_t)rf[13];
+					// Only emit at decode boundaries and at the bne's commit, plus any
+					// cycle where Flags shows Z=1 (the thing we must catch or rule out).
+					bool zset = ((flags >> 2) & 1);
+					if (dec || (exeop == 0x6604 && exopc) || zset) {
+						DLOG("[BNEPROOF] pc=%06X addr=%06X exeop=%04X cond=%u dec=%u exOPC=%u Z=%u CCR=%02X ss=%u D0=%08X D1=%08X D2=%08X F%d\n",
+							pc, ca, exeop, cond, dec, exopc, (flags>>2)&1, flags&0x1F, ss, d0, d1, d2, video.count_frame);
+						bp_logs++;
+					}
+				}
+			}
+
+			// [CKSUM] Settle the ROM-checksum POST stall question. The full-ROM sum
+			// loop is at $A46AF0 (move.w (A0)+,D0; add.l D0,D1; subq.l #1,D3; bne),
+			// $3FFFE words; then $A46AFC eor.l D4,D1; $A46AFE beq $a46b04. PASS (Z=1)
+			// -> $A46B04 jmp(A6); FAIL (Z=0) -> $A46B00 move.w #$FFFF,D6 -> caller
+			// $A464EC bne $a48cda (error handler). Retire-accurate via decodeopc.
+			// Logs coarse D3 countdown milestones (is it PROGRESSING vs stuck?) plus
+			// the decisive eor/beq result. D1=rf14 D3=rf12 D4=rf11 (regfile reversed).
+			{
+				static int ck_logs = 0;
+				static uint32_t last_milestone = 0xFFFFFFFF;
+				uint32_t pc = VERTOPINTERN->debug_pc & 0xFFFFFF;
+				if (pc >= 0xA46ADA && pc <= 0xA46B08 && ck_logs < 120) {
+					unsigned dec   = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__decodeopc;
+					unsigned flags = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__flags;
+					auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
+					uint32_t d1 = (uint32_t)rf[14], d3 = (uint32_t)rf[12], d4 = (uint32_t)rf[11];
+					uint32_t milestone = d3 >> 14;   // ~16 samples across $3FFFE
+					if (pc == 0xA46AF2 && dec && milestone != last_milestone) {
+						DLOG("[CKSUM] progress D3=%08X D1(sum)=%08X F%d cyc=%llu\n",
+							d3, d1, video.count_frame, (unsigned long long)main_time);
+						last_milestone = milestone; ck_logs++;
+					}
+					if ((pc==0xA46AFC || pc==0xA46AFE || pc==0xA46B00 || pc==0xA46B04) && dec) {
+						DLOG("[CKSUM] RESULT pc=%06X Z=%u CCR=%02X D1(sum^exp)=%08X D4(exp)=%08X F%d\n",
+							pc, (flags>>2)&1, flags&0x1F, d1, d4, video.count_frame);
+						ck_logs++;
 					}
 				}
 			}
@@ -367,7 +447,7 @@ int verilate() {
 							auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
 							DLOG( "[ERR] ->%06X from %06X F%d D0=%08X D1=%08X D2=%08X D6=%08X D7=%08X\n",
 								mpc, march_last_pc, video.count_frame,
-								(unsigned)rf[0],(unsigned)rf[1],(unsigned)rf[2],(unsigned)rf[6],(unsigned)rf[7]); DLOG("      D4(testmask)=%08X D3=%08X A0=%08X A1=%08X\n",(unsigned)rf[4],(unsigned)rf[3],(unsigned)rf[8],(unsigned)rf[9]); en++;
+								RF_D(rf,0),RF_D(rf,1),RF_D(rf,2),RF_D(rf,6),RF_D(rf,7)); DLOG("      D4(testmask)=%08X D3=%08X A0=%08X A1=%08X\n",RF_D(rf,4),RF_D(rf,3),RF_A(rf,0),RF_A(rf,1)); en++;
 						}
 					}
 					{   // MOVES-BERR fix verification: machine-config word D2 (and D5
@@ -376,7 +456,7 @@ int verilate() {
 						if (mpc==0xA00AB0 && n<8) {
 							auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
 							DLOG( "[D2PROBE] $A00AB0 #%d F%d D2=%08X D5=%08X\n",
-								n, video.count_frame, (unsigned)rf[2], (unsigned)rf[5]); n++;
+								n, video.count_frame, RF_D(rf,2), RF_D(rf,5)); n++;
 						}
 					}
 					{   // boot state-machine: log entry into each of MAME's 11 handlers
@@ -395,9 +475,9 @@ int verilate() {
 						auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
 						DLOG( "[MARCH] PASS#%d F%d D0=%08X D1=%08X D2=%08X D4=%08X D6=%08X D7=%08X A0=%08X A1=%08X A2=%08X A3=%08X A4=%08X A5=%08X\n",
 							hit_910, video.count_frame,
-							(unsigned)rf[0],(unsigned)rf[1],(unsigned)rf[2],(unsigned)rf[4],
-							(unsigned)rf[6],(unsigned)rf[7],(unsigned)rf[8],(unsigned)rf[9],
-							(unsigned)rf[10],(unsigned)rf[11],(unsigned)rf[12],(unsigned)rf[13]); }
+							RF_D(rf,0),RF_D(rf,1),RF_D(rf,2),RF_D(rf,4),
+							RF_D(rf,6),RF_D(rf,7),RF_A(rf,0),RF_A(rf,1),
+							RF_A(rf,2),RF_A(rf,3),RF_A(rf,4),RF_A(rf,5)); }
 					else if (mpc == 0xA4694C) { hit_694c++;
 						DLOG( "[MARCH] *** DONE $A4694C hit#%d cyc=%llu F%d ***\n",
 							hit_694c, (unsigned long long)main_time, video.count_frame); }
@@ -409,15 +489,15 @@ int verilate() {
 					else if (mpc == 0xA46584) { static int n=0; if(++n<=12) { // cmpaw #-1,a0 : A0=region start loaded, A5=table base
 						auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
 						DLOG( "[TBL] $A46584 #%d F%d D7=%08X A0(start)=%08X A4=%08X A5(tbl)=%08X SP=%08X\n",
-							n, video.count_frame, (unsigned)rf[7], (unsigned)rf[8], (unsigned)rf[12], (unsigned)rf[13], (unsigned)rf[15]); } }
+							n, video.count_frame, RF_D(rf,7), RF_A(rf,0), RF_A(rf,4), RF_A(rf,5), RF_A(rf,7)); } }
 					else if (mpc == 0xA4658A) { static int n=0; if(++n<=12) { // movel a4@+,d0 : D0=region length
 						auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
 						DLOG( "[TBL] $A4658A #%d F%d D0(len)=%08X A0=%08X A4=%08X\n",
-							n, video.count_frame, (unsigned)rf[0], (unsigned)rf[8], (unsigned)rf[12]); } }
+							n, video.count_frame, RF_D(rf,0), RF_A(rf,0), RF_A(rf,4)); } }
 					else if (mpc == 0xA4657E) { static int n=0; if(++n<=8) { // moveal sp@,a4 : about to read table ptr from SP
 						auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
-						DLOG( "[TBL] $A4657E #%d F%d (D7=3 RAM-region entry) SP=%08X overlay=%d\n",
-							n, video.count_frame, (unsigned)rf[15],
+						DLOG( "[TBL] $A4657E #%d F%d (D7=3 RAM-region entry) SP=%08X A4=%08X A5=%08X overlay=%d\n",
+							n, video.count_frame, RF_A(rf,7), RF_A(rf,4), RF_A(rf,5),
 							(int)VERTOPINTERN->emu__DOT__ac0__DOT__rom_overlay);
 						// READ-ONLY dump of built descriptor table memory before the march
 						// writes it. CPU $9FFFE0..$9FFFFF -> SDRAM words $0FFFF0..$0FFFFF
@@ -427,7 +507,69 @@ int verilate() {
 						DLOG( "[TBLMEM] #%d F%d CPU$9FFFE0:", n, video.count_frame);
 						for (uint32_t w = 0xFFFF0; w <= 0xFFFFE; w += 2)
 							DLOG( " %08X", ((unsigned)M[w] << 16) | (unsigned)M[w+1]);
+						DLOG( "\n");
+						// The REAL descriptor table is at the top of 4MB (CPU $3FFFEx ->
+						// SDRAM word $1FFFFx). Dump CPU $3FFFE0..$3FFFFC and the table-ptr
+						// slot CPU $7FF8..$7FFC (SDRAM $3FFC..$3FFE).
+						DLOG( "[TBLMEM] #%d F%d CPU$3FFFE0:", n, video.count_frame);
+						for (uint32_t w = 0x1FFFF0; w <= 0x1FFFFE; w += 2)
+							DLOG( " %08X", ((unsigned)M[w] << 16) | (unsigned)M[w+1]);
+						DLOG( "  | CPU$7FF8:");
+						for (uint32_t w = 0x3FFC; w <= 0x3FFE; w += 2)
+							DLOG( " %08X", ((unsigned)M[w] << 16) | (unsigned)M[w+1]);
 						DLOG( "\n"); } }
+
+						// [ENUM] correctly-mapped register snapshot at the RAM-enumeration
+						// decision points, to diff control flow + values vs the MAME oracle.
+						{
+							static const struct { uint32_t pc; const char* tag; int cap; } EP[] = {
+								{0xA4A5B2,"B2_btstD0", 4}, {0xA4A5C2,"C2_btstD1", 4},
+								{0xA4A5E4,"E4_PanD",   4}, {0xA4A5EC,"EC_C4set",  4},
+								{0xA4A60C,"0C_topRAM", 4}, {0xA4A626,"26_A5set",  4},
+								{0xA4A65C,"5C_walk0",  4}, {0xA4A666,"66_rgnSt", 24},
+								{0xA4A66C,"6C_rgnSz", 24}, {0xA4A698,"98_stkSet",24},
+								{0xA4A6AE,"AE_final",  8}, {0xA4654A,"4A_rdTbl",  8},
+							};
+							static int ecap[12] = {0};
+							for (int i = 0; i < 12; i++) {
+								if (mpc == EP[i].pc && ecap[i] < EP[i].cap) {
+									auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
+									DLOG("[ENUM] %-9s pc=%06X F%d D0=%08X D1=%08X D2=%08X D4=%08X A0=%08X A1=%08X A2=%08X A5=%08X A7=%08X\n",
+										EP[i].tag, mpc, video.count_frame,
+										RF_D(rf,0),RF_D(rf,1),RF_D(rf,2),RF_D(rf,4),
+										RF_A(rf,0),RF_A(rf,1),RF_A(rf,2),RF_A(rf,5),RF_A(rf,7));
+									ecap[i]++;
+								}
+							}
+						}
+
+						// [JMP6] Post-state-machine $A4A2xx-$A4A4xx hardware-init flow that
+						// ends in the crashing jmp(A6) at $A4A454. MAME (our patched ROM):
+						// caller $A4A300 `lea ($a4a308,PC),A6` -> A6=$A4A308 -> jmp(A6) returns
+						// cleanly (60x, no crash). Our core: A6=$FFFFFFAA garbage -> $7FF8 wedge.
+						// Log every new PC in the window with A6/A2/A5 (skip the 256x delay loop
+						// $A4A44E/$A4A450) to find where A6 first goes bad vs MAME.
+						{
+							static int j6 = 0;
+							static uint32_t last454a6 = 0xDEADBEEF;
+							bool log6=false; const char* t6="";
+							if      (mpc==0xA4A290) { t6="ENTRY";    log6=true; } // routine entry (A6=outer ret)
+							else if (mpc==0xA4A2F8) { t6="pollDONE"; log6=true; } // after dbne: D0<0 => timeout
+							else if (mpc==0xA4A31C) { t6="TIMEOUT!"; log6=true; } // bmi error path taken
+							else if (mpc==0xA4A3CE) { t6="D0ne20";   log6=true; } // bne $a4a3ce (D0&$70 != $20)
+							else if (mpc==0xA4A454) {                             // jmp(A6); dedup by A6
+								auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
+								uint32_t a6=RF_A(rf,6);
+								if (a6!=last454a6) { t6="jmp(A6)"; log6=true; last454a6=a6; }
+							}
+							if (log6 && j6 < 250) {
+								auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
+								DLOG("[JMP6] %-9s pc=%06X<-%06X F%d A6=%08X A5=%08X A2=%08X A1=%08X D0=%08X\n",
+									t6, mpc, march_last_pc, video.count_frame,
+									RF_A(rf,6),RF_A(rf,5),RF_A(rf,2),RF_A(rf,1),RF_D(rf,0));
+								j6++;
+							}
+						}
 				}
 			}
 
