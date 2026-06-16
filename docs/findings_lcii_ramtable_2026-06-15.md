@@ -207,6 +207,28 @@ MAME *instruction* tracing is blocked):
 
 Then fix the chipset response our enumeration reads wrong → fixes slow POST + crash.
 
+## Strongest lead — the `d0/d1` subroutine is a hardware loopback/presence test
+
+From our FPGA `cpu_trace.log`, the subroutine called at `$A4A5A4` is at **`$A02F18`**,
+and it calls a routine at **`$A03124`** that does a byte **read-modify-write loopback /
+presence test** on `(A2)` with stride `D2=$20000`:
+
+```
+$A03128: move.b (A2),D1     $A0312E: move.b D1,(A2)     ; write pattern
+$A03130: neg.b D1           $A03132: move.b D1,(A2)     ; write complement
+$A0313A: cmp.b (A2,D2.l),D1 ; compare against (A2 + $20000)  <- alias/presence check
+$A03140: cmp.b (A2),D1
+```
+
+The `@data_addr` lands on I/O space — `$F01C00`, `$F21C00` (= `$F01C00 + $20000`), and
+`$F26001` (pseudovia). So `d0/d1` (hence the whole RAM-enumeration path, incl. the
+`$A4A5C2 btst #7,d1` branch) are decided by **how our chipset answers this register
+loopback/aliasing test** — likely a hardware-variant/slot probe. `A2 = [A0+8] + $1C00`
+(set at `$A03064`). **This is the most specific divergence candidate**: compare what our
+RTL returns for the write-then-read-back + the `(A2)` vs `(A2+$20000)` comparison at
+those addresses against MAME's V8/VIA. If the loopback or the `$20000`-stride alias
+behaves differently, `d1` bit7 flips and we take the failing extensive-probe path.
+
 ## Repro / state
 
 ```bash
