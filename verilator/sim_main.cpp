@@ -550,24 +550,61 @@ int verilate() {
 						// Log every new PC in the window with A6/A2/A5 (skip the 256x delay loop
 						// $A4A44E/$A4A450) to find where A6 first goes bad vs MAME.
 						{
-							static int j6 = 0;
+							static int j6 = 0; static int dcnt = 0;
 							static uint32_t last454a6 = 0xDEADBEEF;
+							auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
+							// [DERAIL] the 68k PC jumping into $FFFFxxxx (the crash). Log the source pc
+							// (the jmp(An) instr) + all regs so we see WHICH jmp went bad and to what.
+							// Fire ONCE on the good->bad PC transition (mpc enters $FFxxxx from a
+							// normal address) so march_last_pc = the offending jmp/rts and the regs
+							// are pre-garbage. Also dump the FULL 32-bit debug_pc (unmasked) to see
+							// the sign-extension, + all A/D regs + A7(SP).
+							bool bad=(mpc & 0xFF0000u)==0xFF0000u, prevbad=(march_last_pc & 0xFF0000u)==0xFF0000u;
+							if (bad && !prevbad && dcnt < 6) {
+								DLOG("[DERAIL] full_pc=%08X mpc=%06X SRC=%06X F%d | A0=%08X A1=%08X A2=%08X A3=%08X A4=%08X A5=%08X A6=%08X A7=%08X | D0=%08X D1=%08X D2=%08X D5=%08X\n",
+									(unsigned)VERTOPINTERN->debug_pc, mpc, march_last_pc, video.count_frame,
+									RF_A(rf,0),RF_A(rf,1),RF_A(rf,2),RF_A(rf,3),RF_A(rf,4),RF_A(rf,5),RF_A(rf,6),RF_A(rf,7),
+									RF_D(rf,0),RF_D(rf,1),RF_D(rf,2),RF_D(rf,5));
+								dcnt++;
+							}
 							bool log6=false; const char* t6="";
 							if      (mpc==0xA4A290) { t6="ENTRY";    log6=true; } // routine entry (A6=outer ret)
 							else if (mpc==0xA4A2F8) { t6="pollDONE"; log6=true; } // after dbne: D0<0 => timeout
 							else if (mpc==0xA4A31C) { t6="TIMEOUT!"; log6=true; } // bmi error path taken
 							else if (mpc==0xA4A3CE) { t6="D0ne20";   log6=true; } // bne $a4a3ce (D0&$70 != $20)
+							else if (mpc==0xA4A24C) { t6="EXIT(A3)"; log6=true; } // jmp(A3): state-machine exit
 							else if (mpc==0xA4A454) {                             // jmp(A6); dedup by A6
-								auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
 								uint32_t a6=RF_A(rf,6);
 								if (a6!=last454a6) { t6="jmp(A6)"; log6=true; last454a6=a6; }
 							}
-							if (log6 && j6 < 250) {
-								auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
-								DLOG("[JMP6] %-9s pc=%06X<-%06X F%d A6=%08X A5=%08X A2=%08X A1=%08X D0=%08X\n",
+							if (log6 && j6 < 900) {
+								DLOG("[JMP6] %-9s pc=%06X<-%06X F%d A6=%08X A5=%08X A3=%08X A2=%08X D1=%08X D2=%08X D5=%08X\n",
 									t6, mpc, march_last_pc, video.count_frame,
-									RF_A(rf,6),RF_A(rf,5),RF_A(rf,2),RF_A(rf,1),RF_D(rf,0));
+									RF_A(rf,6),RF_A(rf,5),RF_A(rf,3),RF_A(rf,2),RF_D(rf,1),RF_D(rf,2),RF_D(rf,5));
 								j6++;
+							}
+						}
+						// [RING] 48-entry circular trace of the derail lead-up. Stores every instr
+						// from F150; on the FIRST abnormal PC (not RAM<4MB / ROM $A0-A7 / VIA $F0xxxx)
+						// it flushes the buffer in order -> the last good entry = the jmp/rts that
+						// derailed, with its opcode + A3/A4/A6/A7/D2.
+						{
+							static uint32_t rpc[48],rop[48],ra2[48],ra5[48],ra6[48],ra7[48],rd2[48];
+							static int ri=0; static bool flushed=false;
+							auto &rf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
+							bool abn = !((mpc<0x400000u) || (mpc>=0xA00000u && mpc<0xA80000u) || (mpc>=0xF00000u && mpc<0xF10000u));
+							if (video.count_frame>=150 && !flushed) {
+								if (abn) {
+									DLOG("[RING] FLUSH at abnormal pc=%06X full=%08X F%d\n", mpc, (unsigned)VERTOPINTERN->debug_pc, video.count_frame);
+									for (int k=0;k<48;k++){ int idx=(ri+k)%48;
+										DLOG("[RING] %2d pc=%06X op=%04X A2=%08X A5=%08X A6=%08X A7=%08X D2=%08X\n",
+											k, rpc[idx], rop[idx], ra2[idx], ra5[idx], ra6[idx], ra7[idx], rd2[idx]); }
+									flushed=true;
+								} else {
+									rpc[ri%48]=mpc; rop[ri%48]=(unsigned)VERTOPINTERN->debug_opcode;
+									ra2[ri%48]=RF_A(rf,2); ra5[ri%48]=RF_A(rf,5); ra6[ri%48]=RF_A(rf,6);
+									ra7[ri%48]=RF_A(rf,7); rd2[ri%48]=RF_D(rf,2); ri++;
+								}
 							}
 						}
 				}
@@ -612,21 +649,43 @@ int verilate() {
 				// [SRBIT] bit-level CB1/CB2/bit_cnt at the FIRST shift-in turnaround
 				// (frame 117 only). Shows whether the VIA samples an idle CB2=1 bit
 				// before the Egret drives valid data (the FF first byte).
-				if (video.count_frame == 117) {
-					static uint32_t bit_key = 0xFFFFFFFF; static int bit_logs = 0;
+				// [SRTRN] enriched bit-level turnaround capture: spans the last OUT byte
+				// through the first IN bytes. Logs CB1/CB2 as seen by the VIA AND the
+				// Egret's raw CB2 data + output-enable (pb_out[5]/pb_ddr[5]) so we can tell
+				// whether the leading idle byte is (a) the Egret not yet driving CB2 (oe=0,
+				// VIA reads the default 1) or (b) the Egret driving idle data (oe=1, cb2=1).
+				// Also tracks the Egret's CB1 drive (pb_out[4]/pb_ddr[4]).
+				if (video.count_frame >= 114 && video.count_frame <= 121) {
+					static uint32_t trn_key = 0xFFFFFFFF; static int trn_logs = 0;
 					uint32_t cb1b = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__shift_clock;
-					uint32_t cb2b = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__cb2_i;
+					uint32_t cb2v = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__cb2_i;
 					uint32_t bcb  = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__bit_cnt;
 					uint32_t acb  = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__acr;
 					uint32_t scb  = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__shift_active;
 					uint32_t srb  = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__shift_reg;
+					uint32_t pbo  = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__egret_inst__DOT__pb_out;
+					uint32_t pbd  = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__egret_inst__DOT__pb_ddr;
+					uint32_t ecb2=(pbo>>5)&1, ecb2oe=(pbd>>5)&1, ecb1=(pbo>>4)&1, ecb1oe=(pbd>>4)&1;
+					uint32_t hpc  = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__egret_inst__DOT__last_pc;
 					bool srmode = (acb & 0x10) || (((acb>>2)&7)==3);  // any SR/ext mode
-					uint32_t bk = (cb1b)|(cb2b<<1)|(bcb<<2)|(scb<<6)|((acb&0x1C)<<8);
-					if (srmode && bk != bit_key && bit_logs < 250) {
-						DLOG("[SRBIT] F117 CB1=%u CB2=%u bcnt=%u act=%u ACR=%02X SReg=%02X pc=%06X\n",
-							cb1b, cb2b, bcb, scb, acb, srb, VERTOPINTERN->debug_pc & 0xFFFFFF);
-						bit_key = bk; bit_logs++;
+					uint32_t bk = cb1b|(cb2v<<1)|(bcb<<2)|(scb<<6)|(ecb2<<7)|(ecb2oe<<8)|((acb&0x1C)<<9);
+					if (srmode && bk != trn_key && trn_logs < 400) {
+						DLOG("[SRTRN] F%d cb1=%u cb2via=%u|egr cb2=%u oe=%u cb1=%u oe=%u|bcnt=%u act=%u dir=%s ACR=%02X SReg=%02X hc05=%04X 68k=%06X\n",
+							video.count_frame, cb1b, cb2v, ecb2, ecb2oe, ecb1, ecb1oe,
+							bcb, scb, ((acb>>2)&7)==7?"OUT":(((acb>>2)&7)==3?"IN ":"?"),
+							acb, srb, hpc, VERTOPINTERN->debug_pc & 0xFFFFFF);
+						trn_key = bk; trn_logs++;
 					}
+					// [DDRT] Egret DDRB (pb_ddr) changes — when does CB2 bit5 flip input<->output
+					// relative to the SR byte boundaries? Logs the HC05 PC driving the flip.
+					static uint32_t ddr_prev = 0xFFFFFFFF; static int ddr_logs = 0;
+					if (pbd != ddr_prev && ddr_logs < 60) {
+						DLOG("[DDRT] F%d DDRB %02X->%02X (cb2oe=%u cb1oe=%u) pb_out=%02X SR(act=%u bcnt=%u dir=%s) hc05=%04X 68k=%06X\n",
+							video.count_frame, ddr_prev==0xFFFFFFFF?pbd:ddr_prev, pbd, (pbd>>5)&1, (pbd>>4)&1, pbo,
+							scb, bcb, ((acb>>2)&7)==7?"OUT":(((acb>>2)&7)==3?"IN ":"?"), hpc, VERTOPINTERN->debug_pc & 0xFFFFFF);
+						ddr_logs++;
+					}
+					ddr_prev = pbd;
 				}
 
 				static uint32_t prev_act = 0; static int byteseq = 0;
@@ -643,6 +702,20 @@ int verilate() {
 					byteseq++;
 				}
 				prev_act = sact;
+				// [HC5] one-shot HC05 instruction trace (PC + accumulator A/X) for the
+				// FIRST cmd-07 transaction at F117: shows the exact bytes the HC05 sends
+				// (regA at the $15C9 send-routine entry) and the path computing byte 5.
+				{
+					static bool hc5_armed=false; static int hc5_n=0; static uint32_t hc5_prev=0xFFFFFFFF;
+					uint32_t hpc=(uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__egret_inst__DOT__last_pc;
+					if (video.count_frame==117 && !hc5_armed && hpc==0x12C2) hc5_armed=true;
+					if (hc5_armed && hc5_n<2000 && hpc!=hc5_prev) {
+						uint32_t ra=(uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__egret_inst__DOT__u_cpu__DOT__regA;
+						uint32_t rx=(uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__egret_inst__DOT__u_cpu__DOT__regX;
+						DLOG("[HC5] pc=%04X A=%02X X=%02X\n", hpc, ra, rx);
+						hc5_prev=hpc; hc5_n++;
+					}
+				}
 			}
 
 			// CPU trace output - skip while ROM is downloading

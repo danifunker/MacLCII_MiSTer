@@ -610,7 +610,16 @@ module dataController_top(
 		.ca2_i      (onesec),
 
 		.cb1_i      (via_cb1_in),
-		.cb2_i      (cuda_cb2_oe ? cuda_cb2 : cb2_i),
+		// CB2 = Egret VIA shift-register data pin. On the real LC II the Egret's
+		// HC05 PORTB bit5 (CB2) has NO pull-up (MAME egret.cpp: set_pullups<1>(0x40)
+		// pulls up ONLY bit6), so when the Egret tri-states CB2 (DDRB bit5=0, e.g. the
+		// receive->send turnaround) the line reads 0, not 1. We must model that: read 0
+		// when the Egret isn't driving — NOT the legacy soft-keyboard line cb2_i
+		// (=kbddata_o, idle HIGH), which is vestigial here (LC II keyboard is ADB via
+		// the Egret). With the old `: cb2_i` the VIA shifted in an idle FF as the first
+		// response byte (invalid Egret packet type) -> ROM mis-branched (A4A36C vs MAME
+		// A4A374) and the $A4A18C Egret handshake loop never terminated -> $7FF8 wedge.
+		.cb2_i      (cuda_cb2_oe ? cuda_cb2 : 1'b0),
 		.cb2_o      (cb2_o),
 		.cb2_t      (cb2_t),
 
