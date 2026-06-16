@@ -114,6 +114,28 @@ finding nothing is *plausibly* correct (no 8 MB SIMM). The divergence that yield
 null table is somewhere in the `84`/`04` phase or the `$400000` boundary handling —
 our `addrDecoder`/`addrController` V8 RAM-config decode vs MAME `v8.cpp ram_size()`.
 
+## Ruled out this session (so the next pass doesn't re-chase them)
+
+- **68030 caches** — not the cause: they're *not instantiated* in this core
+  (`rtl/tg68k/tg68k.v:328` "the kernel runs uncached"), so no stale write-then-read.
+- **PMMU translation** — not active during the bank-scan: TC.E isn't set until the
+  PMMU-enable at `$A416xx`, which is *after* the POST (bank-scan is ~F94). So the
+  probe addresses are physical = logical.
+- **Address mapping** — matches MAME `v8.cpp ram_size()`: the `$800000-$9FFFFF`
+  first-2 MB mirror is always installed; with `config=84` on a 4 MB machine
+  `simm_size=0` (no SIMM) so motherboard sits at `$0-$3FFFFF` and `$400000` is
+  unmapped — exactly our `addrDecoder` (`mb_present`, `in_motherboard_low`).
+- **Unmapped-read constant** — doesn't flip the `$400000` bus-width test: it compares
+  read bytes against the `'Tina'` pattern bytes, which equal neither `0x00` nor
+  `0xFF`, so the test reads "absent" either way. (The `0x0000→0xFFFF` change in
+  `dataController_top.sv:304` fixed a *different* probe; both are consistent here.)
+
+So the divergence is subtler than a single decode/const — it needs the oracle's
+*actual values* to localize. Strong remaining candidates: a misaligned-longword data
+path (the `'PanD'` write to `$1FFFFE` and the table-ptr load `movea.l (a7),a4` with an
+ODD `a7=$773F` both cross a 2 MB SDRAM-word boundary), or the `84`/`04`-phase reprobe
+of mapped RAM that this F88–96 window didn't reach.
+
 ## Recommended next step
 
 Run the **MAME `maclc2` oracle** (see memory `mame-maclc-oracle-setup`) with a CPU
