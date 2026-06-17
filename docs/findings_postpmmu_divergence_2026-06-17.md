@@ -5,7 +5,41 @@
 NEXT downstream blocker") and confirms the dev's instinct in
 `handoff_lcii_boot_postpmmu_2026-06-15.md` ("something else is wrong, not just slow").
 
-## CORRECTED ROOT CAUSE (2026-06-17, cpu_trace of BOTH ROMs) — it's a STACK-POINTER bug, NOT the I-cache
+## LATEST / MOST ACCURATE (2026-06-17, MAME A7/PC diff) — read this first
+
+Two earlier root-cause framings in this doc are WRONG and kept only for history:
+the "missing I-cache" framing and the "stack-pointer overlaps `$c04/$c08`" framing
+(the latter relied on the cpu_trace `@`-annotation, which is buffered/lagged and does
+NOT reliably show SP). What actually holds, verified by a per-frame PC+A7 diff of our
+core vs MAME (`verilator/mame/pc_sp_hb.lua` vs our `--heartbeat` fullpc/a7):
+
+- **Confirmed working:** 68030+PMMU through MMU-enable (walks succeed, NO fault), the
+  video path (our screen == MAME's pre-desktop uniform-127), Egret, chime.
+- **A7 is NOT the bug:** our A7 relocates `$2600 → $7FFx → $1CFExx → $1FF3xx` — i.e.
+  the post-MMU stack relocation to high RAM — which MAME does **identically**
+  (MAME A7: `$2600 → $7FFx → $1CFEE2 → $1FF3xx → $20FDxx`). Same trajectory.
+- **The real divergence is control-flow in the post-MMU continuation:** MAME runs it at
+  the `$40Axxxxx` ALIAS (e.g. `40A0089E`, `40A07A5A`, `40A14908`); our core runs the
+  same code at the bare `$00Axxxxx` (fullpc `00A41C2A`/`00A41AEE`, no `$40` bit) and
+  then **derails** (`rts` in the `$a00910` routine returns to garbage `$00A0094A`
+  instead of `$00A00130`) → `$0`/`$FFFFxx` wander → wedge. No bus fault is involved.
+- **Open (the real remaining question):** WHY does our `rts` (in `$a00910`, reached from
+  the `$00A0010E`/`$40A0010E` continuation) return to the wrong address? It is a
+  control-flow/return divergence, plausibly tied to the `$40A`-alias vs `$00A` address
+  handling (the boot runs the alias; we run the bare address). NEEDS an aligned
+  instruction+register diff of our `$a00910` execution vs MAME's `$40a00910` (longer
+  MAME register-trace at the continuation, past MAME frame ~300).
+
+Repro for the A7/PC diff:
+```
+# ours: ./obj_dir/Vemu --headless --no-cpu-trace --heartbeat --rom ../releases/boot0-fastmem.rom --stop-at-frame 156
+#   -> grep '\[HB\]' ; fields: pc(masked) fullpc(32-bit) a7 a2
+# MAME: HB_OUT=/tmp/mame_hb.txt SOUND=none verilator/mame/run_mame_maclc2.sh -skip_gameinfo \
+#         -autoboot_delay 0 -autoboot_script verilator/mame/pc_sp_hb.lua -seconds_to_run 14
+#   -> grep '\[MHB\]' /tmp/mame_hb.txt ; fields: pc a7  (MAME runs the $40Axxxxx alias)
+```
+
+## (OBSOLETE — kept for history) "stack-pointer overlaps $c04/$c08" framing — superseded; A7 matches MAME
 
 **Supersedes the "missing I-cache" conclusion below (that was a mis-read of the HB).**
 A cpu_trace of the fastmem derail (`--trace-frames 148,156`) shows the EXACT SAME
