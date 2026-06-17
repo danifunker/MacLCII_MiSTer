@@ -5,29 +5,37 @@
 NEXT downstream blocker") and confirms the dev's instinct in
 `handoff_lcii_boot_postpmmu_2026-06-15.md` ("something else is wrong, not just slow").
 
-## CONFIRMED REAL BUG (fastmem, 2026-06-17) — not a nomemcheck artifact
+## CORRECTED ROOT CAUSE (2026-06-17, cpu_trace of BOTH ROMs) — it's a STACK-POINTER bug, NOT the I-cache
 
-A fastmem run (faithful full-POST ROM, F700 cap) **also derails post-MMU**:
+**Supersedes the "missing I-cache" conclusion below (that was a mis-read of the HB).**
+A cpu_trace of the fastmem derail (`--trace-frames 148,156`) shows the EXACT SAME
+failure as nomemcheck:
 ```
-F150 pc=A4A452  (Egret/ADB region)  F152 pc=A41C2A  F153 pc=A41AEE  (MMU descriptor region)
-F154 pc=FFFFDE  (derail to high mem)  ...  F161 pc=000008  (the BUS-ERROR vector $8) ... $FFFFxx wedge
+00A0012C: bsr $a00910                 ; pushes return $00A00130 at SP = $000C06 (LOW RAM)
+00A00910: feature-scan; reads D0=[$dd0], scans table @$a0094a, conditionally:
+00A00936: move.l $c08.w,$c04.w        ; writes $c04-$c07  -> overwrites [$c06] (the return!)
+00A00942: move.l $c04.w,$c08.w @000C06; writes $c08-$c0b  -> overwrites [$c06] (the other half)
+00A00948: rts            @000C06       ; SP=$000C06 -> pops CLOBBERED return -> $00A0094A garbage
+00A0094A: ori.b #0,D2 ; 00000000: ... ; 00000006: bls $ffffffa2  -> $FFFFxx wander (NOT a vector!)
 ```
-So the bug is REAL on the faithful ROM. **Unified root cause:** post-MMU the boot executes
-`$00Axxxxx` ROM code that is logically **unmapped** (root table-desc limit=9). Real HW /
-MAME serve it from the 68030 **I-cache** (enabled by `movec D5,CACR` just before
-`pmove(A3),tc`); our uncached TG68 re-translates → **limit fault** → (VBR=0) vector
-through zeroed `$8` → `$FFFFxx` → `$7FF8` wedge. The bug-#3 grace only covers the single
-MMU-enable page (`$00A`) until execution leaves it; the *extended* post-MMU ROM routine
-(descriptor parse `$A41Axx-$A41Dxx`) faults once the grace disarms. (nomemcheck derails
-too, but to low RAM via a clobbered `rts` — same post-MMU-unmapped-ROM problem, different
-surface, compounded by its skipped SP-setup.) **MAME runs the same `$A41Dxx` descriptor
-code straight through from I-cache.**
+**Mechanism:** our stack pointer is `SP=$000C06`, which **overlaps the `$c04-$c08`
+low-memory globals** the `$a00910` routine writes, so the routine destroys its own
+stacked return address → `rts` derails. The earlier "vector through `$8`" reading was
+wrong: `pc=000008` in the HB was the CPU *executing through* low-mem garbage, not a
+bus-error vector fetch. NO bus fault is involved (PMMU walks all succeed).
 
-**FIX direction (shared `rtl/tg68k`):** make post-MMU instruction fetches of the
-cache-resident ROM routine bypass translation — either (a) broaden the grace to cover the
-whole post-MMU ROM execution window (not just one page until first branch-away), or
-(b) model enough of the 68030 logical I-cache to serve fetches that hit unmapped logical
-ROM after the cache was filled MMU-off. Sync to MacIIvi, gate on its SST bench.
+**Root:** `SP=$000C06` vs MAME's `SP=$2600` (set at `$00A4639A: movea.w #$2600,A7`).
+Identical on fastmem AND nomemcheck, so it is a real bug, not a ROM-hack artifact, and
+**NOT the I-cache / not the grace.** Both ROMs run the `$00A0010E` alias continuation +
+`$a00910`; MAME's stack ($2600) clears the globals, ours ($c06) doesn't.
+
+**NEXT (the real hunt):** find where our `A7`/SP becomes `$000C06` instead of `~$2600`.
+Either (a) a control-flow divergence skips the `$00A4639A` SP-setup, or (b) a TG68
+stack-pointer-select bug (USP/ISP/MSP per SR S+M bits) leaves the wrong A7 active. Get an
+SP-per-frame trace (add A7 to the heartbeat, or trace the POST window) and compare to
+MAME's SP through `$00A4639A`. The fix is likely small once located.
+
+## (OBSOLETE — mis-read, kept for history) "missing I-cache" framing
 
 ## Bottom line
 
