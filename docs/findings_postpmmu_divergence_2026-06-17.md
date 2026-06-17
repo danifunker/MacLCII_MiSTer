@@ -25,10 +25,34 @@ core vs MAME (`verilator/mame/pc_sp_hb.lua` vs our `--heartbeat` fullpc/a7):
   instead of `$00A00130`) → `$0`/`$FFFFxx` wander → wedge. No bus fault is involved.
 - **Open (the real remaining question):** WHY does our `rts` (in `$a00910`, reached from
   the `$00A0010E`/`$40A0010E` continuation) return to the wrong address? It is a
-  control-flow/return divergence, plausibly tied to the `$40A`-alias vs `$00A` address
-  handling (the boot runs the alias; we run the bare address). NEEDS an aligned
-  instruction+register diff of our `$a00910` execution vs MAME's `$40a00910` (longer
-  MAME register-trace at the continuation, past MAME frame ~300).
+  control-flow/return divergence, tied to the `$40A`-alias vs `$00A` address handling.
+
+### REFINED (2026-06-17) — our core strips the `$40` alias bit (A30) from the FETCH ADDRESS
+
+- `debug_pc` (our heartbeat `fullpc`) = `last_fetch_pc` = the **address driven on the CPU
+  bus** during a fetch (`verilator/sim.v:506,529`), NOT the `TG68_PC` register.
+- Our fetch address is `$00Axxxxx` (e.g. `00A41AEE`); MAME's PC/fetch is `$40Axxxxx`
+  (`40A0089E`, `40A07A5A`, …). So **our core drives `$00A` on the bus — the `$40` alias
+  bit (A30) is stripped** — while MAME runs the `$40A` alias. The post-MMU boot is
+  *designed* to run at the `$40A` alias (translated via the alias root entry); running it
+  at the bare `$00A` (served by the bug-#3 grace's identity bypass instead of translating
+  the alias) derails the control flow → the `$a00910` `rts` lands at `$00A0094A`.
+- A7/SP is balanced+normal (bsr `SP=$1FF3C8` → rts `SP=$1FF3C4`, routine net-neutral), so
+  it is NOT a stack/SP fault. (A stack-memory dump was inconclusive — the SDRAM word index
+  for the high stack didn't account for the mapping; reverted.)
+
+**Two sub-questions to close it (NEXT):**
+1. Is the `$40` bit lost in the `TG68_PC` register or only on the address-bus path? Wire
+   `debug_TG68_PC` (kernel already exports it, `TG68KdotC_Kernel.vhd:8784`) into the
+   heartbeat and compare to `last_fetch_pc`.
+2. The fix is then either (a) stop masking A30 in the PC/address path so the `$40A` alias
+   *translates* like MAME, or (b) narrow the bug-#3 grace so the alias `jmp` target runs
+   translated (not graced/identity at `$00A`). Shared `rtl/tg68k`; SST-bench + MAME re-check.
+
+**Tooling walls hit (for the next session):** MAME's `-debug` trace **dies at `pmove tc`**
+(`00A416B6: dc.w $ffff` is the last line) — it can't follow execution past MMU-enable, so
+the MAME-side instruction trace of the continuation needs a Lua single-stepper, not
+`trace.dbg`. The per-frame `pc_sp_hb.lua` DOES run past MMU (use it for register/PC diffs).
 
 Repro for the A7/PC diff:
 ```
