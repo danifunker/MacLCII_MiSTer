@@ -439,7 +439,10 @@ int verilate() {
 					static int last_hb_frame = -1;
 					if ((int)video.count_frame != last_hb_frame) {
 						last_hb_frame = (int)video.count_frame;
-						fprintf(stderr, "[HB] F%d pc=%06X\n", (int)video.count_frame, mpc);
+						auto &hbrf = VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__regfile;
+						fprintf(stderr, "[HB] F%d pc=%06X fullpc=%08X a7=%08X a2=%08X\n",
+						        (int)video.count_frame, mpc,
+						        (unsigned)VERTOPINTERN->debug_pc, RF_A(hbrf,7), RF_A(hbrf,2));
 					}
 				}
 				if (mpc != march_last_pc) {
