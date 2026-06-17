@@ -87,6 +87,7 @@ bool verbose_diag = false;
 // ---------
 bool cpu_trace_enable = false;  // Enable after ROM download
 bool cpu_trace_disabled = false; // --no-cpu-trace: skip per-instruction trace (long runs)
+bool pc_heartbeat = false;      // --heartbeat: print the 68k PC once per frame (long runs)
 bool cpu_trace_started = false;  // Wait for ROM load and reset
 FILE* cpu_trace_file = nullptr;
 const char* cpu_trace_filename = "cpu_trace.log";
@@ -177,6 +178,10 @@ SimBlockDevice blockdevice(console);
 // and --floppy0/1 on the command line.
 std::string scsi_disk_files[2];
 std::string floppy_disk_files[2];
+
+// Boot ROM override (--rom <path>). Empty => default ../releases/boot0.rom.
+// Lets us swap fastmem/nomemcheck ROMs without clobbering the shared boot0.rom.
+std::string rom_file_override;
 
 // Input handling
 // --------------
@@ -428,6 +433,15 @@ int verilate() {
 				static uint32_t march_last_pc = 0xFFFFFFFF;
 				static int hit_910 = 0, hit_694c = 0, hit_a590 = 0;
 				uint32_t mpc = VERTOPINTERN->debug_pc & 0xFFFFFF;
+				// --heartbeat: sample the PC once per frame so long runs show
+				// whether the CPU is advancing or wedged in a loop (no --verbose flood).
+				if (pc_heartbeat) {
+					static int last_hb_frame = -1;
+					if ((int)video.count_frame != last_hb_frame) {
+						last_hb_frame = (int)video.count_frame;
+						fprintf(stderr, "[HB] F%d pc=%06X\n", (int)video.count_frame, mpc);
+					}
+				}
 				if (mpc != march_last_pc) {
 					{   // STM-entry detector: first jump INTO the serial-monitor
 						// region ($A49800-$A49FFF) from outside, with source PC.
@@ -992,6 +1006,9 @@ void show_help() {
 	printf("  --screenshot <frames>         Take screenshots at specified frame numbers\n");
 	printf("                                (comma-separated list, e.g., 100,200,300)\n");
 	printf("  --stop-at-frame <frame>       Exit simulation after specified frame\n");
+	printf("  --rom <path>                  Boot ROM (default ../releases/boot0.rom)\n");
+	printf("                                e.g. --rom ../releases/boot0-nomemcheck.rom\n");
+	printf("  --heartbeat                   Print the 68k PC once per frame (progress on long runs)\n");
 	printf("  -v, --verbose                 Enable verbose bring-up diagnostics\n");
 	printf("                                (overlay/FC/march/RAMCFG/bus/CPU-trace spam)\n");
 	printf("\n");
@@ -1122,6 +1139,10 @@ int main(int argc, char** argv, char** env) {
 			floppy_disk_files[0] = argv[++i]; // primary floppy (.dsk) -> SDRAM download
 		} else if (strcmp(argv[i], "--floppy1") == 0 && i + 1 < argc) {
 			floppy_disk_files[1] = argv[++i]; // secondary floppy
+		} else if (strcmp(argv[i], "--rom") == 0 && i + 1 < argc) {
+			rom_file_override = argv[++i];    // boot ROM path (default ../releases/boot0.rom)
+		} else if (strcmp(argv[i], "--heartbeat") == 0) {
+			pc_heartbeat = true;              // once-per-frame 68k PC print
 		}
 	}
 
@@ -1231,8 +1252,10 @@ int main(int argc, char** argv, char** env) {
 		}
 	}
 
-	// Auto-load Mac LC ROM at startup
-	const char* rom_file = "../releases/boot0.rom";
+	// Auto-load Mac LC ROM at startup (--rom <path> overrides the default).
+	const char* rom_file = rom_file_override.empty()
+	                         ? "../releases/boot0.rom"
+	                         : rom_file_override.c_str();
 	bus.QueueDownload(rom_file, 0, 1);  // index 0 for ROM
 	fprintf(stderr, "Machine type: Mac LC, loading ROM: %s\n", rom_file);
 

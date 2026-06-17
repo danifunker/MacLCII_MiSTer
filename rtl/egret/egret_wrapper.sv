@@ -1027,11 +1027,14 @@ always @(posedge clk) begin
         if (via_byteack_in_stable != via_byteack_prev) begin
             $display("EGRET[%0d]: BYTEACK %b->%b", cycle_count, via_byteack_prev, via_byteack_in_stable);
         end
-        // Periodic PC dump when TIP is active (every 256 cycles)
+`ifdef EGRET_VERBOSE
+        // Periodic PC dump when TIP is active (every 256 cycles).
+        // High-frequency idle-loop spam — opt-in via +define+EGRET_VERBOSE.
         if (!via_tip_effective && cycle_count[7:0] == 8'h00) begin
             $display("EGRET[%0d]: PC=%04x TIP_active PB_in=%02x PB_out=%02x PB_ddr=%02x",
                      cycle_count, last_pc, pb_in, pb_out, pb_ddr);
         end
+`endif
 `endif
 
         // Track program counter
@@ -1046,7 +1049,10 @@ always @(posedge clk) begin
                 $display("EGRET_SRDBG[%0d]: PC=0x%04x BYTEACK=%b TIP=%b TREQ_out=%b CB1out=%b",
                          cycle_count, addr13, via_byteack_in_stable, via_tip_stable, pb_out[1], pb_out[4]);
 `endif
-`ifdef SIMULATION
+`ifdef EGRET_VERBOSE
+            // Track key init milestones. The HC05 loops through the COMM ($12C2)
+            // and SESSION ($132B) handler addresses every idle iteration, so these
+            // flood the log (~46k lines each) — opt-in via +define+EGRET_VERBOSE.
             // Track key init milestones
             if (addr13 == 13'h0FAF)
                 $display("EGRET[%0d]: >>> INIT RESTART ($0FAF)", cycle_count);
