@@ -1,12 +1,17 @@
-# Handoff: Mac LC II boot — Egret SR fixed (matches MAME), blocker is the 68030 PMMU
+# Handoff: Mac LC II boot — Egret SR fixed (matches MAME); 68030 PMMU bug #3 FIXED
 
 **Date:** 2026-06-16
 **Branch:** `030_LCii` (MacLC_MiSTer)
 **Commits this session:** `b0d8af7` (the two Egret fixes + diagnostics),
-`f2d4fb4` (bug #3 root-mechanism docs). This handoff = a third commit.
-**Status:** The Egret↔VIA shift-register transaction is now **byte-perfect vs MAME**
-(two real chipset bugs fixed). The boot still does **not** complete — but the remaining
-blocker is now **root-caused to the 68030 PMMU** (a CPU-core bug), not the chipset.
+`f2d4fb4` (bug #3 root-mechanism docs), `0f0f9ab` (this handoff).
+**UPDATE (later 2026-06-16):** bug #3 **ROOT-CAUSED and FIXED** in `0590605`
+(instruction-prefetch grace across MMU enable). The `$a416` PMMU derail is gone;
+the boot now executes MMU-translated code past the PMMU-enable stage. See the new
+`docs/findings_pmmu_translated_fetch_2026-06-16.md` and the "bug #3 — FIXED" note
+below. Fix also synced to `../MacIIvi_MiSTer` (`e345d01`, kernel byte-identical).
+**Status:** Egret↔VIA SR byte-perfect vs MAME; bug #3 (PMMU translated-fetch
+derail) fixed. Boot proceeds into translated execution (low-RAM + VASP I/O);
+any remaining failure is a *new, downstream* blocker, not bug #3.
 
 ---
 
@@ -33,8 +38,20 @@ session decomposed that into **three** bugs:
    **Result of #1+#2:** the cmd-07 Egret response is now `00 01 00 07 01` =
    MAME, byte-for-byte. The whole Egret/VIA-SR path is **exonerated**.
 
-3. **bug #3 — 68030 PMMU bus-errors on the first MMU-translated fetch (NOT fixed; CPU-core).**
-   This is the actual boot blocker and the rest of this doc.
+3. **bug #3 — 68030 PMMU bus-errors on the first MMU-translated fetch (FIXED `0590605`).**
+   This was the actual boot blocker; the rest of this doc was the investigation.
+   **Resolution (corrects the analysis below):** the faulting fetch is the residual
+   prefetch of the `jmp` at `$00a416b6` (fc=110, supervisor program), NOT the jmp
+   *target*. Captured fault: `va=00a416b6 fstat=4401` = Limit + Invalid, level 1.
+   The page tables map only `$000–$009FFFFF` (root table-desc limit=9) + the
+   `$40xxxxxx` alias; physical ROM `$00Axxxxx` (index 10) is intentionally unmapped
+   and TT0/TT1=0. Real HW serves that residual fetch from the logical 68030 I-cache /
+   prefetch queue (filled while the MMU was off); our uncached kernel re-translated
+   it and limit-faulted. FIX = model the prefetch: instruction fetches from the page
+   the CPU was executing in when the MMU went live bypass translation (identity)
+   until execution branches away (the jmp target, which IS mapped, then translates).
+   Note the earlier "same VA re-walks and resolves" was a mis-read — the re-walk was
+   a *different* VA (`$001ff3c4`, fc=5 data, from the derail), not `$00a416b6`.
 
 ---
 
