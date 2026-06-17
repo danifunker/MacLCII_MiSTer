@@ -41,10 +41,24 @@ core vs MAME (`verilator/mame/pc_sp_hb.lua` vs our `--heartbeat` fullpc/a7):
   it is NOT a stack/SP fault. (A stack-memory dump was inconclusive — the SDRAM word index
   for the high stack didn't account for the mapping; reverted.)
 
-**Two sub-questions to close it (NEXT):**
-1. Is the `$40` bit lost in the `TG68_PC` register or only on the address-bus path? Wire
-   `debug_TG68_PC` (kernel already exports it, `TG68KdotC_Kernel.vhd:8784`) into the
-   heartbeat and compare to `last_fetch_pc`.
+**CONFIRMED (2026-06-17): the `$40` bit is lost in the `TG68_PC` REGISTER — it's the CPU.**
+Temporarily wired `debug_TG68_PC` out (`tg68k.v`→`emu`, reverted after) and compared per
+frame to `last_fetch_pc`:
+```
+F152: busPC=00A41C2A  regPC=00A41C2C   (regPC=busPC+2 prefetch; BOTH bare $00A, no $40)
+F153: busPC=00A41AEE  regPC=00A41AF0   (both $00A)
+```
+`TG68_PC` itself is `$00A41xxx` — two independent signals (the kernel's PC register and
+the bus address) agree, so it is NOT a bus/glue/decode strip. `jmp (A2=$40A0010E)` set
+`PC=$00A0010E`, dropping A30. `A2` is also inconsistent (`$40A0099C` vs `$00A40F4A`), so
+some address loads keep the high bits and others strip them — i.e. the 68000→68030
+conversion's 32-bit address handling is incomplete in the PC/EA paths. **The dev's
+instinct was right: it's the CPU core, not the chipset.** (Tried to find a non-CPU cause
+— bus mask, decode, a memory-stored pointer — every path routes back to a CPU
+store/load/jmp masking the address.)
+
+**Sub-question CLOSED. Remaining = the fix (NEXT):**
+1. (answered: PC register, in the kernel)
 2. The fix is then either (a) stop masking A30 in the PC/address path so the `$40A` alias
    *translates* like MAME, or (b) narrow the bug-#3 grace so the alias `jmp` target runs
    translated (not graced/identity at `$00A`). Shared `rtl/tg68k`; SST-bench + MAME re-check.
