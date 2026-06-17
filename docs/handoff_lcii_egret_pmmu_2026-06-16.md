@@ -95,9 +95,15 @@ access** still faults.
 - **Walker index/limit:** decode the root descriptor `0009fc0a` (limit field?) and the
   TC (loaded from `[A3]=$3FFFB2`) IS/PS fields; verify the `$40A0010E` index doesn't
   trip a spurious limit violation. Add a PMMU_TRACE line for the VA + computed indices.
-- **Strategic:** you're importing a real **MC68030 (PMMU+caches)** in the MacIIvi repo.
-  This derail is very likely exactly what that core resolves — the highest-leverage
-  path is probably the MC68030 import rather than another TG68K-PMMU patch.
+- **Strategic (REVISED 2026-06-16):** the MacIIvi "MC68030 import" turned out NOT to
+  be a different core — it was an accidental newer-Minimig snapshot. Per the user, the
+  MacIIvi repo has now been **re-unified** to host the *byte-identical* MC68030 that
+  boots here (`MacIIvi_MiSTer/rtl/tg68k/` == this repo's `rtl/tg68k/`, kernel
+  `sha 0a6d793d`; validated on the MacIIvi CPU corpus bench: 714/719 architecturally
+  correct, 5 known PRM-CCR diffs). So there is **no second core to switch to** — bug #3
+  must be fixed *here*, in the shared `TG68K_PMMU_030.vhd` / kernel / `tg68k.v`, and then
+  re-copied to MacIIvi. The fix path is the bus-FSM/walker/limit analysis above, NOT a
+  core swap. (Details: `MacIIvi_MiSTer/68030_CPU_IMPLEMENTATION_PLAN.md`, 2026-06-16 update.)
 
 ---
 
