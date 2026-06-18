@@ -21,6 +21,7 @@ V_DEFINE += --trace-fst
 # BYTEACK/TIP/TREQ every ~32k fetches. Use to pinpoint the byte-4 SR/BYTEACK hang.
 # V_DEFINE += +define+EGRET_SRDEBUG=1
 # V_DEFINE += +define+PMMU_TRACE=1  (focused PMMU walker/stall probe; uncomment to enable)
+# V_DEFINE += +define+A30_TRACE=1  (LC II post-MMU bsr.w/PMMU-stall probe; uncomment to enable)
 V_DEFINE +=
 
 UNAME_S := $(shell uname -s)

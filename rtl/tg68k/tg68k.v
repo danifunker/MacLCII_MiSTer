@@ -77,6 +77,17 @@ wire [15:0] tg68_dout_k;               // kernel data_write, muxed with walker w
 wire        kernel_make_berr;
 wire        kernel_trap_berr;
 
+`ifdef A30_TRACE
+// --- A30 alias-bit divergence probe (LC II post-MMU; sim-only) ---
+wire [31:0] dbg_pc, dbg_reg_qa, dbg_memaddr_reg, dbg_memaddr_delta, dbg_data_read;
+wire [31:0] dbg_rf_wdata, dbg_a2, dbg_a5, dbg_a7;
+wire        dbg_directPC, dbg_rf_we;
+wire  [3:0] dbg_rf_waddr;
+wire  [7:0] dbg_ustate;
+wire        dbg_use_base;
+wire  [1:0] dbg_setstate, dbg_state;
+`endif
+
 reg         walk_cycle;   // 1 = a walker word transfer is borrowing the bus
 reg         walk_word;    // 0 = high word @addr, 1 = low word @addr+2
 reg  [15:0] walk_hi;      // captured high word (big-endian: bits 31:16)
@@ -323,6 +334,27 @@ end
 		.debug_make_berr ( kernel_make_berr ),
 		.debug_trap_berr ( kernel_trap_berr )
 
+`ifdef A30_TRACE
+		// --- A30 alias-bit divergence probe (LC II post-MMU; sim-only) ---
+		,
+		.debug_TG68_PC       ( dbg_pc        ),
+		.debug_reg_QA        ( dbg_reg_qa    ),
+		.debug_memaddr_reg   ( dbg_memaddr_reg ),
+		.debug_memaddr_delta ( dbg_memaddr_delta ),
+		.debug_data_read     ( dbg_data_read ),
+		.debug_exec_directPC ( dbg_directPC  ),
+		.debug_regfile_we    ( dbg_rf_we     ),
+		.debug_regfile_waddr ( dbg_rf_waddr  ),
+		.debug_regfile_wdata ( dbg_rf_wdata  ),
+		.debug_regfile_a2    ( dbg_a2        ),
+		.debug_regfile_a5    ( dbg_a5        ),
+		.debug_regfile_a7    ( dbg_a7        ),
+		.debug_micro_state   ( dbg_ustate    ),
+		.debug_use_base      ( dbg_use_base  ),
+		.debug_setstate      ( dbg_setstate  ),
+		.debug_state         ( dbg_state     )
+`endif
+
 		// All other new 030 ports (skipFetch, regin_out, CACR_out, VBR_out,
 		// cache_*/cacr_*, pmmu_reg_*/pmmu_addr_*, cache_op_addr and the debug_*
 		// bus) are outputs left intentionally unconnected. The on-chip caches
@@ -430,6 +462,71 @@ end
 		end
 	end
 	`endif
+`ifdef A30_TRACE
+	// --- A30 alias-bit divergence probe (LC II post-MMU; sim-only) ---
+	// Goal: find where the $40 ROM-alias bit (A30) is dropped on the way to the
+	// post-MMU continuation jmp. Logs (sampled on the kernel clkena edge):
+	//  (1) control flow ENTERING the $x0A0xxxx continuation page (PC[27:16]==0x0A0):
+	//      shows the new PC + the EA source register (reg_QA) + memaddr_reg/delta
+	//      so we can see whether the jmp target carried $40 (alias) or $00A (bare).
+	//  (2) every address-register WRITE whose value lands in the $x0Axxxxx region
+	//      (wdata[23:20]==0xA): catches the load that sets A5/A2 to the continuation
+	//      pointer, revealing if bit30 ($40) is present at the moment it is stored.
+	//  (3) any An write of a $40000000-set value (bit31:28==0x4): proof the regfile
+	//      can hold A30 at all, and which register/value.
+	reg [31:0] a30_pc_d;
+	reg [31:0] a30_cyc;
+	always @(posedge clk) begin
+		if (reset) begin
+			a30_pc_d <= 32'hFFFFFFFF;
+			a30_cyc  <= 32'h0;
+		end else if (tg68_clkena) begin
+			a30_cyc <= a30_cyc + 1'b1;
+
+			// (1) entered the $x0A0xxxx continuation page
+			if (dbg_pc[27:16] == 12'h0A0 && a30_pc_d[27:16] != 12'h0A0)
+				$display("A30[ENTER-A0] cyc=%0d PC=%h (was %h) reg_QA=%h memreg=%h memdelta=%h data_read=%h A7=%h directPC=%b @%0t",
+				         a30_cyc, dbg_pc, a30_pc_d, dbg_reg_qa, dbg_memaddr_reg,
+				         dbg_memaddr_delta, dbg_data_read, dbg_a7, dbg_directPC, $time);
+
+			// (1b) every rts/return PC-load (directPC) while executing in the $x0A
+			//      ROM region — shows the popped return value (data_read) + live SP (A7),
+			//      to settle whether the $a00948 rts pops a clobbered/low return.
+			if (dbg_directPC && (dbg_pc[27:20] == 8'h0A))
+				$display("A30[RTS] cyc=%0d pop=%h newPC=%h A7=%h @%0t",
+				         a30_cyc, dbg_data_read, dbg_pc, dbg_a7, $time);
+
+			// Per-cycle micro-state + address-source dump around the failing bsr.w push
+			// ($40A0012C bsr $a00910, ~cyc 12359300-12359325). Shows the exact cycle the
+			// push write fires and which EA it uses (memaddr_reg+delta vs branch target).
+			if (a30_cyc > 32'd12359298 && a30_cyc < 32'd12359330)
+				$display("A30[UST] cyc=%0d ust=%0d pc=%h memreg=%h memdelta=%h use_base=%b setstate=%b state=%b rfwe=%b waddr=%h wdata=%h",
+				         a30_cyc, dbg_ustate, dbg_pc, dbg_memaddr_reg, dbg_memaddr_delta,
+				         dbg_use_base, dbg_setstate, dbg_state, dbg_rf_we, dbg_rf_waddr, dbg_rf_wdata);
+
+			a30_pc_d <= dbg_pc;
+		end
+	end
+
+	// --- Stack-region ($1FF380-$1FF3FF) bus-cycle logger ---
+	// The failing rts has A7=$1FF3C4 (correct/high) yet pops $0 -> derail. So the
+	// stacked return at $1FF3C4 is wrong. Watch every data read/write to the stack
+	// region: the bsr push should WRITE $40A00130 to $1FF3C4; the rts should READ it
+	// back. If the push writes the wrong value/addr, or the read sees $0, this shows it.
+	always @(posedge clk) begin
+		if (!reset && phi2 && s_state == 3'd6 && !walk_cycle && eff_busstate != 2'b01 &&
+		    // (a) anything aliasing the $1FF3xx stack region (any top nibble), OR
+		    //     (b) ALL data cycles during the continuation window (cyc ~12.359M)
+		    //     so the bsr push is captured wherever its address lands.
+		    (addr[27:8] == 20'h1FF3 ||
+		     (a30_cyc > 32'd12359150 && a30_cyc < 32'd12359650))) begin
+			$display("A30[STK] %s addr=%h data=%h busstate=%b kpc=%h cyc=%0d @%0t",
+			         tg68_rw ? "RD" : "WR", addr,
+			         tg68_rw ? tg68_din : tg68_dout_k, tg68_busstate, tg68_addr, a30_cyc, $time);
+		end
+	end
+`endif
+
 // Expose busstate for debugging
 assign busstate = tg68_busstate;
 
