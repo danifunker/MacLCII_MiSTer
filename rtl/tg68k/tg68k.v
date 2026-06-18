@@ -86,6 +86,28 @@ wire  [3:0] dbg_rf_waddr;
 wire  [7:0] dbg_ustate;
 wire        dbg_use_base;
 wire  [1:0] dbg_setstate, dbg_state;
+wire        dbg_pmmu_busy;        // kernel pmmu_busy (the bsr.w-hold gate)
+wire [31:0] dbg_memaddr_drega;    // memaddr_delta_rega (held by the bsr.w fix)
+// move.b decode-sequence probes: find where the absolute-EA (ld_nn / set_addrlong)
+// transition is lost when the instruction fetch stalls on a PMMU walk.
+wire  [7:0] dbg_next_ustate;      // next_micro_state
+wire [15:0] dbg_opcode, dbg_last_opc;
+wire        dbg_set_addrlong, dbg_decodeOPC, dbg_get_2ndopc, dbg_clkena_lw;
+`endif
+
+`ifdef PMMU_TRACE
+// Expose the PMMU's per-walk logical address + live CRP-aptr/TC + walk state so the
+// PMMU REQ trace shows whether a wrong root index comes from a bad logical address
+// (debug_pmmu_saved_addr) or a bad loaded CRP (debug_pmmu_crp_lo).
+wire [31:0] dbg_pmmu_saddr, dbg_pmmu_crplo, dbg_pmmu_tc;
+wire  [4:0] dbg_pmmu_wstate;
+// Fault-source forensics: the MMUSR fault class (sticky = FIRST fault), the raw
+// pmmu_fault edge (catches a SECOND, suppressed fault during exception entry), and
+// the last descriptor addr/data the walker read. Decides desc_valid(I) vs limit(L)
+// vs supervisor(S) vs buserr(B) for the $40A03F18 root[10] early-term fault.
+wire [15:0] dbg_pmmu_fstat;
+wire        dbg_pmmu_fault_o;
+wire [31:0] dbg_pmmu_wddata, dbg_pmmu_wdaddr;
 `endif
 
 reg         walk_cycle;   // 1 = a walker word transfer is borrowing the bus
@@ -352,7 +374,27 @@ end
 		.debug_micro_state   ( dbg_ustate    ),
 		.debug_use_base      ( dbg_use_base  ),
 		.debug_setstate      ( dbg_setstate  ),
-		.debug_state         ( dbg_state     )
+		.debug_state         ( dbg_state     ),
+		.debug_pmmu_busy     ( dbg_pmmu_busy ),
+		.debug_memaddr_delta_rega ( dbg_memaddr_drega ),
+		.debug_next_micro_state ( dbg_next_ustate ),
+		.debug_opcode        ( dbg_opcode      ),
+		.debug_last_opc_read ( dbg_last_opc    ),
+		.debug_set_addrlong  ( dbg_set_addrlong ),
+		.debug_decodeOPC     ( dbg_decodeOPC   ),
+		.debug_get_2ndopc    ( dbg_get_2ndopc  ),
+		.debug_clkena_lw     ( dbg_clkena_lw   )
+`endif
+`ifdef PMMU_TRACE
+		,
+		.debug_pmmu_saved_addr ( dbg_pmmu_saddr  ),
+		.debug_pmmu_crp_lo     ( dbg_pmmu_crplo  ),
+		.debug_pmmu_tc         ( dbg_pmmu_tc     ),
+		.debug_pmmu_wstate     ( dbg_pmmu_wstate ),
+		.debug_pmmu_fault_status ( dbg_pmmu_fstat ),
+		.debug_pmmu_fault        ( dbg_pmmu_fault_o ),
+		.debug_pmmu_walk_desc_addr ( dbg_pmmu_wdaddr ),
+		.debug_pmmu_walk_desc_data ( dbg_pmmu_wddata )
 `endif
 
 		// All other new 030 ports (skipFetch, regin_out, CACR_out, VBR_out,
@@ -425,12 +467,12 @@ end
 	//  * a heartbeat dump of the CPU/walker bus state so a post-pmove(tc) stall
 	//    is visible (the main cpu_trace goes blind once the kernel parks the bus
 	//    in a never-completing walk). Enable with +define+PMMU_TRACE.
-	reg        walk_cycle_d, mberr_d, tberr_d, wreq_d;
+	reg        walk_cycle_d, mberr_d, tberr_d, wreq_d, pfault_d;
 	reg [31:0] dbg_cyc;
 	reg [31:0] dbg_walks;
 	always @(posedge clk) begin
 		if (reset) begin
-			walk_cycle_d <= 0; mberr_d <= 0; tberr_d <= 0; wreq_d <= 0;
+			walk_cycle_d <= 0; mberr_d <= 0; tberr_d <= 0; wreq_d <= 0; pfault_d <= 0;
 			dbg_cyc <= 0; dbg_walks <= 0;
 		end else begin
 			dbg_cyc      <= dbg_cyc + 1'b1;
@@ -439,20 +481,40 @@ end
 			mberr_d      <= kernel_make_berr;
 			tberr_d      <= kernel_trap_berr;
 
-			// walk request edge (kernel asked for a descriptor)
-			if (pmmu_walker_req && !wreq_d && dbg_walks < 32'd400) begin
-				$display("PMMU REQ #%0d addr=%h we=%b (kernel PC~%h) @%0t",
-				         dbg_walks, pmmu_walker_addr, pmmu_walker_we, tg68_addr, $time);
+			// walk request edge (kernel asked for a descriptor) — gated on the
+			// descriptor address being in the top-of-RAM page-table region
+			// ($3F0000-$3FFFFF, where the CRP table $3FE820 lives), NOT on the PC,
+			// so the $0CB2 DATA-access walk (PC=$0CB2) is captured. Determines
+			// walk-vs-stale-ATC for the $0CB2->$fffffff2 mistranslation.
+			if (pmmu_walker_req && !wreq_d && dbg_walks < 32'd4000 &&
+			    pmmu_walker_addr >= 32'h003F0000 && pmmu_walker_addr <= 32'h003FFFFF) begin
+				$display("PMMU REQ #%0d addr=%h we=%b log=%h crp=%h tc=%h ws=%0d (PC~%h) @%0t",
+				         dbg_walks, pmmu_walker_addr, pmmu_walker_we,
+				         dbg_pmmu_saddr, dbg_pmmu_crplo, dbg_pmmu_tc, dbg_pmmu_wstate,
+				         tg68_addr, $time);
 				dbg_walks <= dbg_walks + 1'b1;
 			end
 			// walk completion (ack pulse)
-			if (pmmu_walker_ack && dbg_walks < 32'd400)
-				$display("PMMU ACK  data=%h @%0t", pmmu_walker_data, $time);
+			if (pmmu_walker_ack &&
+			    pmmu_walker_addr >= 32'h003F0000 && pmmu_walker_addr <= 32'h003FFFFF)
+				$display("PMMU ACK  data=%h kpc=%h waddr=%h @%0t", pmmu_walker_data, tg68_addr, pmmu_walker_addr, $time);
 
 			if (kernel_make_berr && !mberr_d)
 				$display("PMMU make_berr  addr=%h s_state=%0d busstate=%b @%0t", tg68_addr, s_state, tg68_busstate, $time);
 			if (kernel_trap_berr && !tberr_d)
 				$display("PMMU trap_berr  addr=%h @%0t", tg68_addr, $time);
+
+			// Raw pmmu_fault rising edge — fires for EVERY walker fault, including a
+			// second one suppressed during exception entry (trap_berr already pending).
+			// fstat = MMUSR class (sticky=FIRST fault): B=bit15 L=14 S=13 W=11 I=10.
+			// saddr = the faulting logical addr (live per-walk); wddata = last desc word.
+			pfault_d <= dbg_pmmu_fault_o;
+			if (dbg_pmmu_fault_o && !pfault_d)
+				$display("PMMU FAULT  saddr=%h fstat=%h (B=%b L=%b S=%b W=%b I=%b) ws=%0d descaddr=%h descdata=%h @%0t",
+				         dbg_pmmu_saddr, dbg_pmmu_fstat,
+				         dbg_pmmu_fstat[15], dbg_pmmu_fstat[14], dbg_pmmu_fstat[13],
+				         dbg_pmmu_fstat[11], dbg_pmmu_fstat[10], dbg_pmmu_wstate,
+				         dbg_pmmu_wdaddr, dbg_pmmu_wddata, $time);
 
 			// heartbeat: periodic bus-state dump (catches a stalled/looping walk)
 			if (dbg_cyc[17:0] == 18'd0)
@@ -504,6 +566,19 @@ end
 				         a30_cyc, dbg_ustate, dbg_pc, dbg_memaddr_reg, dbg_memaddr_delta,
 				         dbg_use_base, dbg_setstate, dbg_state, dbg_rf_we, dbg_rf_waddr, dbg_rf_wdata);
 
+			// Per-cycle EA-build dump around the failing `move.b d1,$cb2.w` ($40A03F18,
+			// right after `pmove (8,A0),TC`, ~cyc 12462805-12462825). CONFIRM whether the
+			// bsr.w-fix HOLD (pmmu_busy='1' AND state(1)='1' -> freeze memaddr_delta_rega)
+			// engages during the absolute-short operand fetch, pinning the EA at the PC
+			// instead of letting $0CB2 latch. Logs the hold gate (pmmu_busy + state) and
+			// the held value (memaddr_delta_rega) vs the combined memaddr_delta / addr.
+			if (a30_cyc > 32'd12462795 && a30_cyc < 32'd12462830)
+				$display("A30[MOVB] cyc=%0d ust=%0d nxt=%0d pc=%h opc=%h lopc=%h dec=%b g2=%b addrl=%b clw=%b pbusy=%b ubase=%b ss=%b st=%b drega=%h memdelta=%h addr=%h",
+				         a30_cyc, dbg_ustate, dbg_next_ustate, dbg_pc, dbg_opcode, dbg_last_opc,
+				         dbg_decodeOPC, dbg_get_2ndopc, dbg_set_addrlong, dbg_clkena_lw,
+				         dbg_pmmu_busy, dbg_use_base, dbg_setstate, dbg_state,
+				         dbg_memaddr_drega, dbg_memaddr_delta, addr);
+
 			a30_pc_d <= dbg_pc;
 		end
 	end
@@ -523,6 +598,61 @@ end
 			$display("A30[STK] %s addr=%h data=%h busstate=%b kpc=%h cyc=%0d @%0t",
 			         tg68_rw ? "RD" : "WR", addr,
 			         tg68_rw ? tg68_din : tg68_dout_k, tg68_busstate, tg68_addr, a30_cyc, $time);
+		end
+	end
+
+	// --- $1FF35A dispatch probe (LC II post-MMU, NEXT blocker) ---
+	// After the (now-fixed) bsr.w push, trace the path through the $00A1491E
+	// jump-table dispatcher (jmp ($2,PC,D5.w)) to the $001FF35A wedge. Logs each
+	// instruction boundary in the continuation/dispatcher/stack pages ($x0A0xxxx,
+	// $x0A1xxxx, $xx1FF3xx) + every PC-load (directPC) + EA context (memaddr_reg/
+	// delta/use_base/reg_QA/data_read) + PMMU-walk status (walk_cycle/walker_req).
+	// Answers: is the jmp target (D5/computed EA) right vs MAME ($40A07A5A), and
+	// does the EA/target-fetch stall on a PMMU walk (same address-corruption class)?
+	// Bounded: arms just before the push, stops 1500 cyc after PC first enters $1FF3xx.
+	reg        disp_armed;
+	reg        disp_wedged;
+	reg [15:0] disp_cnt;
+	reg [31:0] disp_pc_d;
+	always @(posedge clk) begin
+		if (reset) begin
+			disp_armed  <= 1'b0;
+			disp_wedged <= 1'b0;
+			disp_cnt    <= 16'd0;
+			disp_pc_d   <= 32'hFFFFFFFF;
+		end else if (tg68_clkena) begin
+			if (a30_cyc > 32'd12359000) disp_armed <= 1'b1;
+			if (disp_armed && (dbg_pc[23:8] == 16'h1FF3 || dbg_pc[31:24] == 8'hFF)) disp_wedged <= 1'b1;
+			if (disp_wedged) disp_cnt <= disp_cnt + 1'b1;
+
+			if (disp_armed && !(disp_wedged && disp_cnt > 16'd1500)) begin
+				if (((dbg_pc[23:16] == 8'hA0 || dbg_pc[23:16] == 8'hA1 ||
+				      dbg_pc[23:8] == 16'h1FF3) && dbg_pc != disp_pc_d)
+				    || dbg_directPC || walk_cycle)
+					$display("A30[DISP] cyc=%0d pc=%h(was %h) dPC=%b ust=%0d memreg=%h memdelta=%h ubase=%b QA=%h dread=%h a2=%h a7=%h ss=%b st=%b walk=%b wreq=%b waddr=%h bs=%b addr=%h",
+					         a30_cyc, dbg_pc, disp_pc_d, dbg_directPC, dbg_ustate,
+					         dbg_memaddr_reg, dbg_memaddr_delta, dbg_use_base, dbg_reg_qa,
+					         dbg_data_read, dbg_a2, dbg_a7, dbg_setstate, dbg_state,
+					         walk_cycle, pmmu_walker_req, pmmu_walker_addr, tg68_busstate, tg68_addr);
+			end
+			disp_pc_d <= dbg_pc;
+		end
+	end
+
+	// --- $0CB0-$0CBF byte-lane watchpoint (LC II post-MMU, $1FF35A wedge root) ---
+	// The A-trap MMU-mode flag $0CB2 is $46 in our core but 0 in MAME, sending us into
+	// a spurious pmove-TC reconfig -> bus error. The setup `move.b #$1,$cb2.w` ($A03E14)
+	// is a BYTE write to an EVEN address; suspect it lands on the wrong byte lane (odd),
+	// leaving $0CB2 stale. Log every bus access to $0CB0-$0CBF with the UDS/LDS lane and
+	// both data bytes, so we can see exactly which lane the byte write/read uses.
+	always @(posedge clk) begin
+		if (!reset && phi2 && s_state == 3'd6 && !walk_cycle && eff_busstate != 2'b01 &&
+		    addr[27:4] == 24'h0000CB) begin
+			$display("A30[CB] %s addr=%h uds=%b lds=%b data=%h(hi=%h lo=%h) bs=%b kpc=%h cyc=%0d",
+			         tg68_rw ? "RD" : "WR", addr, tg68_uds_n, tg68_lds_n,
+			         tg68_rw ? din : tg68_dout_k,
+			         (tg68_rw ? din : tg68_dout_k) >> 8, (tg68_rw ? din : tg68_dout_k) & 16'hFF,
+			         tg68_busstate, tg68_addr, a30_cyc);
 		end
 	end
 `endif

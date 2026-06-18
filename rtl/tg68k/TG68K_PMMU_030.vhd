@@ -3588,8 +3588,18 @@ begin
             wstate <= W_PAGE;
           end if;
         when W_PAGE =>
-          -- Process page descriptor and validate completely
-          if not desc_valid(walk_desc) then
+          -- Process page descriptor and validate completely.
+          -- BUG FIX (LC II 24-bit page table): the descriptor TYPE (DT) lives in the
+          -- HIGH word for LONG-format descriptors. walk_desc, however, holds the LOW
+          -- word here (the page's physical base — see W_*_LOW: "walk_desc <= mem_rdat"
+          -- and align_addr(walk_desc_low,...)), which is always >=256-byte aligned, so
+          -- its bits 1:0 are "00". desc_valid(walk_desc) therefore wrongly flagged
+          -- EVERY long-format early-termination page descriptor as invalid (DT=00),
+          -- bus-erroring the first access through e.g. the LC II 24-bit table whose
+          -- root[] entries are DT=01 long early-term pages (root[10]=$7FFFFC19/$00A00000
+          -- maps ROM). Validate the DT in the correct word per format.
+          if (walk_desc_is_long = '1' and not desc_valid(walk_desc_high)) or
+             (walk_desc_is_long = '0' and not desc_valid(walk_desc)) then
             -- Invalid page descriptor (DT=00)
             walker_fault <= '1';
             walker_fault_status <= encode_mmusr_fault(

@@ -20,8 +20,8 @@ V_DEFINE += --trace-fst
 # Uncomment for a FOCUSED HC05 stuck-loop trace (no flood) - prints the Egret PC +
 # BYTEACK/TIP/TREQ every ~32k fetches. Use to pinpoint the byte-4 SR/BYTEACK hang.
 # V_DEFINE += +define+EGRET_SRDEBUG=1
-# V_DEFINE += +define+PMMU_TRACE=1  (focused PMMU walker/stall probe; uncomment to enable)
-# V_DEFINE += +define+A30_TRACE=1  (LC II post-MMU bsr.w/PMMU-stall probe; uncomment to enable)
+# V_DEFINE += +define+PMMU_TRACE=1  (PMMU walker/stall + $A03Fxx mode-switch reconfig walk capture + PMMU FAULT class; uncomment to enable)
+# V_DEFINE += +define+A30_TRACE=1   (LC II post-MMU bsr.w/PMMU + $1FF35A dispatch + $0CB0-$0CBF watchpoint + A30[MOVB] decode-sequence trace)
 V_DEFINE +=
 
 UNAME_S := $(shell uname -s)
