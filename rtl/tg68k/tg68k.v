@@ -40,9 +40,25 @@ module tg68k (
 );
 
 wire  [1:0] tg68_busstate;
+
+// ---------------------------------------------------------------------------
+// 68030 on-chip I/D cache enable (TG68K_Cache_030).
+//   0 = run uncached (today's behaviour, every fetch/load hits the Mac bus)
+//   1 = caches live (read-hit bypass + line fill).
+// Kept at 0 until the Phase 5 sim+MAME+FPGA validation. With it 0 the cache
+// subsystem below is in the generate `else` arm (cache_read_hit tied 0), so the
+// bus FSM is provably identical to the uncached design.
+// ---------------------------------------------------------------------------
+localparam USE_68030_CACHE = 1'b0;
+wire        cache_read_hit;     // current CPU access is a cacheable read that HIT the cache
+wire [15:0] cache_kernel_data;  // 16-bit word fed to the kernel on a cache hit (skips the bus)
+
 // Suppress clkena while the walker is borrowing the bus so the (stalled) CPU
-// pipeline does not advance during a page-table walk.
-wire        tg68_clkena = phi1 && (s_state == 7 || tg68_busstate == 2'b01) && !walk_cycle;
+// pipeline does not advance during a page-table walk. On a cache read-hit the
+// access completes with no bus cycle, so clkena pulses immediately (like a
+// busstate=01 no-access cycle) instead of waiting for s_state 7.
+wire        tg68_clkena = phi1 && (s_state == 7 || tg68_busstate == 2'b01 || cache_read_hit)
+                          && !walk_cycle && !fill_active && !fill_hold;
 wire [31:0] tg68_addr;
 wire [15:0] tg68_din;
 reg  [15:0] tg68_din_r;
@@ -117,13 +133,23 @@ reg  [15:0] walk_hi;      // captured high word (big-endian: bits 31:16)
 wire [31:0] walk_word_addr = walk_word ? (pmmu_walker_addr | 32'd2) : (pmmu_walker_addr & ~32'd2);
 wire [15:0] walk_dout_word = walk_word ? pmmu_walker_wdat[15:0]     : pmmu_walker_wdat[31:16];
 
-// Effective bus controls: the walker drives the (otherwise parked) main bus
-// during a walk; outside a walk these are exactly the kernel's signals.
-wire [1:0]  eff_busstate = walk_cycle ? (pmmu_walker_we ? 2'b11 : 2'b10) : tg68_busstate;
-wire        eff_rw       = walk_cycle ? ~pmmu_walker_we : tg68_rw;
-wire        eff_uds_n    = walk_cycle ? 1'b0 : tg68_uds_n;
-wire        eff_lds_n    = walk_cycle ? 1'b0 : tg68_lds_n;
-wire [31:0] eff_addr     = walk_cycle ? walk_word_addr : tg68_addr;
+// 68030 cache line-fill bus master (Phase 3). On a cacheable read miss the CPU
+// stalls and the fill engine reads the 16-byte line (8 x 16-bit words) at the
+// line-aligned physical address, then hands it to the cache (i/d_fill_valid).
+// Like the PMMU walker it borrows the Mac bus via the eff_* overrides below.
+// All of these are tied 0 when USE_68030_CACHE=0 (no_cache arm), so eff_*,
+// clkena and the s_state FSM reduce exactly to the uncached design.
+wire        fill_active;     // 1 = fill engine is reading the line on the bus
+wire        fill_hold;       // 1 = fill done, hold s_state at 0 until the cache writes the line
+wire [31:0] fill_bus_addr;   // current 16-bit read address during a fill
+
+// Effective bus controls: the walker (highest priority) or the fill engine drive
+// the (otherwise CPU-owned) main bus; outside both these are the kernel's signals.
+wire [1:0]  eff_busstate = walk_cycle ? (pmmu_walker_we ? 2'b11 : 2'b10) : (fill_active ? 2'b10 : tg68_busstate);
+wire        eff_rw       = walk_cycle ? ~pmmu_walker_we : (fill_active ? 1'b1  : tg68_rw);
+wire        eff_uds_n    = walk_cycle ? 1'b0 : (fill_active ? 1'b0 : tg68_uds_n);
+wire        eff_lds_n    = walk_cycle ? 1'b0 : (fill_active ? 1'b0 : tg68_lds_n);
+wire [31:0] eff_addr     = walk_cycle ? walk_word_addr : (fill_active ? fill_bus_addr : tg68_addr);
 
 // The tg68k core doesn't reliably support mixed usage of autovector and non-autovector
 // interrupts, so the TG68K kernel switched to non-autovector interrupts, and the 
@@ -171,6 +197,12 @@ always @(posedge clk) begin
 			if (s_state != 4 && s_state != 3'd0) s_state <= s_state + 1'd1;
 			if (busreq_ack || bus_granted) s_state <= s_state;
 			if (eff_busstate == 2'b01) s_state <= 0;
+			// Cache read-hit: no external bus cycle — hold s_state at 0 (exactly
+			// like a busstate=01 no-access cycle); clkena pulses this phi1 and the
+			// cache supplies the data via the kernel data_in mux below. fill_hold
+			// likewise parks the bus for the few cycles after a line fill completes,
+			// until the cache writes the line and the resulting read-hit delivers.
+			if (cache_read_hit || fill_hold) s_state <= 0;
 
 			case (s_state)
 				1: if (eff_busstate != 2'b01) begin
@@ -197,13 +229,14 @@ always @(posedge clk) begin
 				s_state <= s_state + 1'd1;
 			if ((busreq_ack || bus_granted) && !busrel_ack) s_state <= s_state;
 			if (eff_busstate == 2'b01) s_state <= 0;
+			if (cache_read_hit || fill_hold) s_state <= 0;   // cache read-hit / fill write-wait: no bus cycle (see phi1 branch)
 
 			case (s_state)
 
 				6: begin
-					// During a walk the descriptor word is captured by the walker
-					// FSM (from din); don't clobber the CPU's data_in latch.
-					if (!walk_cycle) tg68_din_r <= tg68_din;
+					// During a walk or a cache line-fill the read word is captured by
+					// that engine's own FSM (from din); don't clobber the CPU data latch.
+					if (!walk_cycle && !fill_active) tg68_din_r <= tg68_din;
 					uds_n_r <= 1;
 					lds_n_r <= 1;
 					as_n_r <= 1;
@@ -321,11 +354,26 @@ end
 	end
 	wire berr_held = (berr | berr_hold) & ~(kernel_make_berr | kernel_trap_berr);
 
+	// 68030 cache-control taps from the kernel. These kernel outputs were
+	// previously left unconnected; they feed the cache subsystem in the generate
+	// block below. When USE_68030_CACHE=0 the cache is not elaborated and these
+	// are simply unused nets (the kernel itself is unaffected by being tapped).
+	wire [31:0] cache_addr_log;     // pmmu_addr_log  (logical  -> cache index/tag)
+	wire [31:0] cache_addr_phys;    // pmmu_addr_phys (physical -> cacheable decode + line fill)
+	wire        cache_inhibit_pmmu; // pmmu_cache_inhibit
+	wire        cacr_ie, cacr_de, cacr_ifreeze, cacr_dfreeze, cacr_wa;
+	wire        cache_inv_req;
+	wire [1:0]  cache_op_scope, cache_op_cache;
+	wire [31:0] cache_op_addr;
+
 	TG68KdotC_Kernel tg68k (
 		.clk            ( clk           ),
 		.nReset         ( ~reset        ),
 		.clkena_in      ( tg68_clkena   ),
-		.data_in        ( tg68_din_r    ),
+		// On a cache read-hit the kernel takes data straight from the cache
+		// (no bus cycle ran, so tg68_din_r is stale); otherwise the latched
+		// bus word. cache_read_hit is constant 0 when USE_68030_CACHE=0.
+		.data_in        ( cache_read_hit ? cache_kernel_data : tg68_din_r ),
 		.IPL            ( ipl           ),
 		.IPL_autovector ( 1'b0          ),
 		.berr           ( berr_held     ),
@@ -354,7 +402,21 @@ end
 		// Bus-error status used by the berr-hold release logic above (prevents a
 		// spurious 030 double bus fault on the ROM's FC=7 MOVES probe).
 		.debug_make_berr ( kernel_make_berr ),
-		.debug_trap_berr ( kernel_trap_berr )
+		.debug_trap_berr ( kernel_trap_berr ),
+
+		// 68030 cache control + PMMU address taps (consumed by the cache below).
+		.pmmu_addr_log      ( cache_addr_log     ),
+		.pmmu_addr_phys     ( cache_addr_phys    ),
+		.pmmu_cache_inhibit ( cache_inhibit_pmmu ),
+		.cacr_ie            ( cacr_ie            ),
+		.cacr_de            ( cacr_de            ),
+		.cacr_ifreeze       ( cacr_ifreeze       ),
+		.cacr_dfreeze       ( cacr_dfreeze       ),
+		.cacr_wa            ( cacr_wa            ),
+		.cache_inv_req      ( cache_inv_req      ),
+		.cache_op_scope     ( cache_op_scope     ),
+		.cache_op_cache     ( cache_op_cache     ),
+		.cache_op_addr      ( cache_op_addr      )
 
 `ifdef A30_TRACE
 		// --- A30 alias-bit divergence probe (LC II post-MMU; sim-only) ---
@@ -397,11 +459,205 @@ end
 		.debug_pmmu_walk_desc_data ( dbg_pmmu_wddata )
 `endif
 
-		// All other new 030 ports (skipFetch, regin_out, CACR_out, VBR_out,
-		// cache_*/cacr_*, pmmu_reg_*/pmmu_addr_*, cache_op_addr and the debug_*
-		// bus) are outputs left intentionally unconnected. The on-chip caches
-		// (TG68K_Cache_030) are not instantiated; the kernel runs uncached.
+		// Cache control + PMMU address taps are connected above. The remaining
+		// new-030 outputs (skipFetch, regin_out, CACR_out, VBR_out, cacr_ibe/dbe,
+		// pmmu_reg_*) are left unconnected. The on-chip caches are instantiated in
+		// the generate block below, only when USE_68030_CACHE=1.
 	);
+
+	// =======================================================================
+	// 68030 on-chip Instruction + Data cache (TG68K_Cache_030)
+	//
+	// Phase 2: controller glue + READ-HIT bypass only. The cache indexes by the
+	// kernel's logical address (cache_addr_log) qualified by FC, allocation-gated
+	// to cacheable physical regions. On a read that hits a present line we hand
+	// the word straight to the kernel: cache_read_hit holds the bus FSM at
+	// s_state 0 and clkena pulses immediately, so NO external/SDRAM cycle runs.
+	// Misses and writes fall through to the normal Mac bus cycle.
+	//
+	// Until the Phase 3 line-fill engine lands, the fill-return inputs are tied
+	// inert, so no line is ever populated -> the cache never reports a hit ->
+	// this block is functionally inert even with USE_68030_CACHE=1.
+	// =======================================================================
+	generate if (USE_68030_CACHE) begin : gen_cache
+
+		wire        is_030      = (cpu == 2'b10);
+		// Phase 3 wires the real PMMU busy/fault here. During a page-table walk
+		// the kernel forces busstate=01, so i_req/d_req are already 0 and a hit
+		// cannot occur mid-walk regardless of this gate.
+		wire        xlate_ready = 1'b1;
+
+		wire i_req = is_030 & cacr_ie & (tg68_busstate == 2'b00) & xlate_ready;
+		wire d_req = is_030 & cacr_de & (tg68_busstate == 2'b10 || tg68_busstate == 2'b11) & xlate_ready;
+		wire d_we  = (tg68_busstate == 2'b11);
+
+		// Cacheable physical regions on the V8 24-bit map (rtl/addrDecoder.v):
+		// RAM $000000-$9FFFFF + ROM $A00000-$AFFFFF. Excludes unmapped $B-$E and
+		// I/O + VRAM ($F). As on the real 030, cache-inhibit (CI) blocks new
+		// ALLOCATION, not hits on already-present lines.
+		wire        phys_cacheable = (cache_addr_phys[23:20] <= 4'hA);
+		wire        fill_inhibit   = cache_inhibit_pmmu | ~phys_cacheable;
+
+		wire [31:0] i_data, d_data_out;
+		wire        i_hit, d_hit;
+		wire        i_fill_req, d_fill_req;     // Phase 3 services these
+		wire [31:0] i_fill_addr, d_fill_addr;   // line-aligned physical fill address
+
+		// ---- Line-fill engine state (drives i/d_fill_* into the cache) ----
+		localparam FILL_IDLE = 2'd0, FILL_READ = 2'd1, FILL_DONE = 2'd2;
+		reg   [1:0]  fill_st;        // FILL_IDLE / FILL_READ / FILL_DONE
+		reg   [2:0]  fill_word;      // 0..7: which 16-bit word of the line
+		reg          fill_is_i;      // 1 = fill the I-cache, 0 = the D-cache
+		reg  [31:0]  fill_base;      // line-aligned (16-byte) physical base address
+		reg  [127:0] fill_buf;       // accumulates the 8 read words (word k -> [16k +: 16])
+		reg          i_fill_valid_r, d_fill_valid_r;
+
+		wire         fill_busy = (fill_st != FILL_IDLE);
+		assign       fill_active   = (fill_st == FILL_READ);            // bus-owning read phase
+		assign       fill_hold     = (fill_st == FILL_DONE);           // write-wait tail
+		assign       fill_bus_addr = {fill_base[31:4], fill_word, 1'b0};  // base + 2*word
+
+		wire [127:0] i_fill_data  = fill_buf;
+		wire [127:0] d_fill_data  = fill_buf;
+		wire         i_fill_valid = i_fill_valid_r;
+		wire         d_fill_valid = d_fill_valid_r;
+
+		// Write-through byte lane into the D-cache (kernel write data + UDS/LDS).
+		// Inert in Phase 2 (no present lines); Phase 4 makes write-through live.
+		reg  [31:0] d_data_in;
+		reg  [3:0]  d_be;
+		always @* begin
+			case (cache_addr_log[1:0])
+				2'b00: begin d_data_in = {16'h0000,   tg68_dout_k};      d_be = {2'b00, ~tg68_uds_n, ~tg68_lds_n}; end
+				2'b01: begin d_data_in = {24'h000000, tg68_dout_k[7:0]}; d_be = {3'b000, ~tg68_lds_n};             end
+				2'b10: begin d_data_in = {tg68_dout_k, 16'h0000};        d_be = {~tg68_uds_n, ~tg68_lds_n, 2'b00}; end
+				2'b11: begin d_data_in = {tg68_dout_k[7:0], 24'h000000}; d_be = {~tg68_uds_n, 3'b000};             end
+			endcase
+		end
+
+		TG68K_Cache_030 cache_inst (
+			.clk             ( clk             ),
+			.nreset          ( ~reset          ),
+			.cacr_ie         ( cacr_ie         ),
+			.cacr_de         ( cacr_de         ),
+			.cacr_ifreeze    ( cacr_ifreeze    ),
+			.cacr_dfreeze    ( cacr_dfreeze    ),
+			.cacr_wa         ( cacr_wa         ),
+			.inv_req         ( cache_inv_req   ),
+			.cache_op_scope  ( cache_op_scope  ),
+			.cache_op_cache  ( cache_op_cache  ),
+			.cache_op_addr   ( cache_op_addr   ),
+
+			.i_addr          ( cache_addr_log  ),
+			.i_addr_phys     ( cache_addr_phys ),
+			.i_fc            ( fc              ),
+			.i_req           ( i_req           ),
+			.i_cache_inhibit ( fill_inhibit    ),
+			.i_data          ( i_data          ),
+			.i_hit           ( i_hit           ),
+			.i_fill_req      ( i_fill_req      ),
+			.i_fill_addr     ( i_fill_addr     ),
+			.i_fill_data     ( i_fill_data     ),
+			.i_fill_valid    ( i_fill_valid    ),
+
+			.d_addr          ( cache_addr_log  ),
+			.d_addr_phys     ( cache_addr_phys ),
+			.d_fc            ( fc              ),
+			.d_req           ( d_req           ),
+			.d_we            ( d_we            ),
+			.d_cache_inhibit ( fill_inhibit    ),
+			.d_data_in       ( d_data_in       ),
+			.d_data_out      ( d_data_out      ),
+			.d_be            ( d_be            ),
+			.d_hit           ( d_hit           ),
+			.d_fill_req      ( d_fill_req      ),
+			.d_fill_addr     ( d_fill_addr     ),
+			.d_fill_data     ( d_fill_data     ),
+			.d_fill_valid    ( d_fill_valid    )
+		);
+
+		// 16-bit data demux from the 32-bit cache word, matched to how
+		// TG68K_Cache_030 stores/serves words (ported from upstream
+		// TG68K_CacheCtrl_030 — the controller paired with this exact cache).
+		reg [15:0] data_out_16;
+		always @* begin
+			case (cache_addr_log[1:0])
+				2'b00: data_out_16 = (tg68_busstate == 2'b00) ? i_data[15:0]  : d_data_out[15:0];
+				2'b10: data_out_16 = (tg68_busstate == 2'b00) ? i_data[31:16] : d_data_out[31:16];
+				2'b01: data_out_16 = {8'h00, d_data_out[15:8]};
+				2'b11: data_out_16 = {8'h00, d_data_out[31:24]};
+			endcase
+		end
+
+		// Read-hit = present I-line on a fetch, or present D-line on a data read
+		// (never a write). Suppressed during a walk and during a fill (until the
+		// engine returns to FILL_IDLE with the line written -> i_hit/d_hit = 1).
+		assign cache_read_hit    = ~walk_cycle & ~fill_busy &
+		                           ((i_hit & i_req) | (d_hit & d_req & ~d_we));
+		assign cache_kernel_data = data_out_16;
+
+		// A cacheable read that MISSED and is allocatable (cacheable region, not
+		// cache-inhibited, not frozen). Triggers a line fill. Cannot fire mid-walk
+		// or mid-fill. ~cacr_*freeze matches the cache's own allocation gating.
+		wire cache_read_miss = ~walk_cycle & ~pmmu_walker_req & ~fill_busy & ~fill_inhibit &
+		                       ( (i_req & ~i_hit & ~cacr_ifreeze) |
+		                         (d_req & ~d_we & ~d_hit & ~cacr_dfreeze) );
+
+		// Line-fill FSM. Borrows the bus (eff_* overrides) for 8 sequential 16-bit
+		// reads at fill_bus_addr, accumulating into fill_buf, then pulses the cache
+		// fill-valid. Mirrors the walker's s_state handshake exactly (start on phi1
+		// @ s_state 0; capture din @ s6/phi2; advance @ s7/phi1) — see walker below.
+		always @(posedge clk) begin
+			if (reset) begin
+				fill_st        <= FILL_IDLE;
+				fill_word      <= 3'd0;
+				fill_is_i      <= 1'b0;
+				fill_base      <= 32'd0;
+				fill_buf       <= 128'd0;
+				i_fill_valid_r <= 1'b0;
+				d_fill_valid_r <= 1'b0;
+			end else begin
+				i_fill_valid_r <= 1'b0;   // single-cycle valid pulses
+				d_fill_valid_r <= 1'b0;
+				case (fill_st)
+					FILL_IDLE:
+						// Start on a miss, aligned like the walker (phi1 @ s_state 0)
+						// so AS asserts at s_state 1 on phi1 (the parity invariant).
+						if (phi1 && cache_read_miss && s_state == 3'd0) begin
+							fill_st   <= FILL_READ;
+							fill_word <= 3'd0;
+							fill_is_i <= (i_req & ~i_hit);
+							fill_base <= {cache_addr_phys[31:4], 4'b0000};
+						end
+					FILL_READ: begin
+						if (phi2 && s_state == 3'd6)
+							fill_buf[fill_word*16 +: 16] <= din;     // capture line word k
+						if (phi1 && s_state == 3'd7) begin
+							if (fill_word != 3'd7)
+								fill_word <= fill_word + 1'b1;       // next word
+							else begin
+								fill_st <= FILL_DONE;                 // 16 bytes read
+								if (fill_is_i) i_fill_valid_r <= 1'b1;
+								else           d_fill_valid_r <= 1'b1;
+							end
+						end
+					end
+					FILL_DONE:
+						// Hold until the cache has written the line (hit available);
+						// the read-hit path then delivers the requested word.
+						if (fill_is_i ? i_hit : d_hit)
+							fill_st <= FILL_IDLE;
+				endcase
+			end
+		end
+
+	end else begin : no_cache
+		assign cache_read_hit    = 1'b0;
+		assign cache_kernel_data = 16'h0;
+		assign fill_active       = 1'b0;
+		assign fill_hold         = 1'b0;
+		assign fill_bus_addr     = 32'd0;
+	end endgenerate
 
 	// Drive the Mac data bus from the walker during descriptor write-backs,
 	// otherwise from the kernel.

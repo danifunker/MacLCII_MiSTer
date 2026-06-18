@@ -42,5 +42,13 @@ echo "=== Synthesizing TG68KdotC_Kernel -> TG68KdotC_Kernel.v ==="
 ghdl synth $GHDL_FLAGS --latches --out=verilog TG68KdotC_Kernel > TG68KdotC_Kernel.v.tmp
 mv TG68KdotC_Kernel.v.tmp TG68KdotC_Kernel.v
 
-echo "=== Done. Lines: $(wc -l < TG68KdotC_Kernel.v) ==="
+# The 68030 on-chip I/D cache is a standalone leaf (no submodules), so it is
+# synthesized on its own rather than inlined into the kernel hierarchy (the
+# kernel does not instantiate it — the Mac bus wrapper tg68k.v does). Quartus
+# compiles the .vhd directly (TG68K.qip); Verilator compiles this generated .v.
+echo "=== Synthesizing TG68K_Cache_030 -> TG68K_Cache_030.v ==="
+ghdl synth $GHDL_FLAGS --latches --out=verilog TG68K_Cache_030 > TG68K_Cache_030.v.tmp
+mv TG68K_Cache_030.v.tmp TG68K_Cache_030.v
+
+echo "=== Done. Kernel lines: $(wc -l < TG68KdotC_Kernel.v); Cache lines: $(wc -l < TG68K_Cache_030.v) ==="
 echo "Now rebuild the sim: (cd ../../verilator && make clean && make)"

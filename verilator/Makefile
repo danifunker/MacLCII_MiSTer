@@ -67,6 +67,7 @@ V_SRC = \
 	sim.v \
 	sim_ram.v \
 	$(RTL)/tg68k/TG68KdotC_Kernel.v \
+	$(RTL)/tg68k/TG68K_Cache_030.v \
 	$(RTL)/tg68k/tg68k.v \
 	$(RTL)/addrController_top.v \
 	$(RTL)/addrDecoder.v \
