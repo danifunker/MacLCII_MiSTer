@@ -30,3 +30,36 @@
 # to boot; a wrong multicycle would corrupt/crash it).
 set_multicycle_path -setup -end 2 -from [get_keepers {*TG68KdotC_Kernel*}] -to [get_keepers {*TG68KdotC_Kernel*}]
 set_multicycle_path -hold  -end 1 -from [get_keepers {*TG68KdotC_Kernel*}] -to [get_keepers {*TG68KdotC_Kernel*}]
+
+# ----------------------------------------------------------------------------
+# CPU write-data -> SDRAM capture multicycle (clk_sys 32.5MHz -> clk_mem 65MHz).
+# ----------------------------------------------------------------------------
+# clk_sys (general[1], 32.5MHz, the CPU domain) and clk_mem (general[0], 65MHz,
+# the sdram.v state machine on .clk_64) are a 2:1 pair off the SAME PLL, so STA
+# analyzes clk_sys->clk_mem transfers synchronously and gives a register in the
+# CPU domain only ONE 65MHz period (15.38ns) to reach a register in the sdram
+# domain. The 68k write-data bus is exactly such a path: a kernel reg drives,
+# combinationally, dout -> sdram_din -> sdram|sd_data[*] (the write-data output
+# register). After the 030 MMU sync this cone runs kernel reg -> PMMU reg-read
+# mux -> ALU adder -> data_write_mux -> dout, ~21.3ns of mostly routing at 95%
+# ALM fill, so it misses the 15.38ns window (worst -6.18ns; the whole 16-bit
+# bus = -77ns TNS). It is the ONLY clk_sys->clk_mem failure (address/control
+# and the sdram->CPU read direction all close).
+#
+# Relaxing it to 2 clk_mem periods (30.76ns) is physically correct, not a paper
+# fix: sd_data is loaded from din ONLY at t==STATE_CMD_CONT (state 2 of the
+# 8-state, ~123ns sdram cycle, rtl/sdram.v:174), and during a write the 68k is
+# stalled on DTACK so din is held stable for the WHOLE access (many clk_mem
+# periods) before state 2 samples it. Independently, the launching kernel regs
+# only advance on clkena (>= 2 clk_sys = 4 clk_mem periods apart, same basis as
+# the kernel multicycle above), so din cannot change within a single clk_mem
+# period regardless. Either way the 1-period-early edge would latch the same
+# settled value, so -setup -end 2 is safe. Scope is -from clk_sys -to the
+# sd_data registers only: it does NOT touch the clk_mem->sd_data load-enable
+# (we_latch) path nor the address/command paths, which stay single-cycle.
+set_multicycle_path -setup -end 2 \
+    -from [get_clocks {*|pll|pll_inst|altera_pll_i|general[1].*|divclk}] \
+    -to   [get_keepers {*sdram:sdram|sd_data[*]~reg0}]
+set_multicycle_path -hold  -end 1 \
+    -from [get_clocks {*|pll|pll_inst|altera_pll_i|general[1].*|divclk}] \
+    -to   [get_keepers {*sdram:sdram|sd_data[*]~reg0}]
