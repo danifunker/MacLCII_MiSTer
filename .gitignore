@@ -2,6 +2,7 @@ db
 greybox_tmp
 incremental_db
 output_files
+output_files_LC1/
 simulation
 hc_output
 scaler
