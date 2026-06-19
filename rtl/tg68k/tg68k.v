@@ -58,7 +58,7 @@ wire [15:0] cache_kernel_data;  // 16-bit word fed to the kernel on a cache hit 
 // access completes with no bus cycle, so clkena pulses immediately (like a
 // busstate=01 no-access cycle) instead of waiting for s_state 7.
 wire        tg68_clkena = phi1 && (s_state == 7 || tg68_busstate == 2'b01 || cache_read_hit)
-                          && !walk_cycle && !fill_active && !fill_hold;
+                          && !walk_cycle && !fill_active;
 wire [31:0] tg68_addr;
 wire [15:0] tg68_din;
 reg  [15:0] tg68_din_r;
@@ -139,8 +139,7 @@ wire [15:0] walk_dout_word = walk_word ? pmmu_walker_wdat[15:0]     : pmmu_walke
 // Like the PMMU walker it borrows the Mac bus via the eff_* overrides below.
 // All of these are tied 0 when USE_68030_CACHE=0 (no_cache arm), so eff_*,
 // clkena and the s_state FSM reduce exactly to the uncached design.
-wire        fill_active;     // 1 = fill engine is reading the line on the bus
-wire        fill_hold;       // 1 = fill done, hold s_state at 0 until the cache writes the line
+wire        fill_active;     // 1 = fill engine is reading a line on the (parked) bus
 wire [31:0] fill_bus_addr;   // current 16-bit read address during a fill
 
 // Effective bus controls: the walker (highest priority) or the fill engine drive
@@ -199,10 +198,8 @@ always @(posedge clk) begin
 			if (eff_busstate == 2'b01) s_state <= 0;
 			// Cache read-hit: no external bus cycle — hold s_state at 0 (exactly
 			// like a busstate=01 no-access cycle); clkena pulses this phi1 and the
-			// cache supplies the data via the kernel data_in mux below. fill_hold
-			// likewise parks the bus for the few cycles after a line fill completes,
-			// until the cache writes the line and the resulting read-hit delivers.
-			if (cache_read_hit || fill_hold) s_state <= 0;
+			// cache supplies the data via the kernel data_in mux below.
+			if (cache_read_hit) s_state <= 0;
 
 			case (s_state)
 				1: if (eff_busstate != 2'b01) begin
@@ -229,7 +226,7 @@ always @(posedge clk) begin
 				s_state <= s_state + 1'd1;
 			if ((busreq_ack || bus_granted) && !busrel_ack) s_state <= s_state;
 			if (eff_busstate == 2'b01) s_state <= 0;
-			if (cache_read_hit || fill_hold) s_state <= 0;   // cache read-hit / fill write-wait: no bus cycle (see phi1 branch)
+			if (cache_read_hit) s_state <= 0;   // cache read-hit: no bus cycle (see phi1 branch)
 
 			case (s_state)
 
@@ -503,18 +500,20 @@ end
 		wire        i_fill_req, d_fill_req;     // Phase 3 services these
 		wire [31:0] i_fill_addr, d_fill_addr;   // line-aligned physical fill address
 
-		// ---- Line-fill engine state (drives i/d_fill_* into the cache) ----
-		localparam FILL_IDLE = 2'd0, FILL_READ = 2'd1, FILL_DONE = 2'd2;
-		reg   [1:0]  fill_st;        // FILL_IDLE / FILL_READ / FILL_DONE
+		// ---- Line-fill engine state ----
+		// Services the cache's OWN fill requests (i_fill_req/d_fill_req) during IDLE
+		// bus cycles, like the PMMU walker. The miss is delivered by the normal bus
+		// cycle; the fill only POPULATES the line for future hits, so there is no
+		// hit-wait and the engine can never deadlock.
+		localparam FILL_IDLE = 1'b0, FILL_READ = 1'b1;
+		reg          fill_st;        // FILL_IDLE / FILL_READ
 		reg   [2:0]  fill_word;      // 0..7: which 16-bit word of the line
 		reg          fill_is_i;      // 1 = fill the I-cache, 0 = the D-cache
-		reg  [31:0]  fill_base;      // line-aligned (16-byte) physical base address
+		reg  [31:0]  fill_base;      // line-aligned (16-byte) physical base (cache's i/d_fill_addr)
 		reg  [127:0] fill_buf;       // accumulates the 8 read words (word k -> [16k +: 16])
 		reg          i_fill_valid_r, d_fill_valid_r;
 
-		wire         fill_busy = (fill_st != FILL_IDLE);
-		assign       fill_active   = (fill_st == FILL_READ);            // bus-owning read phase
-		assign       fill_hold     = (fill_st == FILL_DONE);           // write-wait tail
+		assign       fill_active   = (fill_st == FILL_READ);             // bus-owning read phase
 		assign       fill_bus_addr = {fill_base[31:4], fill_word, 1'b0};  // base + 2*word
 
 		wire [127:0] i_fill_data  = fill_buf;
@@ -590,23 +589,20 @@ end
 		end
 
 		// Read-hit = present I-line on a fetch, or present D-line on a data read
-		// (never a write). Suppressed during a walk and during a fill (until the
-		// engine returns to FILL_IDLE with the line written -> i_hit/d_hit = 1).
-		assign cache_read_hit    = ~walk_cycle & ~fill_busy &
+		// (never a write). Suppressed during a walk and during a fill.
+		assign cache_read_hit    = ~walk_cycle & ~fill_active &
 		                           ((i_hit & i_req) | (d_hit & d_req & ~d_we));
 		assign cache_kernel_data = data_out_16;
 
-		// A cacheable read that MISSED and is allocatable (cacheable region, not
-		// cache-inhibited, not frozen). Triggers a line fill. Cannot fire mid-walk
-		// or mid-fill. ~cacr_*freeze matches the cache's own allocation gating.
-		wire cache_read_miss = ~walk_cycle & ~pmmu_walker_req & ~fill_busy & ~fill_inhibit &
-		                       ( (i_req & ~i_hit & ~cacr_ifreeze) |
-		                         (d_req & ~d_we & ~d_hit & ~cacr_dfreeze) );
-
-		// Line-fill FSM. Borrows the bus (eff_* overrides) for 8 sequential 16-bit
-		// reads at fill_bus_addr, accumulating into fill_buf, then pulses the cache
-		// fill-valid. Mirrors the walker's s_state handshake exactly (start on phi1
-		// @ s_state 0; capture din @ s6/phi2; advance @ s7/phi1) — see walker below.
+		// Line-fill FSM. The cache asserts i_fill_req/d_fill_req (with i/d_fill_addr,
+		// line-aligned physical) on a read miss and holds it until filled. We service
+		// it only when the kernel bus is PARKED (busstate=01, no walk/walker pending) —
+		// the same stable phi1 @ s_state 0 window the walker uses — and borrow the bus
+		// for 8 sequential 16-bit reads, stalling the CPU (clkena gated by fill_active).
+		// Because the cache chose the address+line, our fill data lands in exactly the
+		// line it will hit on; and because the original miss was already delivered by a
+		// normal bus cycle, there is no hit-wait -> no deadlock (worst case = the line
+		// just isn't populated yet, i.e. a future miss).
 		always @(posedge clk) begin
 			if (reset) begin
 				fill_st        <= FILL_IDLE;
@@ -621,13 +617,12 @@ end
 				d_fill_valid_r <= 1'b0;
 				case (fill_st)
 					FILL_IDLE:
-						// Start on a miss, aligned like the walker (phi1 @ s_state 0)
-						// so AS asserts at s_state 1 on phi1 (the parity invariant).
-						if (phi1 && cache_read_miss && s_state == 3'd0) begin
+						if (phi1 && s_state == 3'd0 && tg68_busstate == 2'b01 &&
+						    !walk_cycle && !pmmu_walker_req && (i_fill_req | d_fill_req)) begin
 							fill_st   <= FILL_READ;
 							fill_word <= 3'd0;
-							fill_is_i <= (i_req & ~i_hit);
-							fill_base <= {cache_addr_phys[31:4], 4'b0000};
+							fill_is_i <= i_fill_req;                        // I-cache has priority
+							fill_base <= i_fill_req ? i_fill_addr : d_fill_addr;
 						end
 					FILL_READ: begin
 						if (phi2 && s_state == 3'd6)
@@ -636,26 +631,47 @@ end
 							if (fill_word != 3'd7)
 								fill_word <= fill_word + 1'b1;       // next word
 							else begin
-								fill_st <= FILL_DONE;                 // 16 bytes read
+								fill_st <= FILL_IDLE;                 // 16 bytes read -> populate + done
 								if (fill_is_i) i_fill_valid_r <= 1'b1;
 								else           d_fill_valid_r <= 1'b1;
 							end
 						end
 					end
-					FILL_DONE:
-						// Hold until the cache has written the line (hit available);
-						// the read-hit path then delivers the requested word.
-						if (fill_is_i ? i_hit : d_hit)
-							fill_st <= FILL_IDLE;
 				endcase
 			end
 		end
+
+`ifdef CACHE_TRACE
+		// Cache fill-FSM probe: every state transition (capped) + a stuck-detector
+		// that fires if the FSM sits out of IDLE too long (the suspected deadlock).
+		reg        ct_fst_d;
+		reg [31:0] ct_busy_cnt, ct_tr_cnt;
+		always @(posedge clk) begin
+			if (reset) begin ct_fst_d <= FILL_IDLE; ct_busy_cnt <= 0; ct_tr_cnt <= 0; end
+			else begin
+				ct_fst_d    <= fill_st;
+				ct_busy_cnt <= (fill_st == FILL_IDLE) ? 32'd0 : (ct_busy_cnt + 1'b1);
+				if (fill_st != ct_fst_d && ct_tr_cnt < 32'd4000) begin
+					ct_tr_cnt <= ct_tr_cnt + 1'b1;
+					$display("CACHE fst %0d->%0d word=%0d is_i=%b ireq=%b dreq=%b ihit=%b dhit=%b crh=%b ifreq=%b dfreq=%b ss=%0d bs=%b alog=%h aphys=%h fi_inh=%b @%0t",
+						ct_fst_d, fill_st, fill_word, fill_is_i, i_req, d_req, i_hit, d_hit,
+						cache_read_hit, i_fill_req, d_fill_req, s_state, tg68_busstate,
+						cache_addr_log, cache_addr_phys, fill_inhibit, $time);
+				end
+				// Deadlock detector: FSM stuck out of IDLE for >2000 cycles.
+				if (ct_busy_cnt == 32'd2000)
+					$display("CACHE *** STUCK *** fst=%0d word=%0d is_i=%b ireq=%b dreq=%b ihit=%b dhit=%b ivld=%b dvld=%b ss=%0d bs=%b alog=%h aphys=%h @%0t",
+						fill_st, fill_word, fill_is_i, i_req, d_req, i_hit, d_hit,
+						i_fill_valid_r, d_fill_valid_r, s_state, tg68_busstate,
+						cache_addr_log, cache_addr_phys, $time);
+			end
+		end
+`endif
 
 	end else begin : no_cache
 		assign cache_read_hit    = 1'b0;
 		assign cache_kernel_data = 16'h0;
 		assign fill_active       = 1'b0;
-		assign fill_hold         = 1'b0;
 		assign fill_bus_addr     = 32'd0;
 	end endgenerate
 

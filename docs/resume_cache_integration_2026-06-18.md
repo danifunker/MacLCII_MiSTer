@@ -1,12 +1,32 @@
-# Resume — Enable the 68030 I/D cache (Phase 5 only; Phases 0–4 landed)
+# Resume — 68030 I/D cache: DONE & PARKED (correct but a net perf loss)
 
-**Date parked:** 2026-06-18 · **Branch:** `kernel-sync-030mmu2` · **HEAD:** `5426733`
-("tg68k: add 68030 I/D cache subsystem (disabled by default)")
+**Updated:** 2026-06-18 · **Branch:** `kernel-sync-030mmu2`
+
+> ## ⛔ PHASE 5 OUTCOME: cache is CORRECT but a ~10× SLOWDOWN → kept DISABLED.
+> Enabling it (`USE_68030_CACHE=1`) was tested in sim. It boots and runs correctly (read-hit +
+> line-fill + write-through all work) but is a **~10× net slowdown**, so the flag stays `0`.
+> **Root cause (architectural, not a bug):** each 16-byte line fill = **8 sequential 16-bit reads
+> ≈ 64 cycles** on the non-burst Mac bus vs. 7 cycles uncached, and the 256-byte direct-mapped
+> cache **thrashes** on code that doesn't fit (the ~396-byte chime-wait loop refilled one line
+> 259×). Break-even needs >~90% hit-rate; thrashing code is far below it. A faithful 68030 cache
+> assumes a fast burst fill + a fitting working set — neither holds here. **Real perf lever is
+> bus-slot reclamation, not the cache** (see memory `core-runs-slow-cpu-busslots`).
+>
+> Two fill-engine designs were tried: (A) stall-and-fill on miss — **deadlocked** (fill engine
+> decoupled from the cache's own latched line → `i_hit` never asserts → CPU frozen). (B) service
+> the cache's own `i_fill_req`/`i_fill_addr` during idle bus cycles, no hit-wait — **correct**,
+> shipped as the committed fill engine. If anyone re-enables the cache, it's correct (just slow).
+>
+> To make it actually help would need: a **burst line fill** (read 16 B fast from SDRAM) + a
+> **non-stalling background fill** + likely a bigger cache. Big effort, uncertain payoff.
+
+**Date originally parked (Phases 0–4):** 2026-06-18 · **HEAD then:** `5426733`
 
 The 68030 on-chip Instruction + Data cache (`TG68K_Cache_030`) is **implemented, wired, and
 committed — but DISABLED** (`localparam USE_68030_CACHE = 1'b0` at `rtl/tg68k/tg68k.v:52`).
-With the flag off the design is **bit-identical** to the uncached core (validated). All that
-remains is to flip it on and validate. Full design rationale: `docs/plan_cache_integration_061826.md`.
+With the flag off the design is **bit-identical** to the uncached core (validated). Design
+rationale: `docs/plan_cache_integration_061826.md`. The steps below were the Phase 5 plan;
+they're done — outcome above.
 
 ---
 

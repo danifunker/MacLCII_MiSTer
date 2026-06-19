@@ -22,6 +22,7 @@ V_DEFINE += --trace-fst
 # V_DEFINE += +define+EGRET_SRDEBUG=1
 # V_DEFINE += +define+PMMU_TRACE=1  (PMMU walker/stall + $A03Fxx mode-switch reconfig walk capture + PMMU FAULT class; uncomment to enable)
 # V_DEFINE += +define+A30_TRACE=1   (LC II post-MMU bsr.w/PMMU + $1FF35A dispatch + $0CB0-$0CBF watchpoint + A30[MOVB] decode-sequence trace)
+# V_DEFINE += +define+CACHE_TRACE=1  (68030 I/D cache fill-FSM probe: transitions + stuck detector)
 V_DEFINE +=
 
 UNAME_S := $(shell uname -s)
