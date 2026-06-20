@@ -1,4 +1,4 @@
-# Read the MacLC ADB + AUD In-System probes over JTAG.
+# Read the MacLCii ADB + AUD In-System probes over JTAG.
 #   quartus_stp_tcl -t scripts/read_adb_aud.tcl
 #
 # AUD (32b): [15:0]=ASC write count   [31:16]=ASC read count   (both sticky)

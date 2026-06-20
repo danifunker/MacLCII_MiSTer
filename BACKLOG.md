@@ -1,4 +1,4 @@
-# MacLC MiSTer Backlog
+# MacLCii MiSTer Backlog
 
 ## Priority 2: Audio
 

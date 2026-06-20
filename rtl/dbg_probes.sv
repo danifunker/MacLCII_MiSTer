@@ -1,4 +1,4 @@
-// JTAG In-System probes for MacLC — ported from the LBMacTwo dbg_min.sv
+// JTAG In-System probes for MacLCii — ported from the LBMacTwo dbg_min.sv
 // methodology (same instance IDs and layouts wherever a probe has an
 // LBMacTwo twin, so the decode knowledge and reader tooling carry over).
 //

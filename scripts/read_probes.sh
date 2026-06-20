@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Read the MacLC JTAG In-System probes from the running FPGA (decoded dump).
+# Read the MacLCii JTAG In-System probes from the running FPGA (decoded dump).
 # Portable: resolves the repo root from this script's location and adds
 # Quartus to PATH. Don't run while a Quartus compile is using the cable.
 set -u

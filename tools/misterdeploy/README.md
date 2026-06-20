@@ -17,7 +17,7 @@ found correctly — just pass `--core <filename>`. No menu position is hard-code
 downloader re-populating `_Unstable` simply recomputes on the next run.
 
 > The on-screen OSD orders entries **case-insensitively** (`ao486` sorts among the
-> `A`s; `MacLC` is the first `M`, before `MSX`). The API returns them case-*sensitively*,
+> `A`s; `MacLCii` is the first `M`, before `MSX`). The API returns them case-*sensitively*,
 > so the script re-sorts the filenames itself. A subfolder opens with the cursor on its
 > `<UP-DIR>` row, so the core's row is its index + 1 (auto-derived from the `up` field).
 
@@ -25,14 +25,14 @@ downloader re-populating `_Unstable` simply recomputes on the next run.
 
 ```bash
 # Launch a core already on the MiSTer (host/port from env MISTER_HOST/MISTER_HTTP_PORT):
-python launch_unstable_core.py --core MacLC.rbf
+python launch_unstable_core.py --core MacLCii.rbf
 
 # Push a fresh build, then launch it (explicit host + ssh key):
 python launch_unstable_core.py --host 192.168.1.50 --ssh-key ~/.ssh/mister \
-    --push ./output_files/MacLC.rbf --core MacLC.rbf
+    --push ./output_files/MacLCii.rbf --core MacLCii.rbf
 
 # Preview the generated keystrokes without touching anything:
-python launch_unstable_core.py --core MacLC.rbf --dry-run
+python launch_unstable_core.py --core MacLCii.rbf --dry-run
 ```
 
 ### Options (all machine config is a flag or env var)
@@ -56,7 +56,7 @@ python launch_unstable_core.py --core MacLC.rbf --dry-run
 | `--seed-file FILE` | — | off | local file to seed a save image, **create-only-if-missing** |
 | `--seed-remote PATH` | — | — | absolute remote path for `--seed-file` |
 | `--seed-mount-cfg PATH` | — | — | absolute remote `.s<N>` mount-memory file to create-if-missing |
-| `--seed-mount-rel REL` | — | — | relative path stored in the `.s<N>` file (e.g. `games/MACLC/MacLC.nvr`) |
+| `--seed-mount-rel REL` | — | — | relative path stored in the `.s<N>` file (e.g. `games/MacLCii/MacLCii.nvr`) |
 | `--seed-mount-size N` | — | `1024` | size of the `.s<N>` file (NUL-padded; MiSTer uses 1024) |
 
 **Seeding a save image (zero-touch NVRAM).** `--seed-*` drops a default save file and
@@ -68,5 +68,5 @@ itself is always re-pushed. Under git-bash, set `MSYS_NO_PATHCONV=1` so absolute
 
 Requires `scp`/`ssh` on `PATH` (for `--push`) and the `websockets` Python package.
 
-In this repo, `scripts/deploy_screenshot.sh` is the MacLC wrapper: it verifies the
+In this repo, `scripts/deploy_screenshot.sh` is the MacLCii wrapper: it verifies the
 Quartus build, then calls this tool with values from `scripts/local.env`.

@@ -55,7 +55,7 @@ module emu
 	
 	`include "build_id.v"
 	localparam CONF_STR = {
-		"MACLC;UART57600:115200;",
+		"MacLCii;UART57600:115200;",
 		"-;",
 		"F1,DSKIMG,Mount Pri Floppy;",
 		"F2,DSKIMG,Mount Sec Floppy;",
@@ -1094,7 +1094,7 @@ module emu
 	//                  samples. If it counts on hardware but you hear nothing,
 	//                  the ASC works and the issue is downstream (sys_top/output/
 	//                  build). If it's frozen, the ASC isn't being clocked/selected.
-	// Enabled via the USE_AUDIO_ISSP macro in MacLC.qsf; absent from release/sim.
+	// Enabled via the USE_AUDIO_ISSP macro in MacLCii.qsf; absent from release/sim.
 	//   probe[15:0]  = current ASC sample (signed)
 	//   probe[31:16] = ASC write count — edge-detected CPU writes to the ASC. If this
 	//                  advances, the CPU IS feeding the ASC (issue is the ASC/output);

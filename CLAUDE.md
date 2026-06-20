@@ -10,7 +10,7 @@ This is a Macintosh LC emulation core for the MiSTer FPGA platform. It's based o
 
 ### FPGA Build (Quartus)
 The project uses Intel Quartus 17.0.2 Lite Edition:
-- Open `MacLC.qpf` in Quartus
+- Open `MacLCii.qpf` in Quartus
 - Compile to generate RBF output in `output_files/`
 - Deploy RBF to MiSTer SD card root
 
@@ -105,7 +105,7 @@ Standard MiSTer framework files (video scaling, HPS I/O, audio output). Generall
 ## File Locations
 
 - `files.qip` - Lists all RTL source files for Quartus
-- `MacLC.qsf` - Quartus project settings
+- `MacLCii.qsf` - Quartus project settings
 - `releases/` - Pre-built RBF files and ROM images
 
 ## CPU Conversion Notes
@@ -124,7 +124,7 @@ ghdl synth -fsynopsys -fexplicit --latches --out=verilog
 - Use `if/else if` priority within the block to handle the different write sources
 - Verilator builds (`make` in `verilator/`) will succeed even with multiple drivers — always verify the design is Quartus-clean before targeting FPGA
 
-**Conditional compilation:** `USE_EGRET_CPU` and `SIMULATION` are defined in `verilator/Makefile` for simulation. For FPGA, `USE_EGRET_CPU` is set in `MacLC.qsf`. Guard simulation-only code (`$display`, debug counters) with `` `ifdef SIMULATION ``.
+**Conditional compilation:** `USE_EGRET_CPU` and `SIMULATION` are defined in `verilator/Makefile` for simulation. For FPGA, `USE_EGRET_CPU` is set in `MacLCii.qsf`. Guard simulation-only code (`$display`, debug counters) with `` `ifdef SIMULATION ``.
 
 **Top-level split:** the Verilator top is `verilator/sim.v` (`module emu`), NOT `MacLC.sv`. It has its **own** CPU instantiation and bus glue (VPA/DTACK/BERR/overlay); peripheral RTL is shared via `dataController_top`. CPU-glue/top-level fixes must go in **both** files or sim and FPGA silently diverge. Tracked differences (and a maintenance checklist) live in **`docs/verilator_differences.md`** — update it when you add a top-level signal or hardwire a sim config.
 

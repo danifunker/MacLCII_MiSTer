@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# MacLC deploy: verify the Quartus build, then hand off to the reusable launcher
+# MacLCii deploy: verify the Quartus build, then hand off to the reusable launcher
 # tools/misterdeploy/launch_unstable_core.py, which pushes the rbf (scp, md5-verified),
 # reboots the MiSTer for a clean menu, and selects the core via the OSD. The OSD
 # keystroke sequence is generated from the live menu listing, so nothing about the
@@ -13,7 +13,7 @@ if [ -r scripts/local.env ]; then . scripts/local.env; fi
 : "${MISTER_HOST:?set MISTER_HOST in scripts/local.env}"
 : "${MISTER_SSH_KEY:?set MISTER_SSH_KEY in scripts/local.env}"
 : "${MISTER_HTTP_PORT:=8182}"
-: "${RBF_NAME:=MacLC.rbf}"
+: "${RBF_NAME:=MacLCii.rbf}"
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 
@@ -23,31 +23,31 @@ if [ ! -f "output_files/$RBF_NAME" ]; then
     exit 1
 fi
 # Refuse to deploy a stale rbf left by a failed Quartus run: trust the first line of
-# MacLC.fit.summary ("Fitter Status : Successful" vs "...: Failed").
-FIT_STATUS=$(awk 'NR==1' output_files/MacLC.fit.summary 2>/dev/null)
+# MacLCii.fit.summary ("Fitter Status : Successful" vs "...: Failed").
+FIT_STATUS=$(awk 'NR==1' output_files/MacLCii.fit.summary 2>/dev/null)
 case "$FIT_STATUS" in
     *Successful*) ;;
     *Failed*)
-        log "ERROR: Quartus Fitter reported Failed in MacLC.fit.summary:"
+        log "ERROR: Quartus Fitter reported Failed in MacLCii.fit.summary:"
         log "  $FIT_STATUS"
         exit 1 ;;
     *)
-        log "WARN: no parseable Fitter Status in MacLC.fit.summary. Build state unknown — continuing." ;;
+        log "WARN: no parseable Fitter Status in MacLCii.fit.summary. Build state unknown — continuing." ;;
 esac
 
 log "=== Push rbf + seed PRAM + reboot + OSD-select via the reusable launcher ==="
 # git-bash/MSYS rewrites bare "/media/fat/..." args into Windows paths; disable that
 # so the absolute --seed-remote/--seed-mount-cfg paths reach the MiSTer unmangled.
 export MSYS_NO_PATHCONV=1
-# PRAM NVRAM lives in games/MACLC/MacLC.nvr, auto-mounted to SD slot 2 via
-# config/MacLC.s2. Both are seeded create-only-if-missing, so a saved PRAM and
+# PRAM NVRAM lives in games/MacLCii/MacLCii.nvr, auto-mounted to SD slot 2 via
+# config/MacLCii.s2. Both are seeded create-only-if-missing, so a saved PRAM and
 # its mount survive subsequent deploys (only the rbf is always overwritten).
 exec python tools/misterdeploy/launch_unstable_core.py \
     --host "$MISTER_HOST" --port "$MISTER_HTTP_PORT" \
     --ssh-key "$MISTER_SSH_KEY" \
     --core "$RBF_NAME" \
     --push "output_files/$RBF_NAME" \
-    --seed-file "releases/MacLC.nvr" \
-    --seed-remote "/media/fat/games/MACLC/MacLC.nvr" \
-    --seed-mount-cfg "/media/fat/config/MacLC.s2" \
-    --seed-mount-rel "games/MACLC/MacLC.nvr"
+    --seed-file "releases/MacLCii.nvr" \
+    --seed-remote "/media/fat/games/MacLCii/MacLCii.nvr" \
+    --seed-mount-cfg "/media/fat/config/MacLCii.s2" \
+    --seed-mount-rel "games/MacLCii/MacLCii.nvr"

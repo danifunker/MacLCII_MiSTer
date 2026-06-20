@@ -1,5 +1,5 @@
 # Report the worst setup paths with full From/To node detail.
-project_open MacLC
+project_open MacLCii
 create_timing_netlist -model slow
 read_sdc
 update_timing_netlist

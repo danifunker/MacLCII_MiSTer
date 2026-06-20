@@ -21,6 +21,6 @@
 # to eol=lf makes git normalize the working tree back to LF, so the Windows
 # rewrites become invisible. .qsf/.sdc blobs are already LF (churn-free); .qpf
 # was committed with CRLF and is renormalized to LF in this same commit.
-/MacLC.qsf         text eol=lf
-/MacLC.qpf         text eol=lf
-/MacLC.sdc         text eol=lf
+/MacLCii.qsf       text eol=lf
+/MacLCii.qpf       text eol=lf
+/MacLCii.sdc       text eol=lf

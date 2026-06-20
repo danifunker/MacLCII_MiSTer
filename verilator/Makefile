@@ -62,7 +62,7 @@ V_OPT =  --x-assign fast --x-initial fast --noassert
 #CC_OPT = -O
 CC_OPT =
 
-# MacLC RTL source files
+# MacLCii RTL source files
 V_SRC = \
 	tg68k_debug.vlt \
 	sim.v \

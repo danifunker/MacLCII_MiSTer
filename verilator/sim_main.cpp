@@ -1154,16 +1154,16 @@ int main(int argc, char** argv, char** env) {
 	Verilated::commandArgs(argc, argv);
 	Verilated::traceEverOn(true);
 
-	// Attach bus - using 16-bit ioctl_dout for MacLC
+	// Attach bus - using 16-bit ioctl_dout for MacLCii
 	bus.ioctl_addr = &VERTOPINTERN->ioctl_addr;
 	bus.ioctl_index = &VERTOPINTERN->ioctl_index;
 	bus.ioctl_wait = &VERTOPINTERN->ioctl_wait;
 	bus.ioctl_download = &VERTOPINTERN->ioctl_download;
 	bus.ioctl_wr = &VERTOPINTERN->ioctl_wr;
-	bus.ioctl_dout = &VERTOPINTERN->ioctl_dout;  // 16-bit for MacLC
+	bus.ioctl_dout = &VERTOPINTERN->ioctl_dout;  // 16-bit for MacLCii
 	input.ps2_key = &VERTOPINTERN->ps2_key;
 
-	// Hookup block device for SCSI (2 devices for MacLC)
+	// Hookup block device for SCSI (2 devices for MacLCii)
 	blockdevice.sd_lba[0] = &VERTOPINTERN->sd_lba[0];
 	blockdevice.sd_lba[1] = &VERTOPINTERN->sd_lba[1];
 	blockdevice.sd_rd = &VERTOPINTERN->sd_rd;
@@ -1263,7 +1263,7 @@ int main(int argc, char** argv, char** env) {
 	fprintf(stderr, "Machine type: Mac LC, loading ROM: %s\n", rom_file);
 
 	// Floppy images stream into SDRAM via ioctl, same as a HPS mount.
-	// MacLC uses ioctl_index 1 (F1/primary) and 2 (F2/secondary) — see
+	// MacLCii uses ioctl_index 1 (F1/primary) and 2 (F2/secondary) — see
 	// MacLC.sv dio_a decode. (lbmactwo uses 2/3 because index 1 is its NuBus ROM.)
 	for (int disk_index = 0; disk_index < 2; disk_index++) {
 		if (!floppy_disk_files[disk_index].empty()) {

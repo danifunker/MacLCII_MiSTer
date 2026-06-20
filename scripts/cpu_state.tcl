@@ -1,11 +1,11 @@
-# Read the MacLC JTAG In-System probes and decode them.
+# Read the MacLCii JTAG In-System probes and decode them.
 # Deck: PADR PSTA PACT PIFA PIFD PDRD PSCS PSC2 PSC3 PSCW PSNC PSWL PSC6
 #       PVID   (defined in rtl/dbg_probes.sv; PASC/PAUD audio probes removed)
 #
 #   quartus_stp_tcl -t scripts/cpu_state.tcl     (or: bash scripts/read_probes.sh)
 #
 # Ported from lbmactwo_MiSTer scripts/cpu_state.tcl (same cable detection,
-# MacLC probe deck + layouts).
+# MacLCii probe deck + layouts).
 
 # Pick the cable + device portably: prefer a DE-SoC cable (the DE10-Nano
 # on-board USB-Blaster II), else any cable whose chain has a Cyclone V (5CSE).
@@ -53,7 +53,7 @@ after 200
 set act1  [rd PACT]
 set ifa1  [rd PIFA]
 
-puts "================ MacLC probes ================"
+puts "================ MacLCii probes ================"
 puts [format "PACT bus cycles : %u -> %u  (%s)" $act0 $act1 \
     [expr {$act1 == $act0 ? "FROZEN — CPU wedged in one bus cycle" : "advancing"}]]
 set ifc0 [expr {($ifa0 >> 24) & 0xFF}]

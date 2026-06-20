@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Aggregate sample_loop.tcl output into a reconstructed loop disassembly.
-Ported from lbmactwo_MiSTer (MacLC I/O decode: 24-bit bus, I/O at $F0xxxx).
+Ported from lbmactwo_MiSTer (MacLCii I/O decode: 24-bit bus, I/O at $F0xxxx).
 
 Usage:
     bash -c 'PATH=/c/intelFPGA_lite/17.0/quartus/bin64:$PATH \
@@ -60,7 +60,7 @@ except ImportError:
     print("(capstone not available — word map only)")
 
 if iords:
-    # MacLC: I/O lives at $F00000 + (field<<4) on the 24-bit bus
+    # MacLCii: I/O lives at $F00000 + (field<<4) on the 24-bit bus
     # (the 32-bit-mode alias the OS uses is $50F00000 | offset).
     print("\n=== I/O reads (addr = 0xF00000 | field<<4) ===")
     for (af, val), n in iords.most_common(20):

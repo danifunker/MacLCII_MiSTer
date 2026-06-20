@@ -1,9 +1,9 @@
-# Macintosh LC for the [MiSTer Board](https://github.com/MiSTer-devel/Main_MiSTer/wiki)
+# Macintosh LC II for the [MiSTer Board](https://github.com/MiSTer-devel/Main_MiSTer/wiki)
 
-An emulation core for the **Apple Macintosh LC** running on MiSTer FPGA.
+An emulation core for the **Apple Macintosh LC II** running on MiSTer FPGA.
 
 Based on the [MacPlus MiSTer core](https://github.com/MiSTer-devel/MacPlus_MiSTer) by Sorgelig,
-which originated from the [Plus Too project](http://www.bigmessowires.com/plus-too/). The Mac LC
+which originated from the [Plus Too project](http://www.bigmessowires.com/plus-too/). The Mac LC II
 emulates a Motorola 68020 CPU (via a modified TG68K core), the V8 gate array (video/glue),
 the Egret (HC05) system controller, and the LC's other peripherals.
 
@@ -33,8 +33,8 @@ the Egret (HC05) system controller, and the LC's other peripherals.
 ## Usage
 
 1. Copy the `*.rbf` to the root of your MiSTer SD card.
-2. Place the 512 KB Mac LC ROM as `boot0.rom` in the `MACLC` folder.
-3. Place a bootable SCSI hard-disk image (`.vhd` / `.img` / `.hda`) in the `MACLC` folder.
+2. Place the 512 KB Mac LC ROM as `boot0.rom` in the `MacLCii` folder.
+3. Place a bootable SCSI hard-disk image (`.vhd` / `.img` / `.hda`) in the `MacLCii` folder.
 
 Open the on-screen display with **F12** to mount images and change options.
 
@@ -89,7 +89,7 @@ the real-time clock — is backed by a persistent NVRAM image:
   reload via the "Mount PRAM" slot in the OSD.
 - **Clear:** "Reset PRAM & Core" clears PRAM and resets the machine (a fresh, default PRAM).
 
-A default PRAM image is included as `releases/MacLC.nvr`.
+A default PRAM image is included as `releases/MacLCii.nvr`.
 
 ## Memory
 
@@ -117,7 +117,7 @@ python3 verilator/patch_skip_ramtest.py boot0.rom boot0_skipramtest.rom
 
 This applies a 2-byte patch at ROM offset `0x46558` (`cmpi.l #'WLSC',d3` → `bra.s $46570`) that
 forces the warm-start path, and recomputes the header checksum so the ROM self-check still
-passes. Back up your original ROM, then copy the patched file to your `MACLC` folder as
+passes. Back up your original ROM, then copy the patched file to your `MacLCii` folder as
 `boot0.rom`.
 
 ## Display
@@ -140,7 +140,7 @@ emulated.
 
 ### FPGA (Quartus)
 
-Built with **Intel Quartus 17.0.2 Lite**. Open `MacLC.qpf`, compile, and deploy the resulting
+Built with **Intel Quartus 17.0.2 Lite**. Open `MacLCii.qpf`, compile, and deploy the resulting
 `.rbf` from `output_files/` to the SD card.
 
 ### Simulation (Verilator)

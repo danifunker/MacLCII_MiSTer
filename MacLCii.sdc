@@ -1,4 +1,4 @@
-# MacLC project timing constraints (read after sys/sys_top.sdc).
+# MacLCii project timing constraints (read after sys/sys_top.sdc).
 #
 # ----------------------------------------------------------------------------
 # TG68 kernel multicycle — REQUIRED for reliable timing closure.

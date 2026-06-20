@@ -1,4 +1,4 @@
-# Rapid whole-boot probe sampler: waits for the MacLC core to appear on the
+# Rapid whole-boot probe sampler: waits for the MacLCii core to appear on the
 # JTAG chain (i.e. survives being started while the menu core is up), then
 # samples the key probes in a tight loop inside ONE quartus_stp session
 # (~5 samples/sec) for the given duration.
@@ -43,8 +43,8 @@ if {$hw ne ""} {
 emit "hw=$hw dev=$dev"
 if {$dev eq ""} { emit "NO DEVICE"; exit 1 }
 
-# Wait (up to 10 min) for a bitstream with ISSP probes — i.e. the MacLC core.
-emit "WAITING for MacLC core (probes) on the chain..."
+# Wait (up to 10 min) for a bitstream with ISSP probes — i.e. the MacLCii core.
+emit "WAITING for MacLCii core (probes) on the chain..."
 set info ""
 for {set w 0} {$w < 1200} {incr w} {
     if {![catch {set info [get_insystem_source_probe_instance_info -device_name $dev -hardware_name $hw]}] && [llength $info] > 0} break

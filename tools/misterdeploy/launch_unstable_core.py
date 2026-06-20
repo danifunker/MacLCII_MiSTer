@@ -21,7 +21,7 @@ What it does (each step optional):
 
 IMPORTANT -- sorting: /api/menu/view returns items in BYTE (case-SENSITIVE) order,
 which does NOT match the on-screen OSD. The OSD is case-INSENSITIVE (verified on
-hardware: "ao486" sorts among the "A"s; a core named "MacLC" is the first "M",
+hardware: "ao486" sorts among the "A"s; a core named "MacLCii" is the first "M",
 before "MSX"). So we ignore the API order and re-sort filenames ourselves. A fresh
 subfolder opens with the cursor on its <UP-DIR> row, so the core's real row is its
 index + 1 (auto-derived from the listing's `up` field; override --updir-rows).
@@ -31,12 +31,12 @@ computes row counts from the live listing and verifies the result after launch.
 
 Examples:
   # Launch a core already present (uses MISTER_HOST/MISTER_HTTP_PORT from env):
-  python launch_unstable_core.py --core MacLC.rbf
+  python launch_unstable_core.py --core MacLCii.rbf
   # Push a fresh build then launch it, explicit host + key:
   python launch_unstable_core.py --host 192.168.1.50 --ssh-key ~/.ssh/mister \
-      --push ./output_files/MacLC.rbf --core MacLC.rbf
+      --push ./output_files/MacLCii.rbf --core MacLCii.rbf
   # Preview the generated keystrokes without touching anything:
-  python launch_unstable_core.py --core MacLC.rbf --dry-run
+  python launch_unstable_core.py --core MacLCii.rbf --dry-run
 """
 import argparse
 import asyncio
@@ -307,7 +307,7 @@ def main():
                     default=int(os.environ.get("MISTER_HTTP_PORT", "8182")),
                     help="MiSTer Remote port (env MISTER_HTTP_PORT; default 8182)")
     ap.add_argument("--core", default=os.environ.get("RBF_NAME"),
-                    help="core filename to launch, e.g. MacLC.rbf (env RBF_NAME)")
+                    help="core filename to launch, e.g. MacLCii.rbf (env RBF_NAME)")
     ap.add_argument("--folder", default=os.environ.get("MISTER_CORE_FOLDER", "_Unstable"),
                     help="top-level '_' folder holding the core (default _Unstable)")
     ap.add_argument("--push", metavar="FILE",
@@ -323,7 +323,7 @@ def main():
     ap.add_argument("--seed-mount-cfg",
                     help="absolute remote .s<N> mount-memory file to create-if-missing")
     ap.add_argument("--seed-mount-rel",
-                    help="relative path stored in --seed-mount-cfg (e.g. games/MACLC/MacLC.nvr)")
+                    help="relative path stored in --seed-mount-cfg (e.g. games/MacLCii/MacLCii.nvr)")
     ap.add_argument("--seed-mount-size", type=int, default=1024,
                     help="size of the .s<N> mount file (NUL-padded; MiSTer uses 1024)")
     ap.add_argument("--no-reboot", action="store_true",
