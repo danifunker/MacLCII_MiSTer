@@ -364,6 +364,9 @@ architecture logic of TG68KdotC_Kernel is
 	signal exe_pc				: std_logic_vector(31 downto 0);--TH
 	signal opcode_pc			: std_logic_vector(31 downto 0);
 	signal last_opc_pc		: std_logic_vector(31 downto 0);--TH
+	-- End-of-instruction PC captured during operand setup, for the bus-error
+	-- stack frame (Format-$B continue-past fix). See the latch + use below.
+	signal instr_boundary_pc	: std_logic_vector(31 downto 0) := (others => '0');
 	signal last_opc_read		: std_logic_vector(15 downto 0);
 	signal registerin			: std_logic_vector(31 downto 0);
 	signal reg_QA				: std_logic_vector(31 downto 0);
@@ -3287,6 +3290,18 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 			ELSE
 --				IPL_nr <= NOT IPL;
 				IF clkena_in='1' THEN
+					-- FORMAT-$B CONTINUE-PAST FIX: capture the end-of-instruction PC.
+					-- During operand setup (setstate="01") TG68_PC holds the PC just past
+					-- the faulting instruction's last word. Once the data access starts
+					-- (setstate="10") the prefetch advances TG68_PC up to the prefetch depth
+					-- (~3 words) ahead, so stacking the live TG68_PC in a data bus-fault frame
+					-- overshoots the true next-instruction PC for instructions shorter than the
+					-- prefetch (the Mac OS BERR-probe forms). A DF-cleared "continue-past" RTE
+					-- then resumes too far and derails. Latch the setup-phase PC; the external
+					-- data-fault frame build below stacks THIS instead of TG68_PC.
+					IF setstate = "01" THEN
+						instr_boundary_pc <= TG68_PC;
+					END IF;
 					-- LC II post-MMU bsr.w FIX (part 2 — longword word-counter hold):
 					-- Freeze the longword word counter (memmask/memread) during a PMMU stall
 					-- of ANY access (fetch state="00" OR data read/write state(1)='1'), not
@@ -3665,7 +3680,23 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 								-- bus-fault frames.  For a Format $A LASTWRITE fault this
 								-- is the post-instruction PC; RTE replays only the saved
 								-- write and must not restart the instruction from exe_pc.
-								berr_frame_pc <= TG68_PC;
+								-- FORMAT-$B CONTINUE-PAST FIX: for an EXTERNAL data bus fault
+								-- (the Mac OS BERR-protected probe), stack the captured
+								-- end-of-instruction PC so a DF-cleared RTE continues past the
+								-- faulted access correctly instead of overshooting into the
+								-- next-but-one instruction. PMMU faults keep the live TG68_PC
+								-- (their rte_mmu_fix replay advances the PC itself).
+								-- Validated (verilator/test_berrframe) for register-indirect EA
+								-- (An)/(An)+/-(An) and (d16,An) — the modes the OS handle probes
+								-- use. Absolute-EA data faults stack -2 here (their last EA word
+								-- is read in the access cycle), but the only such case is the boot
+								-- RAM-size probe, which recovers via `jmp (A6)`, never an RTE of
+								-- this frame, so the stacked PC is unused.
+								IF pmmu_fault = '1' OR berr_pmmu_fault_valid = '1' OR make_mmu_berr = '1' THEN
+									berr_frame_pc <= TG68_PC;
+								ELSE
+									berr_frame_pc <= instr_boundary_pc;
+								END IF;
 								berr_opcode_saved <= exe_opcode;
 								-- Save data output buffer for berr2 (data being written at fault time)
 								berr_data_out_saved <= data_write_tmp;
