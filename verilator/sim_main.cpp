@@ -652,6 +652,63 @@ int verilate() {
 				}
 			}
 
+			// [BERRFRAME] 68030 bus-fault frame build + Format-$B RTE consume trace.
+			// Ground-truths the OS "continue-past" probe bug. DISP line = the frame as
+			// BUILT (stacked PC/SSW/opcode). RTE line = the STACKED (post-handler) SSW +
+			// whether the rte_mmu_fix continue-past replay fires + where the RTE landed.
+			// Kernel taps via tg68k_debug.vlt. fprintf(stderr) so it always shows; capped
+			// to avoid flooding a BERR storm. Trigger on berr_frame_pc change (each = one
+			// fault dispatch, value held until next fault) + make_berr edge counting.
+			#define KB(n) (VERTOPINTERN->emu__DOT__tg68k__DOT__tg68k__DOT__##n)
+			if (!*bus.ioctl_download) {
+				static uint32_t bf_prev = 0xFFFFFFFFu;
+				static int      rs_prev = -1;
+				static int      mb_prev = 0;
+				static int      mb_total = 0, bf_n = 0, rte_n = 0, land = 0;
+				const int       CAP = 120;
+
+				int mb = (int)KB(make_berr);
+				if (mb && !mb_prev) mb_total++;
+				mb_prev = mb;
+
+				uint32_t bf = (uint32_t)KB(berr_frame_pc);
+				if (bf != bf_prev) {
+					bf_prev = bf;
+					if (bf_n < CAP) {
+						unsigned ssw = (unsigned)(uint16_t)KB(berr_ssw);
+						fprintf(stderr,
+						  "[BERRFRAME] DISP berr#%d F%d frame_pc=%08X live_pc=%08X ssw=%04X[b9=%u DF=%u RW=%u] long=%d faddr=%08X opc=%04X tberr=%d tmmu=%d\n",
+						  mb_total, video.count_frame, bf, (uint32_t)KB(tg68_pc),
+						  ssw, (ssw>>9)&1u, (ssw>>8)&1u, (ssw>>6)&1u,
+						  (int)KB(berr_long_frame), (uint32_t)KB(berr_fault_addr),
+						  (unsigned)(uint16_t)KB(exe_opcode),
+						  (int)KB(trap_berr), (int)KB(trap_mmu_berr));
+						bf_n++;
+					}
+				}
+
+				int rs = (int)(uint16_t)KB(rte_mmu_fix_ssw);
+				if (rs != rs_prev) {
+					rs_prev = rs;
+					if (rs != 0 && rte_n < CAP) {
+						fprintf(stderr,
+						  "[BERRFRAME] RTE  F%d stacked_ssw=%04X[b9=%u DF=%u] fmt=%04X fix_write=%d fix_commit=%d fix_opc=%04X\n",
+						  video.count_frame, (unsigned)rs, ((unsigned)rs>>9)&1u, ((unsigned)rs>>8)&1u,
+						  (unsigned)(uint16_t)KB(rte_format_word),
+						  (int)KB(rte_mmu_fix_write), (int)KB(rte_mmu_fix_commit),
+						  (unsigned)(uint16_t)KB(rte_mmu_fix_opcode));
+						rte_n++;
+						land = 1;
+					}
+				}
+				if (land && VERTOPINTERN->debug_fetch_valid) {
+					fprintf(stderr, "[BERRFRAME]      landed_pc=%06X opc=%04X\n",
+						VERTOPINTERN->debug_pc & 0xFFFFFFu, VERTOPINTERN->debug_opcode & 0xFFFFu);
+					land = 0;
+				}
+			}
+			#undef KB
+
 			// [SR] VIA6522 shift-register + Egret handshake trace. The $A4A18C packet
 			// loop never completes in our core (MAME: 14 iters & exits). Watch whether
 			// the SR transfers bytes (bit_cnt 7->0, IFR[2] fires) and whether the Egret

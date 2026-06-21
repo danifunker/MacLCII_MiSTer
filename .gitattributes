@@ -24,3 +24,8 @@
 /MacLCii.qsf       text eol=lf
 /MacLCii.qpf       text eol=lf
 /MacLCii.sdc       text eol=lf
+
+# Sim helper scripts — must stay LF so they run on the macOS/Linux Verilator box
+# (a CRLF shebang/line breaks bash). New files, stored LF, churn-free.
+/verilator/berrframe_build.sh  text eol=lf
+/verilator/berrframe_run.sh    text eol=lf

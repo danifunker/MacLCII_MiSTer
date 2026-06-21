@@ -50,6 +50,8 @@ scratch/
 verilator/*.out
 verilator/*.err
 verilator/build*.log
+verilator/berrframe*.log
+verilator/trace.fst
 
 # local/personal env (host IP, ssh key path) — never commit
 scripts/local.env

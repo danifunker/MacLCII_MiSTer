@@ -16,3 +16,22 @@ public_flat_rd -module "TG68KdotC_Kernel" -var "execopc"
 public_flat_rd -module "TG68KdotC_Kernel" -var "exe_condition"
 public_flat_rd -module "TG68KdotC_Kernel" -var "exe_opcode"
 public_flat_rd -module "TG68KdotC_Kernel" -var "decodeopc"
+// [BERRFRAME] taps: 68030 bus-fault frame build + Format-$B RTE consume, to
+// ground-truth the OS continue-past probe bug. make_berr=fault dispatch pulse;
+// berr_frame_pc/berr_ssw/berr_long_frame/berr_fault_addr = the frame AS BUILT;
+// tg68_pc = live PC; rte_mmu_fix_ssw = the STACKED (post-handler) SSW captured at
+// RTE (shows bit9 + DF the handler left); rte_mmu_fix_write/commit = whether the
+// continue-past replay fires; rte_format_word/opcode = the RTE-side decode.
+public_flat_rd -module "TG68KdotC_Kernel" -var "make_berr"
+public_flat_rd -module "TG68KdotC_Kernel" -var "berr_frame_pc"
+public_flat_rd -module "TG68KdotC_Kernel" -var "berr_ssw"
+public_flat_rd -module "TG68KdotC_Kernel" -var "berr_long_frame"
+public_flat_rd -module "TG68KdotC_Kernel" -var "berr_fault_addr"
+public_flat_rd -module "TG68KdotC_Kernel" -var "trap_berr"
+public_flat_rd -module "TG68KdotC_Kernel" -var "trap_mmu_berr"
+public_flat_rd -module "TG68KdotC_Kernel" -var "tg68_pc"
+public_flat_rd -module "TG68KdotC_Kernel" -var "rte_format_word"
+public_flat_rd -module "TG68KdotC_Kernel" -var "rte_mmu_fix_ssw"
+public_flat_rd -module "TG68KdotC_Kernel" -var "rte_mmu_fix_write"
+public_flat_rd -module "TG68KdotC_Kernel" -var "rte_mmu_fix_commit"
+public_flat_rd -module "TG68KdotC_Kernel" -var "rte_mmu_fix_opcode"
