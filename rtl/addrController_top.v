@@ -33,7 +33,8 @@ module addrController_top(
 	input [2:0] cpuFC,
 
 	// RAM/ROM:
-	output [22:0] memoryAddr,  // 23-bit SDRAM word address
+	output [22:0] memoryAddr,  // 23-bit SDRAM word address (lower 16MB)
+	output        mb_hi,       // 1 => this access is the motherboard bank; drives sdram_addr[23] (upper 16MB)
 	output _memoryUDS,
 	output _memoryLDS,
 	output _romOE,
@@ -240,6 +241,14 @@ module addrController_top(
 		dskReadAckInt ? dsk_int_sdram_word :
 		dskReadAckExt ? dsk_ext_sdram_word :
 		addr_mux;
+
+	// Motherboard-bank relocation: the soldered 2MB bank ($800000-$9FFFFF) is
+	// remapped to the upper 16MB of the 32MB SDRAM (sdram_addr[23]=1) because the
+	// lower-16MB region it used to occupy ($000000-$0FFFFF) silently loses writes,
+	// corrupting the PMMU page table in the 10MB config (build #8 2026-06-24).
+	// memoryAddr is unchanged; only this extra high bit moves the bank. Disk-read
+	// slots and SIMM/ROM/VRAM keep mb_hi=0 (lower 16MB, untouched).
+	assign mb_hi = !dskReadAckInt && !dskReadAckExt && selectRAM && motherboard_high;
 
 	// ============================================================
 	// Address decoder

@@ -472,7 +472,8 @@ module emu
 	wire _memoryUDS, _memoryLDS;
 	wire dioBusControl;
 	wire cpuBusControl;
-	wire [22:0] memoryAddr;  // 23-bit SDRAM word address from address controller
+	wire [22:0] memoryAddr;  // 23-bit SDRAM word address from address controller (lower 16MB)
+	wire        mb_hi;       // motherboard-bank select -> sdram_addr[23] (relocates bank to upper 16MB)
 	wire [15:0] memoryDataOut;
 	wire memoryLatch;
 	// peripherals
@@ -496,6 +497,12 @@ module emu
 
 	// dtack generation for 16 MHz mode
 	reg  dtack_en, mem_latch_d;
+	wire sdram_ram_ready;       // SDRAM read-data-valid (from sdram.v)
+	wire cpu_walk_cycle;        // PMMU walker borrowing the bus (from tg68k dbg_walk_cycle_o)
+	// SURGICAL gate: ONLY the borrowed PMMU-walk descriptor read waits for real
+	// SDRAM data-valid. Every normal access keeps the fast slot-start ack, so the
+	// known-good cpu-cycle timing (that booted reliably) is left unperturbed.
+	wire walk_read = cpu_walk_cycle & (selectRAM | selectVRAM) & _cpuRW;
 	always @(posedge clk_sys) begin
 		if (!_cpuReset) begin
 			dtack_en <= 0;
@@ -516,7 +523,17 @@ module emu
 			// also a cpu slot the three slots are contiguous (one rising edge per
 			// round), so we strobe at each cpu-slot start instead — same busPhase-0
 			// timing as the old edge, but for all 3 slots (3 acks/round = +50%).
-			if (!_cpuAS & ((cpuBusControl & mem_latch_d) | (!selectROM & !selectRAM & !selectVRAM))) dtack_en <= 1;
+			// Only the borrowed PMMU-WALK read waits for real SDRAM data-valid
+			// (sdram_ram_ready): it is the one cycle phase-misaligned with the SDRAM
+			// command slot, so it otherwise latches `dout` before the read completes
+			// and captures stale data (the 10MB-boot Sad Mac). EVERY other access
+			// (normal RAM/VRAM reads, ROM reads, all writes) keeps the fast
+			// slot-start ack — the timing the core already booted reliably with — so
+			// this cannot perturb normal cpu-cycle timing. Peripherals keep the
+			// immediate ack.
+			if (!_cpuAS & ( (cpuBusControl & mem_latch_d & ~walk_read)
+			              | (cpuBusControl & walk_read & sdram_ram_ready)
+			              | (!selectROM & !selectRAM & !selectVRAM) )) dtack_en <= 1;
 		end
 	end
 
@@ -709,6 +726,12 @@ module emu
 	end
 `endif
 
+	wire        cpu_make_berr;
+	wire [31:0] cpu_berr_frame_pc, cpu_exe_pc, cpu_tg68_pc;
+	wire [31:0] cpu_pmmu_log, cpu_pmmu_phys;   // PMMU logical/physical (mode-switch capture)
+	wire [31:0] cpu_pmmu_tc, cpu_pmmu_crp, cpu_pmmu_wda, cpu_pmmu_wdd, cpu_pmmu_st;  // MMU-input forensics
+	// cpu_walk_cycle is declared up near the dtack glue (it gates the walk-read DTACK)
+	wire [15:0] cpu_exe_opcode, cpu_berr_opcode;
 	tg68k tg68k (
 		.clk        ( clk_sys      ),
 		.reset      ( !_cpuReset ),
@@ -739,7 +762,21 @@ module emu
 				.din        ( slot_space ? 16'hFFFF : dataControllerDataOut ),
 				.dout       ( tg68_dout ),
 				.longword   ( tg68_longword ),
-				.addr       ( tg68_a )
+				.addr       ( tg68_a ),
+				.dbg_make_berr      ( cpu_make_berr ),
+				.dbg_berr_frame_pc  ( cpu_berr_frame_pc ),
+				.dbg_exe_pc         ( cpu_exe_pc ),
+				.dbg_exe_opcode     ( cpu_exe_opcode ),
+				.dbg_berr_opcode    ( cpu_berr_opcode ),
+				.dbg_tg68_pc        ( cpu_tg68_pc ),
+				.dbg_pmmu_log       ( cpu_pmmu_log ),
+				.dbg_pmmu_phys      ( cpu_pmmu_phys ),
+				.dbg_pmmu_tc_o      ( cpu_pmmu_tc ),
+				.dbg_pmmu_crp_o     ( cpu_pmmu_crp ),
+				.dbg_pmmu_wda_o     ( cpu_pmmu_wda ),
+				.dbg_pmmu_wdd_o     ( cpu_pmmu_wdd ),
+				.dbg_pmmu_st_o      ( cpu_pmmu_st ),
+				.dbg_walk_cycle_o   ( cpu_walk_cycle )
 			);
 	
 	// On-chip framebuffer (BRAM): packed CPU VRAM write mirror (port A) +
@@ -771,6 +808,7 @@ module emu
 		                                   // only ever saw the 2MB board. Mirrors sim.v.
 		.ram_configured(pvia_ram_configured),
 		.memoryAddr(memoryAddr),
+		.mb_hi(mb_hi),
 		.memoryLatch(memoryLatch),
 		._memoryUDS(_memoryUDS),
 		._memoryLDS(_memoryLDS),
@@ -1010,7 +1048,28 @@ module emu
 		.cpu_berr(cpu_berr),
 		.fc7_berr(fc7_berr && !_cpuAS),
 		.sdma_berr(sdma_berr),
-		.memoryOverlayOn(memoryOverlayOn)
+		.memoryOverlayOn(memoryOverlayOn),
+		.cpu_make_berr(cpu_make_berr),
+		.cpu_berr_frame_pc(cpu_berr_frame_pc),
+		.cpu_exe_pc(cpu_exe_pc),
+		.cpu_exe_opcode(cpu_exe_opcode),
+		.cpu_berr_opcode(cpu_berr_opcode),
+		.cpu_tg68_pc(cpu_tg68_pc),
+		.cpu_pmmu_log(cpu_pmmu_log),
+		.cpu_pmmu_phys(cpu_pmmu_phys),
+		.cpu_pmmu_tc(cpu_pmmu_tc),
+		.cpu_pmmu_crp(cpu_pmmu_crp),
+		.cpu_pmmu_wda(cpu_pmmu_wda),
+		.cpu_pmmu_wdd(cpu_pmmu_wdd),
+		.cpu_pmmu_st(cpu_pmmu_st),
+		.cpu_dout(tg68_dout),
+		.cpu_memaddr(memoryAddr),
+		.cpu_ramwe_n(_ramWE),
+		.mb_hi_i(mb_hi),
+		.walk_cycle(cpu_walk_cycle),
+		.ramOE_n(_ramOE),
+		.selectUnmapped(selectUnmapped),
+		.cpuBusControl(cpuBusControl)
 	);
 
 	maclc_v8_video v8_video(
@@ -1388,10 +1447,13 @@ module emu
 	////////////////////////// SDRAM /////////////////////////////////
 
 	// SDRAM Address mapping for Mac LC (V8-style):
-	// memoryAddr[22:0] is already the SDRAM word address from addrController
-	// Download path uses dio_a[22:0] directly
+	// memoryAddr[22:0] is already the SDRAM word address from addrController.
+	// bit23 = mb_hi: relocates the motherboard bank into the upper 16MB of the
+	// 32MB SDRAM (the lower-16MB region it used to use loses writes and corrupts
+	// the PMMU page table; build #8 2026-06-24). All other users keep bit23=0.
+	// Download path uses dio_a[22:0] directly (lower 16MB).
 	wire [24:0] sdram_addr = download_cycle ? {2'b00, dio_a[22:0]} :
-	                                          {2'b00, memoryAddr[22:0]};
+	                                          {1'b0, mb_hi, memoryAddr[22:0]};
 	wire [15:0] sdram_din  = download_cycle ? dio_data :
 	                                          memoryDataOut;
 	wire  [1:0] sdram_ds   = download_cycle ? 2'b11 :
@@ -1491,7 +1553,8 @@ module emu
 		.ds             ( sdram_ds                 ),
 		.we             ( sdram_we                 ),
 		.oe             ( sdram_oe                 ),
-		.dout           ( sdram_out                )
+		.dout           ( sdram_out                ),
+		.ram_ready      ( sdram_ram_ready          )
 	);
 
 endmodule
