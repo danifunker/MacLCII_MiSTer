@@ -331,7 +331,10 @@ entity TG68KdotC_Kernel is
 		debug_rte_mmu_fix_ssw    : out std_logic_vector(15 downto 0);
 		debug_rte_mmu_fix_opcode : out std_logic_vector(15 downto 0);
 		debug_rte_mmu_fix_write  : out std_logic;
-		debug_rte_format_b_version_error : out std_logic
+		debug_rte_format_b_version_error : out std_logic;
+		debug_berr_frame_pc      : out std_logic_vector(31 downto 0);
+		debug_exe_opcode         : out std_logic_vector(15 downto 0);
+		debug_berr_opcode        : out std_logic_vector(15 downto 0)
 			);
 end TG68KdotC_Kernel;
 
@@ -578,6 +581,14 @@ architecture logic of TG68KdotC_Kernel is
 	signal berr_fault_addr   : std_logic_vector(31 downto 0);  -- Faulting logical address
 	signal berr_frame_pc     : std_logic_vector(31 downto 0);  -- PC stacked in the 68030 bus-fault frame
 	signal berr_opcode_saved : std_logic_vector(15 downto 0);  -- Faulted instruction opcode for Format $B replay state
+	-- CONTINUE-PAST FIX v2 (2026-06-21): the FAULTING instruction's opcode + start PC,
+	-- latched at operand setup (setstate="01") BEFORE the data fault / prefetch advance /
+	-- 4E71 opcode-clobber. The external-data-fault frame build stacks PC = exe_pc + the
+	-- decoded instruction length (from this opcode's source EA mode) and this opcode at
+	-- $14, so a DF-cleared "continue-past" RTE resumes on the true next instruction AND
+	-- the rte_mmu_fix register writeback gate decodes the right opcode.
+	signal berr_setup_opcode : std_logic_vector(15 downto 0) := (others => '0');
+	signal berr_setup_exe_pc : std_logic_vector(31 downto 0) := (others => '0');
 	signal berr_ssw          : std_logic_vector(15 downto 0);  -- Special Status Word
 	signal berr_data_out_saved : std_logic_vector(31 downto 0);  -- Data output buffer saved at berr dispatch
 	signal berr_long_frame   : std_logic;  -- MC68030 bus fault frame choice: 0=Format $A, 1=Format $B
@@ -1574,13 +1585,23 @@ ALU: TG68K_ALU
 		micro_state = rte5 AND
 		rot_cnt = "000001" AND
 		rte_format_word(15 downto 12) = "1011" AND
-		rte_mmu_fix_ssw(9) = '1' AND
+		-- CONTINUE-PAST FIX (2026-06-21): bit 9 NO LONGER gates the register
+		-- writeback. Mac OS BERR-protected probes clear DF and RTE to "continue
+		-- past" WITHOUT setting SSW bit 9 (the PMMU software-fix request), so the
+		-- faulted instruction's destination register was never written from the
+		-- handler-supplied DIB -> the probe's validity check (and.l/sub.l a6/beq on
+		-- the dest reg at $A0DC1E) ran on a garbage register -> derail -> vector-2
+		-- storm -> Sad Mac. Fire the writeback for BOTH bit9=1 (PMMU) and bit9=0
+		-- (OS) continue-past frames; PC+2 stays gated on bit9 at the TG68_PC mux so
+		-- the OS case keeps the next-instruction PC restored from the stacked frame.
 		rte_mmu_fix_ssw(8) = '0' AND
 		rte_mmu_fix_ssw(7) = '0' AND
 		rte_mmu_fix_ssw(6) = '1' AND
-		-- Only complete the no-extension source form for now. Other modes need
-		-- effective-address side effects and extension-word replay state.
-		rte_mmu_fix_opcode(5 downto 3) = "010" AND
+		-- Source EA: (An) [mode 010] OR (d16,An) [mode 101] -- the two Mac OS
+		-- handle-probe forms (movea.l (a1),a0 and move.l $38(a6),d0). Both leave a
+		-- clean DIB at frame+$2C and have no EA-register write-back side effects.
+		(rte_mmu_fix_opcode(5 downto 3) = "010" OR
+		 rte_mmu_fix_opcode(5 downto 3) = "101") AND
 		-- MOVE.{B,W,L} to Dn (mode 000)
 		((rte_mmu_fix_opcode(8 downto 6) = "000" AND
 		  (rte_mmu_fix_opcode(15 downto 12) = "0001" OR
@@ -3258,6 +3279,8 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 					berr_fault_addr <= (others => '0');
 					berr_frame_pc <= (others => '0');
 					berr_opcode_saved <= (others => '0');
+					berr_setup_opcode <= (others => '0');
+					berr_setup_exe_pc <= (others => '0');
 					berr_ssw <= (others => '0');
 					berr_data_out_saved <= (others => '0');
 					berr_long_frame <= '0';
@@ -3301,6 +3324,12 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 					-- data-fault frame build below stacks THIS instead of TG68_PC.
 					IF setstate = "01" THEN
 						instr_boundary_pc <= TG68_PC;
+						-- CONTINUE-PAST FIX v2: also latch the FAULTING instruction's opcode and
+						-- start PC here (pre-fault). These feed the external-data-fault frame:
+						-- resume PC = berr_setup_exe_pc + decoded length, opcode field = this
+						-- opcode (so rte_mmu_fix decodes the real move, not the clobbered 4E71).
+						berr_setup_opcode <= opcode;
+						berr_setup_exe_pc <= exe_pc;
 					END IF;
 					-- LC II post-MMU bsr.w FIX (part 2 — longword word-counter hold):
 					-- Freeze the longword word counter (memmask/memread) during a PMMU stall
@@ -3319,7 +3348,11 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 --					IF wbmemmask(5 downto 4)="11" THEN
 --						wbmemmask <= memmask;
 --					END IF;
-					IF rte_mmu_fix_commit='1' THEN
+					-- CONTINUE-PAST FIX: PC+2 only for the PMMU software-fix path
+					-- (bit9=1, which stacks the live TG68_PC). The OS continue-past
+					-- case (bit9=0) keeps the next-instruction PC already restored from
+					-- the stacked frame (instr_boundary_pc); only its register is written.
+					IF rte_mmu_fix_commit='1' AND rte_mmu_fix_ssw(9)='1' THEN
 						TG68_PC <= TG68_PC + 2;
 					ELSIF exec(directPC)='1' THEN
 						TG68_PC <= data_read;
@@ -3680,24 +3713,30 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 								-- bus-fault frames.  For a Format $A LASTWRITE fault this
 								-- is the post-instruction PC; RTE replays only the saved
 								-- write and must not restart the instruction from exe_pc.
-								-- FORMAT-$B CONTINUE-PAST FIX: for an EXTERNAL data bus fault
-								-- (the Mac OS BERR-protected probe), stack the captured
-								-- end-of-instruction PC so a DF-cleared RTE continues past the
-								-- faulted access correctly instead of overshooting into the
-								-- next-but-one instruction. PMMU faults keep the live TG68_PC
-								-- (their rte_mmu_fix replay advances the PC itself).
-								-- Validated (verilator/test_berrframe) for register-indirect EA
-								-- (An)/(An)+/-(An) and (d16,An) — the modes the OS handle probes
-								-- use. Absolute-EA data faults stack -2 here (their last EA word
-								-- is read in the access cycle), but the only such case is the boot
-								-- RAM-size probe, which recovers via `jmp (A6)`, never an RTE of
-								-- this frame, so the stacked PC is unused.
+								-- FORMAT-$B CONTINUE-PAST FIX v2 (2026-06-21): for an EXTERNAL data
+								-- bus fault (the Mac OS BERR-protected handle-validation probe), stack
+								-- the TRUE next-instruction PC = faulting-instr start + its decoded
+								-- length, and save the faulting opcode. HW ground truth (JTAG capture):
+								-- instr_boundary_pc is the PREFETCH pointer (= exe_pc + 6, a constant
+								-- 3 words ahead) so it overshoots the short probe forms; and exe_opcode
+								-- is clobbered to $4E71 by fault time. Use the pre-fault setstate="01"
+								-- latches (berr_setup_*) instead. Length from the faulting source EA:
+								--   (An)     [mode 010] = 1 word  -> +2  (movea.l (a1),a0 = $2051)
+								--   (d16,An) [mode 101] = 2 words -> +4  (move.l $38(a6),d0 = $202E)
+								-- PMMU faults keep the live TG68_PC (their rte_mmu_fix replay advances
+								-- the PC itself). Other EA modes (e.g. the absolute-EA boot RAM probe,
+								-- which recovers via jmp(A6) and never RTEs this frame) fall back to the
+								-- old instr_boundary_pc — harmless, since their stacked PC is unused.
 								IF pmmu_fault = '1' OR berr_pmmu_fault_valid = '1' OR make_mmu_berr = '1' THEN
 									berr_frame_pc <= TG68_PC;
+								ELSIF berr_setup_opcode(5 downto 3) = "101" THEN
+									berr_frame_pc <= berr_setup_exe_pc + 4;   -- (d16,An): opcode + disp word
+								ELSIF berr_setup_opcode(5 downto 3) = "010" THEN
+									berr_frame_pc <= berr_setup_exe_pc + 2;   -- (An): opcode only
 								ELSE
-									berr_frame_pc <= instr_boundary_pc;
+									berr_frame_pc <= instr_boundary_pc;       -- fallback (non-probe forms)
 								END IF;
-								berr_opcode_saved <= exe_opcode;
+								berr_opcode_saved <= berr_setup_opcode;
 								-- Save data output buffer for berr2 (data being written at fault time)
 								berr_data_out_saved <= data_write_tmp;
 								berr_ssw <= (others => '0');
@@ -9247,6 +9286,13 @@ debug_setnextpass <= '1' when setnextpass='1' else '0';
 
 -- DEBUG: BUG #213 - Address generation and opcode capture
 debug_TG68_PC <= TG68_PC;
+-- DIAG (2026-06-21): carry the STABLE instr_boundary_pc (latched at setstate="01"
+-- before the fault, holds through dispatch — no clkena clear/settle ambiguity).
+-- For an external data fault this IS the stacked PC (berr_frame_pc <= instr_boundary_pc
+-- at the data-fault frame build), so PFR0 = the resume PC the OS probe RTE would use.
+debug_berr_frame_pc <= instr_boundary_pc;
+debug_exe_opcode <= exe_opcode;
+debug_berr_opcode <= opcode;
 debug_memaddr_reg <= memaddr_reg;
 debug_memaddr_delta <= memaddr_delta;
 debug_oddout <= oddout;

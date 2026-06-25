@@ -36,8 +36,27 @@ module tg68k (
 	output reg [31:0] addr,
 
 	// Debug outputs
-	output [1:0] busstate
+	output [1:0] busstate,
+	// continue-past first-fault diagnostic taps (-> dbg_probes)
+	output        dbg_make_berr,
+	output [31:0] dbg_berr_frame_pc,
+	output [31:0] dbg_exe_pc,
+	output [15:0] dbg_exe_opcode,
+	output [15:0] dbg_berr_opcode,
+	output [31:0] dbg_tg68_pc,          // LOGICAL prefetch pointer (pre-MMU) -> dbg_probes
+	// PMMU mode-switch mistranslation capture (FPGA, always available):
+	output [31:0] dbg_pmmu_log,         // pmmu_addr_log  (LOGICAL fetch addr = A5/jmp target)
+	output [31:0] dbg_pmmu_phys,        // pmmu_addr_phys (PHYSICAL translated = derail target)
+	// MMU-input forensics at the derail (which input is wrong: TC? CRP? table?):
+	output [31:0] dbg_pmmu_tc_o,        // TC register
+	output [31:0] dbg_pmmu_crp_o,       // CRP_lo (root table base)
+	output [31:0] dbg_pmmu_wda_o,       // last walk descriptor ADDRESS read
+	output [31:0] dbg_pmmu_wdd_o,       // last walk descriptor DATA read
+	output [31:0] dbg_pmmu_st_o,        // {11'b0, walk wstate[4:0], fault_status[15:0]}
+	output        dbg_walk_cycle_o      // BUILD#10: 1 while the PMMU walker is borrowing the bus
 );
+
+	assign dbg_walk_cycle_o = walk_cycle;
 
 wire  [1:0] tg68_busstate;
 
@@ -91,11 +110,15 @@ wire [15:0] tg68_dout_k;               // kernel data_write, muxed with walker w
 // hold logic below to release the held berr the instant the kernel latches the
 // fault, so the 030 double-bus-fault detector doesn't see the same fault twice.
 wire        kernel_make_berr;
+assign dbg_make_berr = kernel_make_berr;
+wire [31:0] kernel_tg68_pc;             // kernel TG68_PC (logical prefetch ptr), non-sim
+assign dbg_tg68_pc   = kernel_tg68_pc;  // -> dbg_probes (works in FPGA build; dbg_pc is sim-only)
 wire        kernel_trap_berr;
 
 `ifdef A30_TRACE
 // --- A30 alias-bit divergence probe (LC II post-MMU; sim-only) ---
-wire [31:0] dbg_pc, dbg_reg_qa, dbg_memaddr_reg, dbg_memaddr_delta, dbg_data_read;
+wire [31:0] dbg_pc = kernel_tg68_pc;   // alias (kernel TG68_PC now lands on kernel_tg68_pc)
+wire [31:0] dbg_reg_qa, dbg_memaddr_reg, dbg_memaddr_delta, dbg_data_read;
 wire [31:0] dbg_rf_wdata, dbg_a2, dbg_a5, dbg_a7;
 wire        dbg_directPC, dbg_rf_we;
 wire  [3:0] dbg_rf_waddr;
@@ -111,7 +134,7 @@ wire [15:0] dbg_opcode, dbg_last_opc;
 wire        dbg_set_addrlong, dbg_decodeOPC, dbg_get_2ndopc, dbg_clkena_lw;
 `endif
 
-`ifdef PMMU_TRACE
+// PMMU debug taps made UNCONDITIONAL (2026-06-23) for the FPGA mistranslation capture.
 // Expose the PMMU's per-walk logical address + live CRP-aptr/TC + walk state so the
 // PMMU REQ trace shows whether a wrong root index comes from a bad logical address
 // (debug_pmmu_saved_addr) or a bad loaded CRP (debug_pmmu_crp_lo).
@@ -124,11 +147,23 @@ wire  [4:0] dbg_pmmu_wstate;
 wire [15:0] dbg_pmmu_fstat;
 wire        dbg_pmmu_fault_o;
 wire [31:0] dbg_pmmu_wddata, dbg_pmmu_wdaddr;
-`endif
 
 reg         walk_cycle;   // 1 = a walker word transfer is borrowing the bus
 reg         walk_word;    // 0 = high word @addr, 1 = low word @addr+2
 reg  [15:0] walk_hi;      // captured high word (big-endian: bits 31:16)
+// Re-read-until-stable (2026-06-24): the borrowed walk READ is intermittently
+// missed by the SDRAM controller (it samples oe only at its t==STATE_CMD_START
+// clk_8 edge; a phase-misaligned borrowed access falls through to AUTO_REFRESH,
+// leaving `dout` stale = $0000, yet DTACK still fires). Result: the PMMU reads a
+// zero descriptor and derails (10MB boot Sad Mac) / faults+retries (slow boot,
+// build #11 2026-06-24). Fix: re-issue the descriptor READ until two consecutive
+// full-32-bit reads agree (each retry lands at a fresh phase, so a missed access
+// is caught), capped so a genuinely-stable descriptor (incl. a real 0) still
+// completes. READS only — descriptor WRITES (U/M bits) keep single-shot.
+reg  [31:0] walk_desc;    // full descriptor captured this read pass
+reg  [31:0] walk_prev;    // previous read pass (for the stable-compare)
+reg  [2:0]  walk_tries;   // read passes so far (0 = first; compare needs >=1)
+localparam [2:0] WALK_MAX_TRIES = 3'd6;
 
 wire [31:0] walk_word_addr = walk_word ? (pmmu_walker_addr | 32'd2) : (pmmu_walker_addr & ~32'd2);
 wire [15:0] walk_dout_word = walk_word ? pmmu_walker_wdat[15:0]     : pmmu_walker_wdat[31:16];
@@ -359,6 +394,14 @@ end
 	wire [31:0] cache_addr_phys;    // pmmu_addr_phys (physical -> cacheable decode + line fill)
 	wire        cache_inhibit_pmmu; // pmmu_cache_inhibit
 	wire        cacr_ie, cacr_de, cacr_ifreeze, cacr_dfreeze, cacr_wa;
+	// PMMU logical/physical taps out to the JTAG probe deck (mode-switch capture)
+	assign      dbg_pmmu_log  = cache_addr_log;
+	assign      dbg_pmmu_phys = cache_addr_phys;
+	assign      dbg_pmmu_tc_o  = dbg_pmmu_tc;
+	assign      dbg_pmmu_crp_o = dbg_pmmu_crplo;
+	assign      dbg_pmmu_wda_o = dbg_pmmu_wdaddr;
+	assign      dbg_pmmu_wdd_o = dbg_pmmu_wddata;
+	assign      dbg_pmmu_st_o  = {11'b0, dbg_pmmu_wstate, dbg_pmmu_fstat};
 	wire        cache_inv_req;
 	wire [1:0]  cache_op_scope, cache_op_cache;
 	wire [31:0] cache_op_addr;
@@ -413,12 +456,17 @@ end
 		.cache_inv_req      ( cache_inv_req      ),
 		.cache_op_scope     ( cache_op_scope     ),
 		.cache_op_cache     ( cache_op_cache     ),
-		.cache_op_addr      ( cache_op_addr      )
+		.cache_op_addr      ( cache_op_addr      ),
+		// continue-past diagnostic taps (always connected)
+		.debug_berr_frame_pc ( dbg_berr_frame_pc ),
+		.debug_exe_PC        ( dbg_exe_pc         ),
+		.debug_exe_opcode    ( dbg_exe_opcode     ),
+		.debug_berr_opcode   ( dbg_berr_opcode    )
 
 `ifdef A30_TRACE
 		// --- A30 alias-bit divergence probe (LC II post-MMU; sim-only) ---
 		,
-		.debug_TG68_PC       ( dbg_pc        ),
+		.debug_TG68_PC       ( kernel_tg68_pc ),
 		.debug_reg_QA        ( dbg_reg_qa    ),
 		.debug_memaddr_reg   ( dbg_memaddr_reg ),
 		.debug_memaddr_delta ( dbg_memaddr_delta ),
@@ -444,7 +492,7 @@ end
 		.debug_get_2ndopc    ( dbg_get_2ndopc  ),
 		.debug_clkena_lw     ( dbg_clkena_lw   )
 `endif
-`ifdef PMMU_TRACE
+		// PMMU debug connections UNCONDITIONAL (2026-06-23) for FPGA capture
 		,
 		.debug_pmmu_saved_addr ( dbg_pmmu_saddr  ),
 		.debug_pmmu_crp_lo     ( dbg_pmmu_crplo  ),
@@ -454,7 +502,6 @@ end
 		.debug_pmmu_fault        ( dbg_pmmu_fault_o ),
 		.debug_pmmu_walk_desc_addr ( dbg_pmmu_wdaddr ),
 		.debug_pmmu_walk_desc_data ( dbg_pmmu_wddata )
-`endif
 
 		// Cache control + PMMU address taps are connected above. The remaining
 		// new-030 outputs (skipFetch, regin_out, CACR_out, VBR_out, cacr_ibe/dbe,
@@ -705,20 +752,37 @@ end
 				    s_state == 3'd0 && tg68_busstate == 2'b01) begin
 					walk_cycle <= 1'b1;
 					walk_word  <= 1'b0;   // high word first
+					walk_tries <= 3'd0;   // re-read pass counter (READs)
 				end
 			end else begin
-				// Capture the read word at the data phase (s_state 6, phi2).
+				// Capture the read word at the data phase (s_state 6, phi2). The low
+				// word completes the 32-bit descriptor into walk_desc (compared below).
 				if (phi2 && s_state == 3'd6) begin
-					if (!walk_word) walk_hi          <= din;
-					else            pmmu_walker_data <= {walk_hi, din};
+					if (!walk_word) walk_hi   <= din;
+					else            walk_desc <= {walk_hi, din};
 				end
 				// Word transfer completes at s_state 7 (phi1).
 				if (phi1 && s_state == 3'd7) begin
 					if (!walk_word) begin
 						walk_word <= 1'b1;        // proceed to low word
+					end else if (pmmu_walker_we) begin
+						// descriptor WRITE: single-shot (no read-back to verify)
+						walk_cycle      <= 1'b0;
+						pmmu_walker_ack <= 1'b1;
+					end else if ((walk_tries != 3'd0 && walk_desc == walk_prev) ||
+					             walk_tries >= WALK_MAX_TRIES) begin
+						// descriptor READ stable (two passes agree) or retry cap hit:
+						// accept it. walk_desc was latched at s_state 6 above.
+						walk_cycle       <= 1'b0;
+						pmmu_walker_data <= walk_desc;
+						pmmu_walker_ack  <= 1'b1;
 					end else begin
-						walk_cycle      <= 1'b0;  // descriptor done
-						pmmu_walker_ack <= 1'b1;  // data already latched at s_state 6
+						// not yet stable: re-issue the read from the high word. Each
+						// retry lands at a fresh SDRAM phase, so a missed (refresh-
+						// shadowed) access is caught on a subsequent pass.
+						walk_prev  <= walk_desc;
+						walk_tries <= walk_tries + 3'd1;
+						walk_word  <= 1'b0;
 					end
 				end
 			end
