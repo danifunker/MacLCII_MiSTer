@@ -245,6 +245,17 @@ wire [3:0] px_per_word =
     (bits_per_pixel == 5'd8)  ? 4'd1  :   //  2
                                 4'd0;     // 16bpp: 1 px/word
 
+// The display FSM must gate on the COMBINATIONAL blank (aligned to h_count), NOT
+// the registered hblank/vblank outputs — those lag h_count by one pix_en, so at
+// the first active pixel (h_count==0) the FSM still saw "hblank" and primed
+// pixel_shift<=0 instead of loading word 0. The load then slipped to h_count==1,
+// leaving col 0 showing the primed value (0 -> palette 0x7F = WHITE in 1bpp): a
+// 1px white line down the left edge, with the whole line shifted right by one.
+// At h_count==0 v_count has already advanced to this line, so the word-0 read
+// linebuf[{v_count[0],0}] is already the correct buffer.
+wire hblank_c = (h_count >= h_active);
+wire vblank_c = (v_count >= v_active);
+
 always @(posedge clk_sys) begin
     if (reset) begin
         disp_idx    <= 0;
@@ -252,7 +263,7 @@ always @(posedge clk_sys) begin
         pixel_shift <= 16'h0000;
         video_data  <= 16'h0000;
     end else if (pix_en) begin
-        if (hblank || vblank) begin
+        if (hblank_c || vblank_c) begin
             // Prime for the first pixel of the next line.
             disp_idx    <= 0;
             px_in_word  <= 0;
