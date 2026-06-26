@@ -124,6 +124,14 @@ always @(posedge clk_sys) begin
     end
 end
 
+// COMBINATIONAL blanks (aligned to h_count/v_count), used by the fetch and display
+// FSMs. The registered hblank/vblank OUTPUTS above lag h_count/v_count by one
+// pix_en, so gating internal logic on them slipped the first-pixel / first-line
+// work one step late — a white col 0 (display FSM) and a corrupted first scanline
+// at the left edge (fetch side). Use these non-lagged versions internally.
+wire hblank_c = (h_count >= h_active);
+wire vblank_c = (v_count >= v_active);
+
 `ifdef SIMULATION
 reg [3:0] monitor_id_prev;
 always @(posedge clk_sys) begin
@@ -189,7 +197,8 @@ end
 reg        fetch_buf;
 reg [17:0] fetch_packed_base;
 always @(*) begin
-    if (vblank) begin
+    if (vblank_c) begin   // combinational: registered vblank lags one pix_en and
+                          // corrupted the first scanline's prefetch (left-edge artifact)
         fetch_buf         = 1'b0;        // prefetch line 0 into buffer 0
         fetch_packed_base = 18'd0;
     end else begin
@@ -245,17 +254,10 @@ wire [3:0] px_per_word =
     (bits_per_pixel == 5'd8)  ? 4'd1  :   //  2
                                 4'd0;     // 16bpp: 1 px/word
 
-// The display FSM must gate on the COMBINATIONAL blank (aligned to h_count), NOT
-// the registered hblank/vblank outputs — those lag h_count by one pix_en, so at
-// the first active pixel (h_count==0) the FSM still saw "hblank" and primed
-// pixel_shift<=0 instead of loading word 0. The load then slipped to h_count==1,
-// leaving col 0 showing the primed value (0 -> palette 0x7F = WHITE in 1bpp): a
-// 1px white line down the left edge, with the whole line shifted right by one.
-// At h_count==0 v_count has already advanced to this line, so the word-0 read
-// linebuf[{v_count[0],0}] is already the correct buffer.
-wire hblank_c = (h_count >= h_active);
-wire vblank_c = (v_count >= v_active);
-
+// Display side gates on hblank_c/vblank_c (declared up top): the registered blanks
+// lag one pix_en, which left col 0 showing the primed pixel_shift (=0 -> 0x7F white
+// in 1bpp) and shifted each line right by one. At h_count==0 v_count has already
+// advanced to this line, so the word-0 read linebuf[{v_count[0],0}] is correct.
 always @(posedge clk_sys) begin
     if (reset) begin
         disp_idx    <= 0;
