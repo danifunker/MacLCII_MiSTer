@@ -732,7 +732,7 @@ int verilate() {
 				if (video.count_frame >= 114 && video.count_frame <= 121) {
 					static uint32_t trn_key = 0xFFFFFFFF; static int trn_logs = 0;
 					uint32_t cb1b = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__shift_clock;
-					uint32_t cb2v = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__cb2_i;
+					uint32_t cb2v = 0; // cb2_i optimized away by this Verilator (input, no standalone storage); [SRTRN] VIA-SR debug trace only
 					uint32_t bcb  = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__bit_cnt;
 					uint32_t acb  = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__acr;
 					uint32_t scb  = (uint32_t)VERTOPINTERN->emu__DOT__dc0__DOT__via__DOT__shift_active;

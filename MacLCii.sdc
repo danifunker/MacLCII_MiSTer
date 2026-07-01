@@ -63,3 +63,29 @@ set_multicycle_path -setup -end 2 \
 set_multicycle_path -hold  -end 1 \
     -from [get_clocks {*|pll|pll_inst|altera_pll_i|general[1].*|divclk}] \
     -to   [get_keepers {*sdram:sdram|sd_data[*]~reg0}]
+
+# ----------------------------------------------------------------------------
+# SCSI status-read multicycle — fixes the #3 cold-boot spontaneous reboot.
+# ----------------------------------------------------------------------------
+# The 68k reads the NCR5380 CSR (the BSY/REQ selection poll at $A0786A) as a
+# 6800-style VPA cycle: din is latched into tg68_din_r at s_state==6
+# (rtl/tg68k/tg68k.v:271), near the END of a long E-synced access (E ~ clk_sys/
+# 10..20). The combinational read cone — target `phase` reg -> bsy -> csr ->
+# ncr5380 rdata -> scsiDataOut -> cpuDataOut mux -> tg68_din — is therefore held
+# stable for MANY clk_sys periods before capture: a pure status read does NOT
+# advance the SCSI protocol, so the launch registers don't change during the
+# access. Yet the default single-cycle constraint leaves this ~30.5ns cone at
+# only +0.2..0.44ns slack = fit-sensitive, and in HW the CPU intermittently
+# reads BSY=0 while the target holds BSY=1 -> the SCSI Manager aborts -> a 2nd
+# SCSI bus reset -> the spontaneous reboot just before "Welcome to Macintosh"
+# (docs/handoff_cold_boot_reboot_2026-06-15.md).
+#
+# Relaxing ONLY the NCR5380/target-reg -> CPU-din-latch paths to 2 clk_sys
+# periods is physically correct (same basis as the kernel multicycle above) and
+# surgical: the ONLY paths from any ncr5380 register to tg68_din_r are SCSI read
+# data (rdata), all VPA/DTACK-paced. -from is the SCSI engine only (RAM/ROM and
+# other peripheral reads keep their own single-cycle -from); -to is the din latch
+# only (DTACK/DREQ/IRQ control never reaches tg68_din_r). Leaves the "must stay
+# single-cycle" CPU<->peripheral note above intact for every non-SCSI path.
+set_multicycle_path -setup -end 2 -from [get_keepers {*ncr5380*}] -to [get_keepers {*tg68_din_r*}]
+set_multicycle_path -hold  -end 1 -from [get_keepers {*ncr5380*}] -to [get_keepers {*tg68_din_r*}]
