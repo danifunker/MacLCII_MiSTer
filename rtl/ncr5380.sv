@@ -605,7 +605,12 @@ module ncr5380
 		genvar i;
 		for (i = 0; i < DEVS; i = i + 1) begin : target
 			// connect a target
-			scsi #(.ID(3'd6 - i[2:0])) target
+			// Boot disk = SCSI ID 0 (the Mac's conventional internal-drive ID),
+			// 2nd disk = ID 1. The old IDs 6/5 are LOWEST OS boot priority and a
+			// device at ID 6 is de-prioritized by the 7.x SCSI Manager, so 7.5.5
+			// would not boot from it (6.0.8's older SCSI Manager did). Phantom CD
+			// stays at ID 3 (future CD-ROM). Slot i -> SCSI ID i.
+			scsi #(.ID(i[2:0])) target
 			(
 				.clk    ( clk ),
 				.rst    ( scsi_rst ),
