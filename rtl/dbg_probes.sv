@@ -529,7 +529,7 @@ module dbg_probes (
     altsource_probe #(
         .instance_id ("PDRD"), .probe_width (32), .source_width(1),
         .sld_auto_instance_index ("YES")
-    ) cp_pdrd (.probe({walk_saw_b, 15'd0, walk_din_or}), .source(), .source_clk(clk), .source_ena(1'b1));  // BUILD#11 PDRD: [31]=din==000B seen during walk read | [15:0]=OR of din over walk read
+    ) cp_pdrd (.probe(pdrd_r), .source(), .source_clk(clk), .source_ena(1'b1));  // restored: live {I/O rd addr field, data} (was walk din_or)
 
     // ---- PSCS: last SCSI register read + value (the poll target) ----------
     // {sdwr_seen[1:0], sdrd_seen[1:0], img_seen[1:0], 3'b0, last_reg[6:0],
@@ -554,7 +554,7 @@ module dbg_probes (
     altsource_probe #(
         .instance_id ("PSCS"), .probe_width (32), .source_width(1),
         .sld_auto_instance_index ("YES")
-    ) cp_pscs (.probe(c0), .source(), .source_clk(clk), .source_ena(1'b1));  // PSCS: newest write to $0FF720 {cpuAddr16,data} = CLOBBER
+    ) cp_pscs (.probe(pscs_r), .source(), .source_clk(clk), .source_ena(1'b1));  // restored: last SCSI reg read + img/sd flags (was $0FF720 clobber)
 
     // ---- PSC2: selection transaction visibility ---------------------------
     // scsi_dbg layout (ncr5380.sv): [15]=out_en [14]=SEL [13]=BSY
@@ -581,7 +581,7 @@ module dbg_probes (
     altsource_probe #(
         .instance_id ("PSC2"), .probe_width (32), .source_width(1),
         .sld_auto_instance_index ("YES")
-    ) cp_psc2 (.probe(c0_cpa), .source(), .source_clk(clk), .source_ena(1'b1));  // PSC2: full cpuAddr of newest write to $0FF720 = CLOBBER SOURCE
+    ) cp_psc2 (.probe(psc2_r), .source(), .source_clk(clk), .source_ena(1'b1));  // restored: selection transaction (was walk cpuAddr)
 
     // ---- PSC3: target phases + max-phase + io/sd handshake ----------------
     // LBMacTwo layout with the spare top nibble carrying the bus-reset count:
@@ -606,7 +606,7 @@ module dbg_probes (
     altsource_probe #(
         .instance_id ("PSC3"), .probe_width (32), .source_width(1),
         .sld_auto_instance_index ("YES")
-    ) cp_psc3 (.probe(wda_l), .source(), .source_clk(clk), .source_ena(1'b1));  // BUILD#9 PSC3: walker's last descriptor ADDR (cpu_pmmu_wda) — expect $9FEE40
+    ) cp_psc3 (.probe(psc3_r), .source(), .source_clk(clk), .source_ena(1'b1));  // restored: target phases + acks (was walker desc ADDR)
 
     // ---- PSCW / PSNC / PSWL: live SCSI engine snapshots (layouts in
     // ---- ncr5380.sv port comments; identical to lbmactwo) -----------------
@@ -620,17 +620,17 @@ module dbg_probes (
     altsource_probe #(
         .instance_id ("PSCW"), .probe_width (32), .source_width(1),
         .sld_auto_instance_index ("YES")
-    ) cp_pscw (.probe(c1_cpa), .source(), .source_clk(clk), .source_ena(1'b1));  // PSCW: full cpuAddr of prev write
+    ) cp_pscw (.probe(pscw_r), .source(), .source_clk(clk), .source_ena(1'b1));  // restored: write-stall snapshot (was walk cpuAddr)
 
     altsource_probe #(
         .instance_id ("PSNC"), .probe_width (32), .source_width(1),
         .sld_auto_instance_index ("YES")
-    ) cp_psnc (.probe({walk_seen, walk_sRAM, walk_sROM, walk_sVRAM, walk_sUnm, walk_busctl, walk_ramoe, walk_mbhi, 1'b0, walk_memaddr}), .source(), .source_clk(clk), .source_ena(1'b1));  // BUILD#10 PSNC: walk-read decode of $9FEE40 [31]=seen [30]=selRAM [29]=selROM [28]=selVRAM [27]=selUnmap [26]=busCtl [25]=ramOE_asserted [24]=mb_hi | [22:0]=memoryAddr
+    ) cp_psnc (.probe(psnc_r), .source(), .source_clk(clk), .source_ena(1'b1));  // restored: pseudo-DMA engine state (was walk-read decode)
 
     altsource_probe #(
         .instance_id ("PSWL"), .probe_width (32), .source_width(1),
         .sld_auto_instance_index ("YES")
-    ) cp_pswl (.probe(wdd_l), .source(), .source_clk(clk), .source_ena(1'b1));  // BUILD#9 PSWL: walker's last descriptor DATA (cpu_pmmu_wdd) — the value the walker actually got
+    ) cp_pswl (.probe(pswl_r), .source(), .source_clk(clk), .source_ena(1'b1));  // restored: IRQ/deferral machine (was walker desc DATA)
 
     // ---- PSC6: {bus-reset count + completion flags, last opcodes} ---------
     //   [31:24]=rst_count [23:20]=t1 hs2 [19:16]=t0 hs2
@@ -641,7 +641,7 @@ module dbg_probes (
     altsource_probe #(
         .instance_id ("PSC6"), .probe_width (32), .source_width(1),
         .sld_auto_instance_index ("YES")
-    ) cp_psc6 (.probe({16'd0, cw_cnt}), .source(), .source_clk(clk), .source_ena(1'b1));
+    ) cp_psc6 (.probe(psc6_r), .source(), .source_clk(clk), .source_ena(1'b1));  // restored: rst/completion + last opcodes (was cw_cnt)
 
     // (PASC/PAUD audio probes removed — re-add from git history if the sound
     // path needs JTAG visibility again.)
@@ -667,6 +667,6 @@ module dbg_probes (
     altsource_probe #(
         .instance_id ("PVID"), .probe_width (32), .source_width(1),
         .sld_auto_instance_index ("YES")
-    ) cp_pvid (.probe(rd_cpa), .source(), .source_clk(clk), .source_ena(1'b1));
+    ) cp_pvid (.probe(pvid_r), .source(), .source_clk(clk), .source_ena(1'b1));  // restored: video liveness (was walk rd_cpa)
 
 endmodule
