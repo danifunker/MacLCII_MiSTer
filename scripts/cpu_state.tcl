@@ -30,17 +30,37 @@ if {$dev eq ""} { puts "NO DEVICE — is the MiSTer on and the USB-Blaster cable
 
 set info [get_insystem_source_probe_instance_info -device_name $dev -hardware_name $hw]
 array set idx {}
-set i 0
 foreach inst $info {
-    set idx([lindex $inst 3]) $i
-    incr i
+    # Map name -> the instance's OWN index (field 0), NOT the list position:
+    # with >40 auto-indexed instances the info list order is not guaranteed.
+    set idx([lindex $inst 3]) [lindex $inst 0]
 }
+puts "probe instances: [llength $info]"
 
 proc rd {name} {
     global idx dev hw
     if {![info exists idx($name)]} { return -1 }
     set v [read_probe_data -instance_index $idx($name) -value_in_hex]
     scan $v %x n
+    return $n
+}
+
+# Wide-instance helpers (PFA0/PFA1/PFW0/PFJX/PFLX are >32-bit ISSP probes):
+# rdhex returns the raw hex string; wslice extracts field i of width nib
+# NIBBLES counting fields from the LSB (right) end, so leading-zero trimming
+# by the tool cannot shift the fields.
+proc rdhex {name} {
+    global idx dev hw
+    if {![info exists idx($name)]} { return "" }
+    return [read_probe_data -instance_index $idx($name) -value_in_hex]
+}
+proc wslice {hexstr i nib} {
+    set L [string length $hexstr]
+    set last [expr {$L - 1 - $i*$nib}]
+    if {$last < 0} { return 0 }
+    set first [expr {$last - $nib + 1}]
+    if {$first < 0} { set first 0 }
+    scan [string range $hexstr $first $last] %x n
     return $n
 }
 
@@ -127,6 +147,63 @@ elseif {($dfull & 0xFFE000) == 0xF26000} { set ddev "PseudoVIA" } \
 elseif {($dfull & 0xFFE000) == 0xF14000} { set ddev "ASC" } \
 elseif {($dfull & 0xFFE000) == 0xF16000} { set ddev "IWM" }
 puts [format "PDRD I/O read   : %06X (%s) = %04X" $dfull $ddev [expr {$drd&0xFFFF}]]
+
+# ---- PFLX: F-line (vector 11) trap capture — 7.x bad-F-line hunt -------------
+# One 160-bit instance: {meta, last_op, last_pc, first_op, first_pc}, LSB=first_pc.
+# meta={count[15:0],7'b0,first_ctx,7'b0,last_ctx}. ctx=1 ⟹ trap came from the
+# PMMU ext-word sub-decode (op/ext are the latched F-line pair). Cleared on CPU
+# reset (incl. Egret warm restarts).
+if {[info exists idx(PFLX)]} {
+    set lx [rdhex PFLX]
+    set fpc [wslice $lx 0 8]; set fop [wslice $lx 1 8]
+    set lpc [wslice $lx 2 8]; set lop [wslice $lx 3 8]
+    set e   [wslice $lx 4 8]
+    set fcnt [expr {($e>>16)&0xFFFF}]
+    if {$fcnt == 0} {
+        puts "PFLx F-line trap: (none since CPU reset)"
+    } else {
+        puts [format "PFLx F-line trap: count=%d" $fcnt]
+        puts [format "  first: pc=%08X op=%04X ext=%04X ctx=%d" \
+            $fpc [expr {($fop>>16)&0xFFFF}] [expr {$fop&0xFFFF}] [expr {($e>>8)&1}]]
+        puts [format "  last : pc=%08X op=%04X ext=%04X ctx=%d" \
+            $lpc [expr {($lop>>16)&0xFFFF}] [expr {$lop&0xFFFF}] [expr {$e&1}]]
+    }
+}
+
+# ---- PFA0/PFA1/PFW0/PFJX: fetch-history ring v2 — wild-jump catcher ----------
+# 16 entries: PFA0 = addrs 7..0 (256b), PFA1 = addrs 15..8, PFW0 = the 16
+# fetched words (256b). Freezes on the first code fetch below $400 after
+# ROM-home arming (cause=lowjump), or on the first F-line trap (cause=fline,
+# fallback). wp = oldest slot after freeze; the NEWEST entry is the killing
+# fetch (the vector-table target). PFJX = {meta, {src_word,tgt_word}, tgt, src}.
+if {[info exists idx(PFJX)]} {
+    set jx  [rdhex PFJX]
+    set src [wslice $jx 0 8]
+    set tgt [wslice $jx 1 8]
+    set jo  [wslice $jx 2 8]
+    set m   [wslice $jx 3 8]
+    set frozen [expr {($m>>20)&1}]
+    set armed  [expr {($m>>21)&1}]
+    set clow   [expr {($m>>22)&1}]
+    set cfl    [expr {($m>>23)&1}]
+    set wp     [expr {($m>>16)&0xF}]
+    set cause "-"
+    if {$clow} { set cause "lowjump" } elseif {$cfl} { set cause "fline" }
+    puts [format "PFJX fetch-hist : frozen=%d cause=%s armed=%d wp(oldest)=%d nonseq_jumps(wrap256)=%d" \
+        $frozen $cause $armed $wp [expr {$m&0xFF}]]
+    if {$frozen} {
+        set a0 [rdhex PFA0]; set a1 [rdhex PFA1]; set w0 [rdhex PFW0]
+        puts "  fetch history (oldest->newest)  addr: word"
+        for {set i 0} {$i < 16} {incr i} {
+            set slot [expr {($wp + $i) & 15}]
+            if {$slot < 8} { set a [wslice $a0 $slot 8] } else { set a [wslice $a1 [expr {$slot-8}] 8] }
+            set w [wslice $w0 $slot 4]
+            puts [format "    %2d: %08X: %04X" $i $a $w]
+        }
+        puts [format "  last jump: src=%08X (word %04X) -> tgt=%08X (word %04X)" \
+            $src [expr {($jo>>16)&0xFFFF}] $tgt [expr {$jo&0xFFFF}]]
+    }
+}
 
 # ---- PFR: restart flight recorder (rev 2: BERR/RTE capture) ------------------
 if {[info exists idx(PFR0)]} {

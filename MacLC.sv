@@ -732,6 +732,9 @@ module emu
 	wire [31:0] cpu_pmmu_tc, cpu_pmmu_crp, cpu_pmmu_wda, cpu_pmmu_wdd, cpu_pmmu_st;  // MMU-input forensics
 	// cpu_walk_cycle is declared up near the dtack glue (it gates the walk-read DTACK)
 	wire [15:0] cpu_exe_opcode, cpu_berr_opcode;
+	// F-line trap capture (PFLx probes below)
+	wire [31:0] cpu_fline_first_pc, cpu_fline_first_op, cpu_fline_last_pc,
+	            cpu_fline_last_op, cpu_fline_meta;
 	tg68k tg68k (
 		.clk        ( clk_sys      ),
 		.reset      ( !_cpuReset ),
@@ -776,7 +779,12 @@ module emu
 				.dbg_pmmu_wda_o     ( cpu_pmmu_wda ),
 				.dbg_pmmu_wdd_o     ( cpu_pmmu_wdd ),
 				.dbg_pmmu_st_o      ( cpu_pmmu_st ),
-				.dbg_walk_cycle_o   ( cpu_walk_cycle )
+				.dbg_walk_cycle_o   ( cpu_walk_cycle ),
+				.dbg_fline_first_pc ( cpu_fline_first_pc ),
+				.dbg_fline_first_op ( cpu_fline_first_op ),
+				.dbg_fline_last_pc  ( cpu_fline_last_pc  ),
+				.dbg_fline_last_op  ( cpu_fline_last_op  ),
+				.dbg_fline_meta     ( cpu_fline_meta     )
 			);
 	
 	// On-chip framebuffer (BRAM): packed CPU VRAM write mirror (port A) +
@@ -998,6 +1006,123 @@ module emu
 		.sld_auto_instance_index ("YES")
 	) cp_prst (.probe({reboot_cnt, first_src, reset_src,
 	                   prst_armed, first_rst_seen, first_nreset, n_reset, 4'd0}),
+	           .source(), .source_clk(clk_sys), .source_ena(1'b1));
+
+	// --- PFHx/PFOx/PFJx: instruction-fetch history v2 — WILD-JUMP catcher ---
+	// 16-deep ring of {full addr[31:0], fetched word[15:0]} for FC=2'b10 code
+	// fetches (address at AS fall; the word is re-sampled every clk while the
+	// cycle is live, so the slot holds the settled bus data when AS rises).
+	// FREEZE (primary): the FIRST code fetch into the exception vector table
+	// (full 32-bit addr < $400) after fh_armed — armed by the first code fetch
+	// from ROM home $Axxxxx, because the reset-overlay path legitimately
+	// executes at $2A-$B4 before jumping to ROM home (MAME trace lines 1-12).
+	// FREEZE (fallback): first F-line trap, as before, for non-low-jump bombs.
+	// After freeze: ring holds the killing fetch + the 15 before it; fh_wp =
+	// slot of the OLDEST entry. PFJS/PFJT = last non-sequential fetch pair
+	// (full 32-bit); PFJO = {word fetched at PFJS, word fetched at PFJT}.
+	// Readout: PFA0/PFA1 = ring addrs (wide), PFW0 = fetched words, PFJX =
+	// {meta, jump words, tgt, src} — see the consolidated instances below.
+	reg [31:0] fh_ring_a [0:15];
+	reg [15:0] fh_ring_o [0:15];
+	reg [3:0]  fh_wp = 4'd0;
+	reg        fh_frozen = 1'b0;
+	reg        fh_armed = 1'b0;
+	reg        fh_cause_low = 1'b0, fh_cause_fline = 1'b0;
+	reg        fh_as_d = 1'b1;
+	reg        fh_pend = 1'b0;           // code-fetch cycle live: keep sampling its data
+	reg [3:0]  fh_pend_slot = 4'd0;
+	reg        fh_pend_tgt = 1'b0;       // live cycle is a jump target: mirror word into PFJO
+	reg [31:0] fh_prev_pc = 32'd0, fh_jump_src = 32'd0, fh_jump_tgt = 32'd0;
+	reg [15:0] fh_jump_src_op = 16'd0, fh_jump_tgt_op = 16'd0;
+	reg [7:0]  fh_jumps = 8'd0;
+	wire        fh_ifetch = (cpuFC[1:0] == 2'b10) && fh_as_d && !_cpuAS; // AS fell, code fetch
+	wire [15:0] fh_din = slot_space ? 16'hFFFF : dataControllerDataOut;  // mirrors tg68k .din
+	always @(posedge clk_sys) begin
+		fh_as_d <= _cpuAS;
+		if (!_cpuReset) begin
+			fh_wp <= 4'd0; fh_frozen <= 1'b0; fh_armed <= 1'b0;
+			fh_cause_low <= 1'b0; fh_cause_fline <= 1'b0;
+			fh_pend <= 1'b0; fh_pend_tgt <= 1'b0;
+			fh_prev_pc <= 32'd0; fh_jumps <= 8'd0;
+		end else begin
+			// Live-cycle data sampling — runs even after freeze so the KILLING
+			// fetch's word (the vector-table entry executed as code) lands too.
+			if (fh_pend) begin
+				if (!_cpuAS) begin
+					fh_ring_o[fh_pend_slot] <= fh_din;
+					if (fh_pend_tgt) fh_jump_tgt_op <= fh_din;
+				end else begin
+					fh_pend <= 1'b0; fh_pend_tgt <= 1'b0;
+				end
+			end
+			if (!fh_frozen) begin
+				if (fh_ifetch) begin
+					if (cpuAddr[23:20] == 4'hA) fh_armed <= 1'b1;
+					fh_ring_a[fh_wp] <= cpuAddr;
+					fh_pend <= 1'b1; fh_pend_slot <= fh_wp; fh_pend_tgt <= 1'b0;
+					fh_wp <= fh_wp + 4'd1;
+					if (cpuAddr != fh_prev_pc + 32'd2 && cpuAddr != fh_prev_pc) begin
+						fh_jump_src    <= fh_prev_pc;
+						fh_jump_tgt    <= cpuAddr;
+						fh_jump_src_op <= fh_ring_o[fh_wp - 4'd1]; // prev fetch, cycle done
+						fh_pend_tgt    <= 1'b1;
+						fh_jumps       <= fh_jumps + 8'd1;
+					end
+					fh_prev_pc <= cpuAddr;
+					if (fh_armed && cpuAddr < 32'h00000400) begin
+						fh_frozen <= 1'b1; fh_cause_low <= 1'b1;
+					end
+				end
+				if (cpu_fline_meta[31:16] != 16'd0) begin
+					fh_frozen <= 1'b1; fh_cause_fline <= 1'b1;
+				end
+			end
+		end
+	end
+	// Consolidated WIDE ISSP instances (2026-07-02): the 64-instance deck
+	// corrupted the sld-hub enumeration (6 phantom nodes with garbage widths,
+	// every read returning all-ones) — quartus_stp 17.0 handled the previous
+	// ~41-instance deck fine. ISSP probes go up to 511 bits, so the ring packs
+	// into 4 instances. scripts/cpu_state.tcl slices the wide hex strings.
+	// PFA0 = ring addrs 7..0 (LSB 32 bits = entry 0), PFA1 = addrs 15..8,
+	// PFW0 = the 16 fetched words (LSB 16 bits = entry 0),
+	// PFJX = {meta[31:0], jump words[31:0], tgt[31:0], src[31:0]} (LSB = src);
+	//        meta = {8'd0, cause_fline, cause_low, armed, frozen, wp[3:0], 8'd0, jumps[7:0]},
+	//        jump words = {src_word[15:0], tgt_word[15:0]}.
+	altsource_probe #(
+		.instance_id ("PFA0"), .probe_width (256), .source_width(1), .sld_auto_instance_index ("YES")
+	) cp_pfa0 (.probe({fh_ring_a[7], fh_ring_a[6], fh_ring_a[5], fh_ring_a[4],
+	                   fh_ring_a[3], fh_ring_a[2], fh_ring_a[1], fh_ring_a[0]}),
+	           .source(), .source_clk(clk_sys), .source_ena(1'b1));
+	altsource_probe #(
+		.instance_id ("PFA1"), .probe_width (256), .source_width(1), .sld_auto_instance_index ("YES")
+	) cp_pfa1 (.probe({fh_ring_a[15], fh_ring_a[14], fh_ring_a[13], fh_ring_a[12],
+	                   fh_ring_a[11], fh_ring_a[10], fh_ring_a[9],  fh_ring_a[8]}),
+	           .source(), .source_clk(clk_sys), .source_ena(1'b1));
+	altsource_probe #(
+		.instance_id ("PFW0"), .probe_width (256), .source_width(1), .sld_auto_instance_index ("YES")
+	) cp_pfw0 (.probe({fh_ring_o[15], fh_ring_o[14], fh_ring_o[13], fh_ring_o[12],
+	                   fh_ring_o[11], fh_ring_o[10], fh_ring_o[9],  fh_ring_o[8],
+	                   fh_ring_o[7],  fh_ring_o[6],  fh_ring_o[5],  fh_ring_o[4],
+	                   fh_ring_o[3],  fh_ring_o[2],  fh_ring_o[1],  fh_ring_o[0]}),
+	           .source(), .source_clk(clk_sys), .source_ena(1'b1));
+	altsource_probe #(
+		.instance_id ("PFJX"), .probe_width (128), .source_width(1), .sld_auto_instance_index ("YES")
+	) cp_pfjx (.probe({8'd0, fh_cause_fline, fh_cause_low, fh_armed, fh_frozen, fh_wp, 8'd0, fh_jumps,
+	                   fh_jump_src_op, fh_jump_tgt_op, fh_jump_tgt, fh_jump_src}),
+	           .source(), .source_clk(clk_sys), .source_ena(1'b1));
+
+	// --- PFLx: F-line (vector 11) trap capture — System 7.x bad-F-line hunt ---
+	// PFLX (160b) = {meta, last_op, last_pc, first_op, first_pc}; ops are
+	// {op[15:0], ext[15:0]} pairs;
+	// meta = {count[15:0], 7'b0, first_ctx, 7'b0, last_ctx}; ctx=1 means the trap
+	// came from the PMMU ext-word sub-decode (op/ext are the latched F-line pair).
+	// Consolidated into one wide instance (deck-size fix, see PFA0 comment):
+	// PFLX = {meta, last_op, last_pc, first_op, first_pc} (LSB 32 = first_pc).
+	altsource_probe #(
+		.instance_id ("PFLX"), .probe_width (160), .source_width(1), .sld_auto_instance_index ("YES")
+	) cp_pflx (.probe({cpu_fline_meta, cpu_fline_last_op, cpu_fline_last_pc,
+	                   cpu_fline_first_op, cpu_fline_first_pc}),
 	           .source(), .source_clk(clk_sys), .source_ena(1'b1));
 
 	dbg_probes probes(

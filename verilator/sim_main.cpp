@@ -1241,7 +1241,7 @@ int main(int argc, char** argv, char** env) {
 	}
 
 #ifndef DISABLE_AUDIO
-	audio.Initialise();
+	if (!headless) audio.Initialise();
 #endif
 
 	// Set up input module
@@ -1276,8 +1276,16 @@ int main(int argc, char** argv, char** env) {
 	input.SetMapping(input_menu, SDL_SCANCODE_M);
 #endif
 
-	// Setup video output
-	if (video.Initialise(windowTitle) == 1) { return 1; }
+	// Setup video output. Headless: allocate ONLY the pixel buffer that
+	// video.Clock() fills and save_screenshot() reads — no SDL, no ImGui, no
+	// window. (The --headless flag existed but was never wired; it crashed in
+	// ImGui::NewFrame because SDL/ImGui were still initialised uncondition-
+	// ally. Long sim runs must survive WSLg display outages.)
+	if (headless) {
+		output_ptr = (uint32_t*)malloc(video.output_width * video.output_height * 4);
+		if (!output_ptr) { fprintf(stderr, "headless: framebuffer alloc failed\n"); return 1; }
+		fprintf(stderr, "Headless mode: no window; screenshots + stop-at-frame active\n");
+	} else if (video.Initialise(windowTitle) == 1) { return 1; }
 
 	// Open CPU trace file
 	if (cpu_trace_enable) {
@@ -1352,6 +1360,26 @@ int main(int argc, char** argv, char** env) {
 	bool done = false;
 	while (!done)
 	{
+		// Headless fast path: run the sim, honor screenshots + stop-at-frame,
+		// touch nothing SDL/ImGui.
+		if (headless) {
+			bool took_ss = false;
+			if (screenshot_mode) {
+				auto it = std::find(screenshot_frames.begin(), screenshot_frames.end(), video.count_frame);
+				if (it != screenshot_frames.end()) {
+					save_screenshot(video.count_frame);
+					screenshot_frames.erase(it);
+					took_ss = true;
+				}
+			}
+			if (stop_at_frame_enabled && video.count_frame >= stop_at_frame) {
+				printf("Reached stop frame %d%s, exiting...\n", stop_at_frame,
+				       took_ss ? " after taking screenshot" : "");
+				break;
+			}
+			if (run_enable) { for (int step = 0; step < batchSize; step++) { verilate(); } }
+			continue;
+		}
 		sdl_mouse_dx = 0;
 		sdl_mouse_dy = 0;
 		SDL_Event event;
@@ -1586,10 +1614,12 @@ int main(int argc, char** argv, char** env) {
 	// --------------------
 
 #ifndef DISABLE_AUDIO
-	audio.CleanUp();
+	if (!headless) audio.CleanUp();
 #endif
-	video.CleanUp();
-	input.CleanUp();
+	if (!headless) {
+		video.CleanUp();
+		input.CleanUp();
+	}
 
 	return 0;
 }

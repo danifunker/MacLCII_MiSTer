@@ -545,6 +545,12 @@ architecture logic of TG68KdotC_Kernel is
 	signal rte_mmu_fix_ccr_value : std_logic_vector(7 downto 0) := (others => '0');
 	signal rte_mmu_fix_dest : std_logic_vector(2 downto 0) := (others => '0');
 	signal rte_mmu_fix_size : std_logic_vector(1 downto 0) := (others => '0');
+	-- CONTINUE-PAST CCR FIX (2026-07-02): opcode classes + static-BTST bit number
+	-- recovered from the frame at rte5 (stacked in the +$14 high word).
+	signal rte_mmu_fix_bitnr : std_logic_vector(2 downto 0) := (others => '0');
+	signal rte_mmu_fix_is_move : std_logic;
+	signal rte_mmu_fix_is_tst  : std_logic;
+	signal rte_mmu_fix_is_btst : std_logic;
 	signal rte_format_b_version_error : std_logic := '0';
 	signal rte_fmt_a_capture_active : std_logic := '0';
 	signal rte_fmt_a_long_index : integer range 0 to 7 := 0;
@@ -589,6 +595,32 @@ architecture logic of TG68KdotC_Kernel is
 	-- the rte_mmu_fix register writeback gate decodes the right opcode.
 	signal berr_setup_opcode : std_logic_vector(15 downto 0) := (others => '0');
 	signal berr_setup_exe_pc : std_logic_vector(31 downto 0) := (others => '0');
+	-- CONTINUE-PAST FIX v3 (2026-07-01): berr_bench proved the v2 setstate="01"
+	-- latches go STALE for the real OS probe sequences (lea/moveq/move.l back to
+	-- back: register-only instructions never pass setstate="01", so the latches
+	-- still hold an older instruction -> stacked PC one instruction short -> the
+	-- DF-cleared RTE re-runs the probe -> vector-2 storm; and the $14 opcode
+	-- stash held the stale opcode -> rte_mmu_fix writeback gate never fired).
+	-- v3 captures opcode + opcode_pc at the external-BERR FIRST-FIRE cycle
+	-- (same latch point as berr_external_rw/fc/addr, BUG #431/#434): at that
+	-- moment the faulting instruction is still the EXECUTING one — the 4E71
+	-- opcode-clobber only happens later, when the trap dispatches.
+	signal berr_capture_opcode : std_logic_vector(15 downto 0) := (others => '0');
+	signal berr_capture_pc     : std_logic_vector(31 downto 0) := (others => '0');
+	-- CONTINUE-PAST FIX v4 (2026-07-02): the prefetch pointer TG68_PC captured at
+	-- external-BERR first-fire. berr_bench proved v3's EA-mode length reconstruction
+	-- is wrong for two-word opcodes (btst #imm,(An) is 4 bytes but EA mode 010 ->
+	-- v3 stacked +2 -> resumed mid-instruction -> derail). At first-fire TG68_PC is
+	-- EXACTLY the next-instruction PC + 2 (one prefetched word) for every faulting
+	-- read form the OS validators use, so resume = berr_capture_nextpc - 2, with no
+	-- length decode. (See docs/findings_fline_71_oracle_2026-07-01.md.)
+	signal berr_capture_nextpc : std_logic_vector(31 downto 0) := (others => '0');
+	-- CONTINUE-PAST CCR FIX (2026-07-02): static BTST #imm,<mem> bit number,
+	-- latched from sndOPC at fault first-fire (the immediate is still there:
+	-- nothing refetches sndOPC between the ext-word fetch and the EA read).
+	-- Stacked into the frame +$14 high word (bits 18:16) and recovered at rte5,
+	-- so it round-trips through the frame like the opcode (nesting-safe).
+	signal berr_capture_bitnr : std_logic_vector(2 downto 0) := (others => '0');
 	signal berr_ssw          : std_logic_vector(15 downto 0);  -- Special Status Word
 	signal berr_data_out_saved : std_logic_vector(31 downto 0);  -- Data output buffer saved at berr dispatch
 	signal berr_long_frame   : std_logic;  -- MC68030 bus fault frame choice: 0=Format $A, 1=Format $B
@@ -1567,7 +1599,39 @@ ALU: TG68K_ALU
 	END PROCESS;
 
 	rte_mmu_fix_dest <= rte_mmu_fix_opcode(11 downto 9);
-	rte_mmu_fix_size <= "00" when rte_mmu_fix_opcode(15 downto 12) = "0001" else
+	-- CONTINUE-PAST opcode classes (CCR FIX 2026-07-02): the OS BERR-probe
+	-- validators use MOVE/MOVEA (register loads), TST.B, and static BTST #imm
+	-- reads. A real 68030 replays the faulted cycle from the handler-stuffed
+	-- DIB, which also rewrites CCR; TG68 instead computed TST/BTST flags from
+	-- the junk bus data of the ABORTED cycle (berr_bench proves it), so the
+	-- validator's following Bcc took a garbage direction -> wrong hardware
+	-- verdict -> garbage handle -> wild jump (the 7.1 "bad F-Line" bomb path).
+	-- MOVE/MOVEA: register writeback (+ MOVE-rule CCR for Dn destinations).
+	-- TST: MOVE-rule CCR only. BTST: Z only, N/V/C/X keep fault-time values.
+	rte_mmu_fix_is_move <= '1' when
+		(rte_mmu_fix_opcode(8 downto 6) = "000" AND
+		 (rte_mmu_fix_opcode(15 downto 12) = "0001" OR
+		  rte_mmu_fix_opcode(15 downto 12) = "0010" OR
+		  rte_mmu_fix_opcode(15 downto 12) = "0011")) OR
+		(rte_mmu_fix_opcode(8 downto 6) = "001" AND
+		 (rte_mmu_fix_opcode(15 downto 12) = "0010" OR
+		  rte_mmu_fix_opcode(15 downto 12) = "0011"))
+		else '0';
+	-- TST.B/W/L <ea> ($4Axx, size /= "11": size 11 is TAS/ILLEGAL)
+	rte_mmu_fix_is_tst <= '1' when
+		rte_mmu_fix_opcode(15 downto 8) = x"4A" AND
+		rte_mmu_fix_opcode(7 downto 6) /= "11"
+		else '0';
+	-- static BTST #imm,<ea> only ($0800 family). The dynamic BTST Dn,<ea> form
+	-- is NOT fixed up (its bit number lives in a register not reliably
+	-- re-readable at RTE time; no ROM/OS validator uses it).
+	rte_mmu_fix_is_btst <= '1' when
+		rte_mmu_fix_opcode(15 downto 6) = "0000100000"
+		else '0';
+	rte_mmu_fix_size <=
+		rte_mmu_fix_opcode(7 downto 6) when rte_mmu_fix_is_tst = '1' else
+		"00" when rte_mmu_fix_is_btst = '1' else       -- memory bit ops are byte
+		"00" when rte_mmu_fix_opcode(15 downto 12) = "0001" else
 	                   "10" when rte_mmu_fix_opcode(15 downto 12) = "0010" else
 	                   "01";
 	rte_fmt_a_replay_needed <= '1' when
@@ -1597,29 +1661,39 @@ ALU: TG68K_ALU
 		rte_mmu_fix_ssw(8) = '0' AND
 		rte_mmu_fix_ssw(7) = '0' AND
 		rte_mmu_fix_ssw(6) = '1' AND
-		-- Source EA: (An) [mode 010] OR (d16,An) [mode 101] -- the two Mac OS
-		-- handle-probe forms (movea.l (a1),a0 and move.l $38(a6),d0). Both leave a
-		-- clean DIB at frame+$2C and have no EA-register write-back side effects.
-		(rte_mmu_fix_opcode(5 downto 3) = "010" OR
-		 rte_mmu_fix_opcode(5 downto 3) = "101") AND
-		-- MOVE.{B,W,L} to Dn (mode 000)
-		((rte_mmu_fix_opcode(8 downto 6) = "000" AND
-		  (rte_mmu_fix_opcode(15 downto 12) = "0001" OR
-		   rte_mmu_fix_opcode(15 downto 12) = "0010" OR
-		   rte_mmu_fix_opcode(15 downto 12) = "0011")) OR
-		-- MOVEA.{W,L} to An (mode 001, no byte form)
-		 (rte_mmu_fix_opcode(8 downto 6) = "001" AND
-		  (rte_mmu_fix_opcode(15 downto 12) = "0010" OR
-		   rte_mmu_fix_opcode(15 downto 12) = "0011")))
+		-- MOVE/MOVEA register loads + the CCR-only validator reads (TST, static
+		-- BTST). CCR FIX 2026-07-02: TST/BTST added — they take the CCR path
+		-- below, never the register writeback (that one is gated on is_move).
+		-- v6 EA-mode widening (2026-07-02): the v5 HW test proved the 7.1 bomb
+		-- survives an (An)/(d16,An)-only gate, so the OS probe deck is wider
+		-- than the two $A0DB6A forms. MOVE/MOVEA writeback: every
+		-- side-effect-free source EA — (An) 010, (d16,An) 101, (d8,An,Xn) 110,
+		-- abs/PC-rel 111 — EXCLUDING (An)+ 011 / -(An) 100 (their An update is
+		-- part of the faulted instruction, not ours to redo) and register-direct
+		-- 000/001 (cannot data-fault; refuse bogus frames). TST/BTST are
+		-- CCR-only (no writeback, no EA side effect): no mode gate needed.
+		((rte_mmu_fix_is_move = '1' AND
+		  rte_mmu_fix_opcode(5 downto 3) /= "000" AND
+		  rte_mmu_fix_opcode(5 downto 3) /= "001" AND
+		  rte_mmu_fix_opcode(5 downto 3) /= "011" AND
+		  rte_mmu_fix_opcode(5 downto 3) /= "100") OR
+		 rte_mmu_fix_is_tst = '1' OR rte_mmu_fix_is_btst = '1')
 		else '0';
 	rte_mmu_fix_commit <= rte_mmu_fix_write AND clkena_lw;
 	rte_mmu_fix_ccr_update <= '1' when rte_mmu_fix_commit = '1' AND
-		rte_mmu_fix_opcode(8 downto 6) = "000" else '0';
+		(rte_mmu_fix_is_tst = '1' OR rte_mmu_fix_is_btst = '1' OR
+		 (rte_mmu_fix_is_move = '1' AND rte_mmu_fix_opcode(8 downto 6) = "000")) else '0';
 
-	PROCESS (Flags, rte_mmu_fix_size, rte_mmu_fix_input_buffer)
+	PROCESS (Flags, rte_mmu_fix_size, rte_mmu_fix_input_buffer, rte_mmu_fix_is_btst, rte_mmu_fix_bitnr)
 	BEGIN
+		IF rte_mmu_fix_is_btst = '1' THEN
+			-- BTST: Z from the DIB bit; N/V/C/X keep the fault-time values (Flags
+			-- holds the frame-restored CCR here — directSR already ran at rte1).
+			rte_mmu_fix_ccr_value <= Flags(7 downto 0);
+			rte_mmu_fix_ccr_value(2) <= NOT rte_mmu_fix_input_buffer(conv_integer(rte_mmu_fix_bitnr));
+		ELSE
 		rte_mmu_fix_ccr_value <= (others => '0');
-		rte_mmu_fix_ccr_value(4) <= Flags(4); -- MOVE preserves X and clears V/C.
+		rte_mmu_fix_ccr_value(4) <= Flags(4); -- MOVE/TST preserve X and clear V/C.
 		CASE rte_mmu_fix_size IS
 			WHEN "00" =>
 				rte_mmu_fix_ccr_value(3) <= rte_mmu_fix_input_buffer(7);
@@ -1637,6 +1711,7 @@ ALU: TG68K_ALU
 					rte_mmu_fix_ccr_value(2) <= '1';
 				END IF;
 		END CASE;
+		END IF;
 	END PROCESS;
 
 PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, memread, memmask, data_read)
@@ -1766,6 +1841,7 @@ PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, me
 				rte_mmu_fix_ssw <= (others => '0');
 				rte_mmu_fix_opcode <= (others => '0');
 				rte_mmu_fix_input_buffer <= (others => '0');
+				rte_mmu_fix_bitnr <= (others => '0');
 				rte_format_b_version_error <= '0';
 			ELSIF clkena_lw='1' THEN
 				IF trapmake='1' THEN
@@ -1795,6 +1871,7 @@ PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, me
 						rte_mmu_fix_ssw <= (others => '0');
 						rte_mmu_fix_opcode <= (others => '0');
 						rte_mmu_fix_input_buffer <= (others => '0');
+						rte_mmu_fix_bitnr <= (others => '0');
 					ELSE
 						rte_mmu_fix_capture_active <= '0';
 						rte_mmu_fix_long_index <= 0;
@@ -1805,6 +1882,7 @@ PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, me
 							rte_mmu_fix_ssw <= data_read(15 downto 0);      -- SP+$0A after unwind starts at $08 longword
 						WHEN 3 =>
 							rte_mmu_fix_opcode <= data_read(15 downto 0);   -- SP+$14 low word
+							rte_mmu_fix_bitnr  <= data_read(18 downto 16);  -- static-BTST bit number (CCR FIX)
 						WHEN 9 =>
 							rte_mmu_fix_input_buffer <= data_read;           -- SP+$2C data input buffer
 						WHEN OTHERS =>
@@ -1985,7 +2063,11 @@ PROCESS (clk, regfile, RDindex_A, RDindex_B, exec, rte_mmu_fix_commit, rte_mmu_f
 							regfile(conv_integer(moves_reg)) <= data_read;
 					END CASE;
 				END IF;
-				IF rte_mmu_fix_commit = '1' THEN
+				-- CCR FIX 2026-07-02: register writeback is MOVE/MOVEA-only. TST/BTST
+				-- now also commit (for their CCR) but must NOT write a register —
+				-- their bits 11:9 are not a destination field (TST $4A10 would
+				-- smash D5, BTST $0810 would smash D4).
+				IF rte_mmu_fix_commit = '1' AND rte_mmu_fix_is_move = '1' THEN
 					IF rte_mmu_fix_opcode(8 downto 6) = "001" THEN
 						-- MOVEA to An: always 32-bit write, sign-extend for word
 						IF rte_mmu_fix_size = "01" THEN  -- MOVEA.W: sign-extend 16->32
@@ -2453,7 +2535,14 @@ PROCESS (clk)
 				--   5. micro_state=trap0, useStackframe2=1 -> $2xxx fmt/vec   (role B)
 				--   6. micro_state=trap0 (else)            -> $0xxx fmt/vec   (role B)
 				--   7. micro_state=int3                    -> $1xxx fmt/vec   (role B, Fmt$1 throwaway)
-				IF writePC='1' THEN
+				-- 7.1 WILD-RTS FIX part 2 (2026-07-02): hold data_write_tmp while a
+				-- CPU data access is stalled on a PMMU walk (pmmu_busy & state(1)) —
+				-- the beats of a stalled longword push must not re-sample a moving
+				-- source (writePC follows the live TG68_PC). Mirrors the June
+				-- memaddr/use_base hold in the address datapath.
+				IF pmmu_busy='1' AND state(1)='1' THEN
+					data_write_tmp <= data_write_tmp;
+				ELSIF writePC='1' THEN
 					-- Priority 1: explicit PC push (trap0/1 68000-style, int4 Fmt$1 PC,
 					-- JSR/BSR target, DIV0 return PC, etc.)
 					data_write_tmp <= TG68_PC;
@@ -2532,9 +2621,11 @@ PROCESS (clk)
 				ELSIF micro_state = berr2 THEN
 					data_write_tmp <= berr_data_out_saved;  -- Data output buffer ($18)
 				ELSIF micro_state = berr3 THEN
-					-- $14: Current instruction opcode in high word (matches real 68030
-					-- "internal register, opcode of faulted bus cycle" field)
-					data_write_tmp <= last_opc_read(15 downto 0) & berr_opcode_saved;
+					-- $14: faulted-instruction opcode in the LOW word ($16); bits 18:16
+					-- of the long carry the static-BTST bit number for the RTE-side CCR
+					-- rebuild (CCR FIX 2026-07-02 — the high word was last_opc_read
+					-- cosmetics; nothing consumes it).
+					data_write_tmp <= "0000000000000" & berr_capture_bitnr & berr_opcode_saved;
 				ELSIF micro_state = berr4 THEN
 					data_write_tmp <= berr_fault_addr;  -- Data cycle fault address ($10)
 				ELSIF micro_state = berr5 THEN
@@ -3281,6 +3372,10 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 					berr_opcode_saved <= (others => '0');
 					berr_setup_opcode <= (others => '0');
 					berr_setup_exe_pc <= (others => '0');
+					berr_capture_opcode <= (others => '0');
+					berr_capture_pc <= (others => '0');
+					berr_capture_nextpc <= (others => '0');
+					berr_capture_bitnr <= (others => '0');
 					berr_ssw <= (others => '0');
 					berr_data_out_saved <= (others => '0');
 					berr_long_frame <= '0';
@@ -3358,7 +3453,20 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 						TG68_PC <= data_read;
 					ELSIF exec(ea_to_pc)='1' THEN
 						TG68_PC <= addr;
-					ELSIF (((state ="00") AND pmmu_busy='0') OR TG68_PC_brw = '1') AND stop='0'
+					-- 7.1 WILD-RTS FIX (2026-07-02): gate the TG68_PC_brw redirect on
+				-- pmmu_busy='0' UNIFORMLY, like the sequential-fetch arm. The PMMU
+				-- retrofit guarded only (state="00"); the branch redirect kept firing
+				-- on clkena_in edges while a walk stall froze clkena_lw (micro_state +
+				-- data_write_tmp). For a bsr.w whose displacement word ends a page,
+				-- the NEXT-page prefetch walk is already stalling at bsr2, so the
+				-- redirect moved TG68_PC away BEFORE the push-data capture -> the
+				-- pushed return address was torn/zero, and the callee's rts popped
+				-- garbage (System 7.1 "bad F-Line" bomb; berr_bench probe #13).
+				-- TG68_PC_brw is combinational from the frozen micro_state, so it
+				-- stays asserted through the stall and the redirect commits on the
+				-- first non-busy edge — same edge the push data samples, restoring
+				-- the designed atomic handoff.
+				ELSIF (((state ="00") OR TG68_PC_brw = '1') AND pmmu_busy='0') AND stop='0'
 					      AND NOT (micro_state = pmmu_ld_nn AND nextpass = '1') THEN
 						TG68_PC <= TG68_PC_add;
 					END IF;
@@ -3543,6 +3651,15 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 								-- early mark, the first bus-error frame stack write sees the
 								-- stale fault for one cycle and trips the double-fault guard.
 								pmmu_fault_dispatched <= '1';
+								-- CCR FIX: latch the static-BTST bit number for PMMU-fault
+								-- frames too (same in-flight instruction, sndOPC still live).
+								berr_capture_bitnr <= sndOPC(2 downto 0);
+								-- v6: latch the opcode/pc too — the PMMU-fault frame build
+								-- also stacks berr_capture_opcode at +$14; without this it
+								-- held the value from an OLDER external fault, so the RTE
+								-- writeback gate decoded a stale opcode for PMMU faults.
+								berr_capture_opcode <= opcode;
+								berr_capture_pc     <= opcode_pc;
 							else
 								make_berr <= (berr OR make_berr OR pmmu_walker_berr);
 							end if;
@@ -3571,6 +3688,15 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 							berr_external_fc <= fc_internal;
 							berr_external_datatype <= datatype;  -- BUG #433b FIX: latch at BERR first-fire
 							berr_external_addr <= addr;          -- BUG #434 FIX: latch fault addr at BERR first-fire (state="11")
+							-- CONTINUE-PAST FIX v3: capture the EXECUTING instruction here.
+							-- opcode/opcode_pc still hold the faulting instruction at first-fire
+							-- (the trap dispatch's 4E71 clobber comes later); the v2 setstate="01"
+							-- latches go stale when the preceding instructions are register-only.
+							berr_capture_opcode <= opcode;
+							berr_capture_pc     <= opcode_pc;
+							berr_capture_nextpc <= TG68_PC;   -- v4: prefetch ptr = next-instr + 2
+							-- CCR FIX: static-BTST bit number (sndOPC still holds the imm word)
+							berr_capture_bitnr  <= sndOPC(2 downto 0);
 						end if;
 					else
 						-- MC68030 Double bus fault detection: bus error/fault during bus error processing
@@ -3729,14 +3855,19 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 								-- old instr_boundary_pc — harmless, since their stacked PC is unused.
 								IF pmmu_fault = '1' OR berr_pmmu_fault_valid = '1' OR make_mmu_berr = '1' THEN
 									berr_frame_pc <= TG68_PC;
-								ELSIF berr_setup_opcode(5 downto 3) = "101" THEN
-									berr_frame_pc <= berr_setup_exe_pc + 4;   -- (d16,An): opcode + disp word
-								ELSIF berr_setup_opcode(5 downto 3) = "010" THEN
-									berr_frame_pc <= berr_setup_exe_pc + 2;   -- (An): opcode only
 								ELSE
-									berr_frame_pc <= instr_boundary_pc;       -- fallback (non-probe forms)
+									-- CONTINUE-PAST FIX v4 (2026-07-02): resume = the TRUE next-
+									-- instruction PC = the prefetch pointer captured at first-fire
+									-- minus one prefetched word. berr_bench proved the v3 EA-mode
+									-- length reconstruction is wrong for two-word opcodes (btst
+									-- #imm,(An) = 4 bytes but EA mode 010 -> v3 stacked +2 ->
+									-- resumed on the immediate word -> derail into the vector table
+									-- -> the $100 F-line bomb). TG68_PC at first-fire is next+2 for
+									-- every OS-validator read form (move.l(d16,An), movea.l(An),
+									-- tst.b(An), btst #imm,(An), abs) -> no length decode needed.
+									berr_frame_pc <= berr_capture_nextpc - 2;
 								END IF;
-								berr_opcode_saved <= berr_setup_opcode;
+								berr_opcode_saved <= berr_capture_opcode;
 								-- Save data output buffer for berr2 (data being written at fault time)
 								berr_data_out_saved <= data_write_tmp;
 								berr_ssw <= (others => '0');

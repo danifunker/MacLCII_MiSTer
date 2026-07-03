@@ -38,12 +38,17 @@ foreach inst $info {
     set nm [lindex $inst 3]
     if {$nm eq "PIFD"} { set idx(PIFD) $i }
     if {$nm eq "PDRD"} { set idx(PDRD) $i }
+    if {$nm eq "PADR"} { set idx(PADR) $i }
     incr i
 }
 if {![info exists idx(PIFD)]} { puts "NO PIFD probe"; exit 1 }
 
 start_insystem_source_probe -device_name $dev -hardware_name $hw
 for {set s 0} {$s < $n} {incr s} {
+    # JTAG-SAFETY: the DE10-Nano shares JTAG with the HPS; back-to-back
+    # In-System-Probe reads have crashed the whole MiSTer (2026-06-29).
+    # Space every iteration; keep n modest (<=32).
+    after 250
     set fp [read_probe_data -instance_index $idx(PIFD) -value_in_hex]
     scan $fp %x fpv
     puts [format "IFPAIR %04X %04X" [expr {($fpv >> 16) & 0xFFFF}] [expr {$fpv & 0xFFFF}]]
@@ -51,6 +56,11 @@ for {set s 0} {$s < $n} {incr s} {
         set dr [read_probe_data -instance_index $idx(PDRD) -value_in_hex]
         scan $dr %x drv
         puts [format "IORD %04X %04X" [expr {($drv >> 16) & 0xFFFF}] [expr {$drv & 0xFFFF}]]
+    }
+    if {[info exists idx(PADR)]} {
+        set ad [read_probe_data -instance_index $idx(PADR) -value_in_hex]
+        scan $ad %x adv
+        puts [format "CPUADDR %06X" [expr {$adv & 0xFFFFFF}]]
     }
 }
 end_insystem_source_probe -device_name $dev -hardware_name $hw

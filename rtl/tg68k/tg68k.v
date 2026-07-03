@@ -53,7 +53,18 @@ module tg68k (
 	output [31:0] dbg_pmmu_wda_o,       // last walk descriptor ADDRESS read
 	output [31:0] dbg_pmmu_wdd_o,       // last walk descriptor DATA read
 	output [31:0] dbg_pmmu_st_o,        // {11'b0, walk wstate[4:0], fault_status[15:0]}
-	output        dbg_walk_cycle_o      // BUILD#10: 1 while the PMMU walker is borrowing the bus
+	output        dbg_walk_cycle_o,     // BUILD#10: 1 while the PMMU walker is borrowing the bus
+	// F-line (vector 11) trap capture — System 7.x "bad F-Line instruction" hunt.
+	// Latches the FIRST and most-recent line-1111 trap dispatch since CPU reset.
+	// op = the faulting F-line opcode (fline_opcode_latch when the trap came from
+	// the PMMU ext-word sub-decode, else the live opcode register), ext = the PMMU
+	// extension word (meaningful only when the ctx flag is set), pc = matching
+	// instruction PC. meta = {count[15:0], 7'b0, first_ctx, 7'b0, last_ctx}.
+	output [31:0] dbg_fline_first_pc,
+	output [31:0] dbg_fline_first_op,   // {op[15:0], ext[15:0]}
+	output [31:0] dbg_fline_last_pc,
+	output [31:0] dbg_fline_last_op,    // {op[15:0], ext[15:0]}
+	output [31:0] dbg_fline_meta
 );
 
 	assign dbg_walk_cycle_o = walk_cycle;
@@ -115,6 +126,11 @@ wire [31:0] kernel_tg68_pc;             // kernel TG68_PC (logical prefetch ptr)
 assign dbg_tg68_pc   = kernel_tg68_pc;  // -> dbg_probes (works in FPGA build; dbg_pc is sim-only)
 wire        kernel_trap_berr;
 
+// F-line trap capture taps (always connected; consumed by the latch block below)
+wire        k_trap_1111, k_trapmake, k_fline_ctx;
+wire [15:0] k_opcode, k_fline_op_latch, k_pmmu_brief;
+wire [31:0] k_fline_op_pc;
+
 `ifdef A30_TRACE
 // --- A30 alias-bit divergence probe (LC II post-MMU; sim-only) ---
 wire [31:0] dbg_pc = kernel_tg68_pc;   // alias (kernel TG68_PC now lands on kernel_tg68_pc)
@@ -130,7 +146,8 @@ wire [31:0] dbg_memaddr_drega;    // memaddr_delta_rega (held by the bsr.w fix)
 // move.b decode-sequence probes: find where the absolute-EA (ld_nn / set_addrlong)
 // transition is lost when the instruction fetch stalls on a PMMU walk.
 wire  [7:0] dbg_next_ustate;      // next_micro_state
-wire [15:0] dbg_opcode, dbg_last_opc;
+wire [15:0] dbg_last_opc;
+wire [15:0] dbg_opcode = k_opcode;  // kernel opcode now tapped unconditionally (F-line capture)
 wire        dbg_set_addrlong, dbg_decodeOPC, dbg_get_2ndopc, dbg_clkena_lw;
 `endif
 
@@ -461,7 +478,16 @@ end
 		.debug_berr_frame_pc ( dbg_berr_frame_pc ),
 		.debug_exe_PC        ( dbg_exe_pc         ),
 		.debug_exe_opcode    ( dbg_exe_opcode     ),
-		.debug_berr_opcode   ( dbg_berr_opcode    )
+		.debug_berr_opcode   ( dbg_berr_opcode    ),
+
+		// F-line trap capture taps (always connected; latch block below)
+		.debug_trap_1111           ( k_trap_1111     ),
+		.debug_trapmake            ( k_trapmake      ),
+		.debug_opcode              ( k_opcode        ),
+		.debug_pmmu_brief          ( k_pmmu_brief    ),
+		.debug_fline_context_valid ( k_fline_ctx     ),
+		.debug_fline_opcode_latch  ( k_fline_op_latch ),
+		.debug_fline_opcode_pc     ( k_fline_op_pc   )
 
 `ifdef A30_TRACE
 		// --- A30 alias-bit divergence probe (LC II post-MMU; sim-only) ---
@@ -485,7 +511,6 @@ end
 		.debug_pmmu_busy     ( dbg_pmmu_busy ),
 		.debug_memaddr_delta_rega ( dbg_memaddr_drega ),
 		.debug_next_micro_state ( dbg_next_ustate ),
-		.debug_opcode        ( dbg_opcode      ),
 		.debug_last_opc_read ( dbg_last_opc    ),
 		.debug_set_addrlong  ( dbg_set_addrlong ),
 		.debug_decodeOPC     ( dbg_decodeOPC   ),
@@ -508,6 +533,53 @@ end
 		// pmmu_reg_*) are left unconnected. The on-chip caches are instantiated in
 		// the generate block below, only when USE_68030_CACHE=1.
 	);
+
+	// =======================================================================
+	// F-line (vector 11) trap capture — System 7.x "bad F-Line instruction"
+	// hunt. trap_1111+trapmake assert combinationally through the whole trap
+	// microcode of one instruction, so a rising-edge detect counts each
+	// dispatch exactly once. When the trap comes from the PMMU ext-word
+	// sub-decode (pmove_decode), fline_context_valid=1 and the latched
+	// fline_opcode_latch/fline_opcode_pc identify the instruction (the live
+	// opcode register may already hold prefetched data there); otherwise the
+	// live opcode/exe_pc are the faulting instruction.
+	// =======================================================================
+	wire [15:0] fline_ev_op = k_fline_ctx ? k_fline_op_latch : k_opcode;
+	wire [31:0] fline_ev_pc = k_fline_ctx ? k_fline_op_pc    : dbg_exe_pc;
+	wire        fline_ev    = k_trap_1111 && k_trapmake;
+	reg  [31:0] fline_first_pc = 32'd0, fline_last_pc = 32'd0;
+	reg  [31:0] fline_first_op = 32'd0, fline_last_op = 32'd0;
+	reg  [15:0] fline_cnt = 16'd0;
+	reg         fline_first_ctx = 1'b0, fline_last_ctx = 1'b0, fline_ev_d = 1'b0;
+	always @(posedge clk) begin
+		if (reset) begin
+			fline_cnt      <= 16'd0;  fline_ev_d     <= 1'b0;
+			fline_first_pc <= 32'd0;  fline_first_op <= 32'd0;  fline_first_ctx <= 1'b0;
+			fline_last_pc  <= 32'd0;  fline_last_op  <= 32'd0;  fline_last_ctx  <= 1'b0;
+		end else begin
+			fline_ev_d <= fline_ev;
+			if (fline_ev && !fline_ev_d) begin
+				if (fline_cnt == 16'd0) begin
+					fline_first_pc  <= fline_ev_pc;
+					fline_first_op  <= {fline_ev_op, k_pmmu_brief};
+					fline_first_ctx <= k_fline_ctx;
+				end
+				fline_last_pc  <= fline_ev_pc;
+				fline_last_op  <= {fline_ev_op, k_pmmu_brief};
+				fline_last_ctx <= k_fline_ctx;
+				if (fline_cnt != 16'hFFFF) fline_cnt <= fline_cnt + 16'd1;
+`ifdef SIMULATION
+				$display("FLINE[%0d]: op=%04x ext=%04x pc=%08x ctx=%b t=%0t",
+				         fline_cnt, fline_ev_op, k_pmmu_brief, fline_ev_pc, k_fline_ctx, $time);
+`endif
+			end
+		end
+	end
+	assign dbg_fline_first_pc = fline_first_pc;
+	assign dbg_fline_first_op = fline_first_op;
+	assign dbg_fline_last_pc  = fline_last_pc;
+	assign dbg_fline_last_op  = fline_last_op;
+	assign dbg_fline_meta     = {fline_cnt, 7'b0, fline_first_ctx, 7'b0, fline_last_ctx};
 
 	// =======================================================================
 	// 68030 on-chip Instruction + Data cache (TG68K_Cache_030)
