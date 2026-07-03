@@ -3114,7 +3114,21 @@ PROCESS (brief, OP1out, OP1outbrief, cpu)
 				-- mirror that by freezing the address-datapath registers while the PMMU is
 				-- translating a pending CPU access. The longword base->base+2 progression
 				-- resumes after the walk (the 2nd word hits the now-filled ATC, no stall).
-				IF pmmu_busy='1' AND state(1)='1' THEN
+				-- 7.1 type-7/bad-F-line FIX v9 (2026-07-03): widen the hold to FETCH
+				-- walks (state="00"), mirroring the memmask hold below (:~3439) which
+				-- already covers "ANY access". PCRING capture (sim_ring.log F1768):
+				-- the prefetch of $378000 (first word of a cold 32K page) walks; 2
+				-- ticks in, the un-held datapath recomputes with use_base cleared and
+				-- the pending -(A7) delta -> addr = 0-4 = $FFFFFFFC; the walker
+				-- translates the CORRECT original address but the post-walk REPLAYED
+				-- fetch issues at the corrupted one, returning open-bus garbage as
+				-- "the word at $378000" -> decoded as an opcode -> $FFFF-class word =
+				-- F-line (sim) / privileged garbage = "type 7" (HW), with opcode_pc
+				-- mis-booked +4 ($378004) by the same slipped window. TG68_PC itself
+				-- stayed correct throughout (v7 gates) — the tear was ONLY the address
+				-- datapath. Third member of the walk-hold family (data-addr June,
+				-- memmask June pt2, TG68_PC brw v7).
+				IF pmmu_busy='1' AND (state="00" OR state(1)='1') THEN
 					use_base           <= use_base;
 					memaddr_delta_rega <= memaddr_delta_rega;
 					memaddr_delta_regb <= memaddr_delta_regb;
@@ -3449,9 +3463,22 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 					-- the stacked frame (instr_boundary_pc); only its register is written.
 					IF rte_mmu_fix_commit='1' AND rte_mmu_fix_ssw(9)='1' THEN
 						TG68_PC <= TG68_PC + 2;
-					ELSIF exec(directPC)='1' THEN
+					-- 7.1 type-7 / bad-F-line FIX (2026-07-03): gate the RTS/RTE/JMP-abs
+					-- (directPC, PC<=data_read) and JSR/JMP-indirect (ea_to_pc, PC<=addr)
+					-- redirects on pmmu_busy='0', exactly like the brw arm below. jsr/jmp
+					-- (kernel ~5683-5716) do writePC (return-address push) AND the ea_to_pc
+					-- redirect; if the push's stack write / prefetch stalls on a PMMU walk,
+					-- clkena_lw freezes the push while the UNGATED redirect kept advancing
+					-- TG68_PC one prefetch word early -> the pushed return address was torn
+					-- (landed mid-instruction, e.g. $378004 = jsr return $378006 - 2 -> the
+					-- callee's rts hit the jsr displacement word $FD48 as an F-line -> bomb).
+					-- Holding the redirect until the walk clears makes it commit on the first
+					-- non-busy edge (data_read/addr valid, same edge the frozen push samples).
+					-- Non-walk path unaffected (pmmu_busy='0' always). Sibling of the v7
+					-- bsr/brw tear fix; that gated only the brw arm, missing jsr's ea_to_pc.
+					ELSIF exec(directPC)='1' AND pmmu_busy='0' THEN
 						TG68_PC <= data_read;
-					ELSIF exec(ea_to_pc)='1' THEN
+					ELSIF exec(ea_to_pc)='1' AND pmmu_busy='0' THEN
 						TG68_PC <= addr;
 					-- 7.1 WILD-RTS FIX (2026-07-02): gate the TG68_PC_brw redirect on
 				-- pmmu_busy='0' UNIFORMLY, like the sequential-fetch arm. The PMMU
