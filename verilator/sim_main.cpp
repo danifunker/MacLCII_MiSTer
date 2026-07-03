@@ -707,6 +707,129 @@ int verilate() {
 					land = 0;
 				}
 			}
+
+			// [EXC] Exception-dispatch tracer — pins the fatal "bad F-Line" (sim) /
+			// "type 7" (HW) at Finder launch. Edge-detect each trap_* request and log
+			// the vector + faulting PC (opcode_pc) + full SR (flagssr, bit5=S) + the
+			// live opcode. Frame-gated to skip the early-boot storm; capped. The trap
+			// signals are held across the multi-cycle dispatch, so edge-detect on the
+			// rising transition to log once per exception.
+			// NOTE: A-line (trap_1010, vec10) DELIBERATELY EXCLUDED — it is the normal
+			// Mac Toolbox trap-dispatch mechanism ($Axxx opcodes = every Toolbox/OS
+			// call), which fires hundreds of times per frame and would flood the cap
+			// before the fatal F-line at Finder launch. The bomb is a "bad F-Line"
+			// (vec11); we only want the rare fault classes.
+			if (!*bus.ioctl_download && video.count_frame >= 1600) {
+				static int p1111=0, ppriv=0, pillg=0, paddr=0, pfmt=0;
+				static int exc_n = 0; const int ECAP = 400;
+				struct Trap { const char* name; int now; int* prev; };
+				Trap tr[] = {
+					{ "F-LINE  vec11", (int)KB(trap_1111),        &p1111 },
+					{ "PRIVVIOL vec8", (int)KB(trap_priv),        &ppriv },
+					{ "ILLEGAL  vec4", (int)KB(trap_illegal),     &pillg },
+					{ "ADDR-ERR vec3", (int)KB(trap_addr_error),  &paddr },
+					{ "FORMATERR v14", (int)KB(trap_format_error), &pfmt  },
+				};
+				for (auto& t : tr) {
+					if (t.now && !*t.prev && exc_n < ECAP) {
+						// flagssr = SR high byte (SR[15:8]); resets to $27. S=bit5, IPL=bits2:0.
+						unsigned srhi = (unsigned)(uint8_t)KB(flagssr);
+						fprintf(stderr,
+						  "[EXC] F%d %s  vector=%03X opcode_pc=%08X exe_pc=%08X live_pc=%08X SRhi=%02X[S=%u IPL=%u] exe_opcode=%04X svmode=%d\n",
+						  video.count_frame, t.name,
+						  (unsigned)KB(trap_vector) & 0x3FF,
+						  (uint32_t)KB(opcode_pc), (uint32_t)KB(exe_pc), (uint32_t)KB(tg68_pc),
+						  srhi, (srhi>>5)&1u, srhi&7u,
+						  (unsigned)(uint16_t)KB(exe_opcode),
+						  (int)KB(svmode));
+						exc_n++;
+					}
+					*t.prev = t.now;
+				}
+			}
+
+			// [PCRING] torn-jsr-push forensics (2026-07-03). The F1768 F-line
+			// executes at $378004 = a jsr return address pushed 2 LOW (missing
+			// displacement +2), and the pmmu_busy gate on directPC/ea_to_pc was
+			// behavior-inert => the tear is an edge-ORDERING flip between the
+			// data_write_tmp<=TG68_PC sample (clkena_lw domain, writepc=1) and
+			// the seq-arm TG68_PC<=TG68_PC_add commit (clkena_in domain) at a
+			// walk exit. Ring-log every settled-cycle change of that cluster;
+			// dump on (a) the first F-line >=F1600, (b) a state="11" write cycle
+			// carrying the torn value $00378004, with healthy $00378006 pushes
+			// logged one-line for contrast. All output on stderr as [PCRING].
+			{
+				struct RE { uint64_t t; int f; uint32_t pc, add, dwt, ma;
+				            uint8_t wpc, lw, cin, busy, st, brw; };
+				static const int RN = 16384;
+				static RE ring[RN]; static int rw = 0; static bool wrapped = false;
+				static uint32_t ppc=~0u, padd=~0u, pdwt=~0u, pma=~0u; static int pflags=-1;
+				RE e;
+				e.t   = main_time;
+				e.f   = video.count_frame;
+				e.pc  = (uint32_t)KB(tg68_pc);
+				e.add = (uint32_t)KB(tg68_pc_add);
+				e.dwt = (uint32_t)KB(data_write_tmp);
+				e.ma  = (uint32_t)KB(memaddr);
+				e.wpc = (uint8_t)(KB(writepc) & 1);
+				e.lw  = (uint8_t)(KB(clkena_lw) & 1);
+				e.cin = (uint8_t)(KB(clkena_in) & 1);
+				e.busy= (uint8_t)(KB(pmmu_busy) & 1);
+				e.st  = (uint8_t)(KB(state) & 3);
+				e.brw = (uint8_t)(KB(tg68_pc_brw) & 1);
+				int flags = e.wpc | (e.lw<<1) | (e.cin<<2) | (e.busy<<3) | (e.st<<4) | (e.brw<<6);
+				if (e.pc!=ppc || e.add!=padd || e.dwt!=pdwt || e.ma!=pma || flags!=pflags) {
+					ring[rw] = e; rw = (rw+1)%RN; if (rw==0) wrapped = true;
+					ppc=e.pc; padd=e.add; pdwt=e.dwt; pma=e.ma; pflags=flags;
+				}
+				auto dump_ring = [&](const char* why, int last_n) {
+					int n = wrapped ? RN : rw;
+					int from = (last_n > 0 && last_n < n) ? n - last_n : 0;
+					fprintf(stderr, "[PCRING] ==== DUMP (%s) t=%llu F%d entries=%d ====\n",
+					        why, (unsigned long long)main_time, video.count_frame, n - from);
+					for (int i = from; i < n; ++i) {
+						const RE& r = ring[wrapped ? (rw + i) % RN : i];
+						fprintf(stderr, "[PCRING] t=%llu F%d pc=%08X add=%08X dwt=%08X ma=%08X "
+						        "wpc=%u lw=%u cin=%u busy=%u st=%u brw=%u\n",
+						        (unsigned long long)r.t, r.f, r.pc, r.add, r.dwt, r.ma,
+						        r.wpc, r.lw, r.cin, r.busy, r.st, r.brw);
+					}
+					fprintf(stderr, "[PCRING] ==== END DUMP (%s) ====\n", why);
+				};
+				if (video.count_frame >= 1600 && !*bus.ioctl_download) {
+					// (a) full-ring dump on the first F-line dispatch (site-independent)
+					static int pfl = 0; static bool excdumped = false;
+					int fl = (int)KB(trap_1111);
+					if (fl && !pfl && !excdumped) { dump_ring("FLINE", 0); excdumped = true; }
+					pfl = fl;
+					// (b) torn-value push write: state="11" carrying $00378004
+					static int ptorn = 0, torn_n = 0;
+					int torn = (e.st == 3 && e.dwt == 0x00378004u);
+					if (torn && !ptorn && torn_n < 4) {
+						fprintf(stderr, "[PCRING] TORN-PUSH t=%llu F%d ma=%08X\n",
+						        (unsigned long long)main_time, video.count_frame, e.ma);
+						dump_ring("TORNPUSH", 128); torn_n++;
+					}
+					ptorn = torn;
+					// healthy-sibling push one-liners ($00378006) for contrast
+					static int pok = 0, ok_n = 0;
+					int okp = (e.st == 3 && e.dwt == 0x00378006u);
+					if (okp && !pok && ok_n < 8) {
+						fprintf(stderr, "[PCRING] OK-PUSH t=%llu F%d ma=%08X\n",
+						        (unsigned long long)main_time, video.count_frame, e.ma);
+						ok_n++;
+					}
+					pok = okp;
+					// writepc falling edges at the jsr site: the final sample moments
+					static int pwpc = 0, site_n = 0;
+					if (!e.wpc && pwpc && e.pc >= 0x377FF0u && e.pc <= 0x378010u && site_n < 100) {
+						fprintf(stderr, "[PCRING] SITE-SAMPLE-END t=%llu F%d pc=%08X dwt=%08X busy=%u lw=%u st=%u\n",
+						        (unsigned long long)main_time, video.count_frame, e.pc, e.dwt, e.busy, e.lw, e.st);
+						site_n++;
+					}
+					pwpc = e.wpc;
+				}
+			}
 			#undef KB
 
 			// [SR] VIA6522 shift-register + Egret handshake trace. The $A4A18C packet

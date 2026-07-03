@@ -212,3 +212,22 @@ ring shows the killing fetch + the 15 fetches (with opcodes) leading to it.
 - The `$378` ring-walk divergence ($140C2 in MAME vs $40C2 here) may just be
   heap-layout noise between machines — do not chase unless the ring implicates
   it.
+
+## ADDENDUM (late 2026-07-02, type-7 session): fix #2 is inert (dead code)
+Static re-audit while chasing the type-7: the `data_write_tmp` hold added as
+"fix part 2" sits inside the `ELSIF clkena_lw='1'` block of its process
+(~line 2472 of TG68KdotC_Kernel.vhd), and `clkena_lw <= clkena_in AND
+memmaskmux(3) AND NOT pmmu_busy` (line 1575) — so `pmmu_busy='1'` can never be
+true where the hold is evaluated. The bsr-push fix therefore came ENTIRELY
+from fix #1 (the TG68_PC brw gate). Harmless to leave in (shipped + validated
+as a pair); remove at the next kernel-touching commit for clarity.
+
+Sibling-audit map for the type-7 hunt (clkena_in-domain arms that can fire
+during a walk stall — exec strobes stay held because micro_state is frozen):
+- `exec(directPC)` -> `TG68_PC <= data_read` (~3452) — RTE/RTS PC pops. UNGATED by pmmu_busy.
+- `exec(ea_to_pc)` -> `TG68_PC <= addr` (~3454) — jmp/jsr (ea). UNGATED.
+- Walker read data does NOT flow through data_read (dedicated pmmu_walker_data
+  port, ~171): mid-stall re-assignments re-sample a STABLE stale value, so the
+  exposure is confined to stall-EXIT latch ordering and page-straddling pops.
+- FlagsSR/SVmode/trap_SR/data_write_tmp/regfile writes all live in
+  clkena_lw-gated processes — frozen through stalls, structurally safe.

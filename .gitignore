@@ -76,3 +76,7 @@ __pycache__/
 /snap/
 /diff/
 /.claude/
+
+# GHDL work artifacts (regen via rtl/tg68k/conv_lf.sh)
+rtl/tg68k/*.o
+rtl/tg68k/work-obj*.cf

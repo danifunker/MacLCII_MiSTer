@@ -35,3 +35,33 @@ public_flat_rd -module "TG68KdotC_Kernel" -var "rte_mmu_fix_ssw"
 public_flat_rd -module "TG68KdotC_Kernel" -var "rte_mmu_fix_write"
 public_flat_rd -module "TG68KdotC_Kernel" -var "rte_mmu_fix_commit"
 public_flat_rd -module "TG68KdotC_Kernel" -var "rte_mmu_fix_opcode"
+// [EXC] exception-dispatch tracer taps: find the fatal bad-F-line / type-7 at
+// Finder launch. trap_* = the exception-type request pulses; trap_vector = the
+// dispatched vector*... offset; opcode_pc/exe_pc = the faulting instruction PC;
+// flagssr = full SR (bit5=S supervisor); svmode = live supervisor mode.
+public_flat_rd -module "TG68KdotC_Kernel" -var "trap_1111"
+public_flat_rd -module "TG68KdotC_Kernel" -var "trap_priv"
+public_flat_rd -module "TG68KdotC_Kernel" -var "trap_illegal"
+public_flat_rd -module "TG68KdotC_Kernel" -var "trap_addr_error"
+public_flat_rd -module "TG68KdotC_Kernel" -var "trap_1010"
+public_flat_rd -module "TG68KdotC_Kernel" -var "trap_format_error"
+public_flat_rd -module "TG68KdotC_Kernel" -var "trap_vector"
+public_flat_rd -module "TG68KdotC_Kernel" -var "opcode_pc"
+public_flat_rd -module "TG68KdotC_Kernel" -var "exe_pc"
+public_flat_rd -module "TG68KdotC_Kernel" -var "flagssr"
+public_flat_rd -module "TG68KdotC_Kernel" -var "svmode"
+// [PCRING] torn-jsr-push taps (2026-07-03): capture the push-data sample vs
+// PC-increment edge ordering around a PMMU-walk exit (the $378004 torn return —
+// data_write_tmp latches TG68_PC on clkena_lw edges while the seq +2 commits on
+// the same edge; the walk-exit collapses the sample window). writepc gates the
+// data_write_tmp<=TG68_PC branch; state/memaddr identify the bus cycle;
+// tg68_pc_add shows the pending increment; clkena_in/clkena_lw/pmmu_busy time it.
+public_flat_rd -module "TG68KdotC_Kernel" -var "data_write_tmp"
+public_flat_rd -module "TG68KdotC_Kernel" -var "writepc"
+public_flat_rd -module "TG68KdotC_Kernel" -var "clkena_lw"
+public_flat_rd -module "TG68KdotC_Kernel" -var "clkena_in"
+public_flat_rd -module "TG68KdotC_Kernel" -var "pmmu_busy"
+public_flat_rd -module "TG68KdotC_Kernel" -var "state"
+public_flat_rd -module "TG68KdotC_Kernel" -var "memaddr"
+public_flat_rd -module "TG68KdotC_Kernel" -var "tg68_pc_add"
+public_flat_rd -module "TG68KdotC_Kernel" -var "tg68_pc_brw"
