@@ -121,5 +121,35 @@ harness and address controller).
 - Old-binary forensic run (bounded cpu_trace F2500-2820 + SCSI phase log)
   still recording as the broken-behavior reference.
 
+## TRACE-PROVEN MECHANISM REFINEMENT (forensic run, F2500-2820 cpu_trace)
+The old-binary bounded trace (`sim755run2/cpu_trace.log`, 203 MB, wedge fully
+formed in-window and deterministic vs run 1) sharpens the story:
+- The `$A06EC0` entry (the `and.b ($203,A1)` gate) **never executes** in the
+  entire wedge window — that entry point belongs to a different caller.
+- The actual loop: the level-2 interrupt chain tail at **$A06EAA** does
+  `move.b #$82,($3,A1)` (IFR-ack bit 1) → `or.b ($2,A1),D0` (read SLOT
+  STATUS $F26002) → `not.l` → `and.b ($12,A1),D0` (mask with SLOT IER
+  $F26012) → `bne $a06eca` (re-dispatch the slot queues). With the OLD RTL,
+  $F26002 bit 6 was the live `~vblank_irq` wire — unackable — so the re-
+  dispatch loop at $A06EAA↔$A06ECA↔the $A06EEC queue walk monopolized the
+  CPU (walk → handled → re-check → still "pending" → walk ...), and the
+  launch continuation starved anyway.
+- So the operative starved registers are **$F26002 (slot status) and
+  $F26012 (slot IER)** on the interrupt path; the $203 IFR alias matters
+  for the other dispatcher entry. Both are the same root — slot state must
+  be LATCHED, ACKABLE registers as on real V8/MAME — and both are covered
+  by the rewrite. (Headline in the sections above kept; this note is the
+  cycle-exact ground truth.)
+
 ## VALIDATION RESULTS (appended)
-- (pending)
+- Egret/SR + no-disk smoke: PASS on the new binary — POST, Egret SR
+  transfers, PRAM reads all normal; no-disk boot reaches the disk-scan
+  desktop with correct video. Timeline shifts ~160 frames later than the
+  old binary because TimeDBRA-calibrated delays now run their CORRECT
+  length (the old interrupt storm stole cycles during calibration and
+  shortened every ROM delay loop).
+- Interrupt storm: ~5.9M pseudo-VIA writes in the first 60 frames (old)
+  → 130 (new).
+- 7.1 full regression: **PASS** — Finder desktop at F1800
+  (sim71fix/screenshot_frame_1800.png), zero [EXC]/[PCRING] through F2500.
+- 7.5.5 cure test: (in flight — verdict at the menu-bar window ~F2600)
