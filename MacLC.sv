@@ -637,6 +637,43 @@ module emu
 	                        selectSCSIDMA ? ~scsiDREQ :
 	                        (~(!_cpuAS && (cpuAddr[23:21] != 3'b111 || selectVRAM)) | !dtack_en);
 
+	// ─────────────────────────────────────────────────────────────────────────
+	// SCSI / peripheral read-path fit-stabilization (structural fix; ported from
+	// MacLC 0c8844b, HW-proven there since 2026-06-24).
+	//
+	// Peripheral reads ($Exxxxx/$Fxxxxx, cpuAddr[23:21]==111) complete via the
+	// 6800-style VPA cycle — NOT the async-DTACK path RAM/ROM/VRAM use. The VPA
+	// cycle is E-paced (E ≈ 812 kHz ⇒ ~40 clk_sys per E period) and the wrapper
+	// latches read data LATE: at s_state 6, after stalling at s_state 4 for xVma
+	// (= eCntr==8, one tick before E-fall — rtl/tg68k/tg68k.v:277,288,308). So
+	// from address/select settle (AS at s_state 1) to the data sample is ALWAYS
+	// ≥5 clk_sys.
+	//
+	// The bit that makes this read fit-sensitive is CSR bit6 / scsi_bsy — the
+	// deepest cone in the whole read mux: scsi.v phase reg → bsy=(phase!=IDLE) →
+	// |target_bsy (cross-module) → wide OR → CSR (ncr5380.sv) → far inter-module
+	// route → 7-way cpuDataOut mux (dataController_top.sv) → CPU din. CSR bit1 /
+	// scsi_sel is a local ICR register bit (shallow) — which is exactly why HW
+	// read bit1 right but bit6 wrong, depending on placement → dice-roll boots.
+	//
+	// Fix: register the peripheral read data one clk_sys stage (periph_din_reg)
+	// and feed the CPU the REGISTERED value on VPA cycles only. The ≥5-cycle VPA
+	// window absorbs the +1 latency completely (sampled at s_state 6, settled by
+	// ~s_state 3), so no DTACK/VMA change is needed and the memory (DTACK) read
+	// path — including SCSI pseudo-DMA (selectSCSIDMA) and the PMMU walker's RAM
+	// reads — is byte-for-byte unchanged. MacLCii.sdc adds a conservative 2×
+	// multicycle on `-to periph_din_reg` (supersedes the old constraint-only
+	// `-from {*ncr5380*} -to {*tg68_din_r*}` relaxation). periph_din_reg is only
+	// CONSUMED during VPA reads, when its combinational input is held stable by
+	// the CPU. Mirrored in verilator/sim.v.
+	wire vpa_periph_read = !fc7_iack && !fc7_berr && !slot_space && !_cpuAS &&
+	                       (cpuAddr[23:21] == 3'b111) && !selectVRAM && !selectSCSIDMA;
+	reg [15:0] periph_din_reg;
+	always @(posedge clk_sys) periph_din_reg <= dataControllerDataOut;
+	wire [15:0] cpu_din_muxed = slot_space      ? 16'hFFFF :
+	                            vpa_periph_read ? periph_din_reg :
+	                                              dataControllerDataOut;
+
 	// ── Programmer's switch / Level-7 NMI (debug aid) ───────────────────────────
 	// An OSD button (status[5], the "R5" momentary trigger) fires a non-maskable
 	// Level-7 interrupt so MacsBug can break into a HUNG system — the core has no
@@ -762,7 +799,7 @@ module emu
 				.bgack_n    ( 1'b1 ),
 				.ipl        ( _cpuIPL ),
 				.berr       ( cpu_berr ),
-				.din        ( slot_space ? 16'hFFFF : dataControllerDataOut ),
+				.din        ( cpu_din_muxed ),
 				.dout       ( tg68_dout ),
 				.longword   ( tg68_longword ),
 				.addr       ( tg68_a ),
@@ -1036,7 +1073,7 @@ module emu
 	reg [15:0] fh_jump_src_op = 16'd0, fh_jump_tgt_op = 16'd0;
 	reg [7:0]  fh_jumps = 8'd0;
 	wire        fh_ifetch = (cpuFC[1:0] == 2'b10) && fh_as_d && !_cpuAS; // AS fell, code fetch
-	wire [15:0] fh_din = slot_space ? 16'hFFFF : dataControllerDataOut;  // mirrors tg68k .din
+	wire [15:0] fh_din = cpu_din_muxed;  // mirrors tg68k .din
 	always @(posedge clk_sys) begin
 		fh_as_d <= _cpuAS;
 		if (!_cpuReset) begin

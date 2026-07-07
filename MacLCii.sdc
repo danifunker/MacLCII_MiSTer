@@ -65,27 +65,27 @@ set_multicycle_path -hold  -end 1 \
     -to   [get_keepers {*sdram:sdram|sd_data[*]~reg0}]
 
 # ----------------------------------------------------------------------------
-# SCSI status-read multicycle — fixes the #3 cold-boot spontaneous reboot.
+# Peripheral (VPA) read-data register — SCSI read-path fit-stabilization.
 # ----------------------------------------------------------------------------
-# The 68k reads the NCR5380 CSR (the BSY/REQ selection poll at $A0786A) as a
-# 6800-style VPA cycle: din is latched into tg68_din_r at s_state==6
-# (rtl/tg68k/tg68k.v:271), near the END of a long E-synced access (E ~ clk_sys/
-# 10..20). The combinational read cone — target `phase` reg -> bsy -> csr ->
-# ncr5380 rdata -> scsiDataOut -> cpuDataOut mux -> tg68_din — is therefore held
-# stable for MANY clk_sys periods before capture: a pure status read does NOT
-# advance the SCSI protocol, so the launch registers don't change during the
-# access. Yet the default single-cycle constraint leaves this ~30.5ns cone at
-# only +0.2..0.44ns slack = fit-sensitive, and in HW the CPU intermittently
-# reads BSY=0 while the target holds BSY=1 -> the SCSI Manager aborts -> a 2nd
-# SCSI bus reset -> the spontaneous reboot just before "Welcome to Macintosh"
-# (docs/handoff_cold_boot_reboot_2026-06-15.md).
+# periph_din_reg (MacLC.sv) captures the peripheral read mux (dataControllerDataOut)
+# one clk_sys stage before the CPU samples it on VPA/6800 cycles. Its deepest input
+# cone is the SCSI CSR's scsi_bsy bit (scsi.v phase -> |target_bsy -> CSR -> far
+# route -> 7-way mux) — historically THE fit-sensitive net (bit6/scsi_bsy read
+# wrong while shallow bit1/scsi_sel read right) behind dice-roll SCSI boots and
+# the #3 cold-boot spontaneous reboot (docs/handoff_cold_boot_reboot_2026-06-15.md).
 #
-# Relaxing ONLY the NCR5380/target-reg -> CPU-din-latch paths to 2 clk_sys
-# periods is physically correct (same basis as the kernel multicycle above) and
-# surgical: the ONLY paths from any ncr5380 register to tg68_din_r are SCSI read
-# data (rdata), all VPA/DTACK-paced. -from is the SCSI engine only (RAM/ROM and
-# other peripheral reads keep their own single-cycle -from); -to is the din latch
-# only (DTACK/DREQ/IRQ control never reaches tg68_din_r). Leaves the "must stay
-# single-cycle" CPU<->peripheral note above intact for every non-SCSI path.
-set_multicycle_path -setup -end 2 -from [get_keepers {*ncr5380*}] -to [get_keepers {*tg68_din_r*}]
-set_multicycle_path -hold  -end 1 -from [get_keepers {*ncr5380*}] -to [get_keepers {*tg68_din_r*}]
+# Peripheral reads are E-paced: the wrapper stalls at s_state 4 for xVma (near
+# E-fall) and latches read data at s_state 6, ALWAYS >= 5 clk_sys after the
+# address/select settle (rtl/tg68k/tg68k.v:277,288,308). So the cone into
+# periph_din_reg genuinely has multiple clk_sys to resolve, not one. Credit a
+# CONSERVATIVE 2x (61.6 ns @ 32.5 MHz) — well inside the >=5-cycle window — so
+# STA reports the real margin instead of over-constraining this E-paced read to
+# a single 30.8 ns period (the "STA passes but HW fails" trap). periph_din_reg
+# is only CONSUMED during VPA reads, when its input is held stable by the CPU;
+# its fan-OUT (-> tg68_din_r, near the CPU) stays a normal single-cycle path and
+# is deliberately NOT relaxed. (Ported from MacLC 0c8844b; supersedes the earlier
+# constraint-only relaxation `-from {*ncr5380*} -to {*tg68_din_r*}` — with the
+# register in place, all remaining direct paths into the CPU din latch must
+# close single-cycle.)
+set_multicycle_path -setup -end 2 -to [get_keepers {*periph_din_reg*}]
+set_multicycle_path -hold  -end 1 -to [get_keepers {*periph_din_reg*}]

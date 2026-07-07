@@ -332,6 +332,20 @@ module emu
 	                        selectSCSIDMA ? ~scsiDREQ :
 	                        (~(!_cpuAS && (cpuAddr[23:21] != 3'b111 || selectVRAM)) | !dtack_en);
 
+	// Peripheral (VPA) read-data register — mirror of MacLC.sv periph_din_reg
+	// (fit-stabilization for the deep SCSI-CSR read cone; ported from MacLC
+	// 0c8844b). Functionally transparent: VPA reads latch at s_state 6, ≥5
+	// clk_sys after select settle, absorbing the +1 register latency. Mirrored
+	// here so the sim exercises the registered path rather than trusting that
+	// transparency claim FPGA-only.
+	wire vpa_periph_read = !fc7_iack && !fc7_berr && !slot_space && !_cpuAS &&
+	                       (cpuAddr[23:21] == 3'b111) && !selectVRAM && !selectSCSIDMA;
+	reg [15:0] periph_din_reg;
+	always @(posedge clk_sys) periph_din_reg <= dataControllerDataOut;
+	wire [15:0] cpu_din_muxed = slot_space      ? 16'hFFFF :
+	                            vpa_periph_read ? periph_din_reg :
+	                                              dataControllerDataOut;
+
 	// Programmer's switch / Level-7 NMI — mirror of MacLC.sv (there the trigger is
 	// the "R5" OSD button status[5]; in sim it is the nmi_pulse input driven by
 	// --nmi-at-frame). Verifies the level-7 autovector path our CPU+glue takes.
@@ -461,7 +475,7 @@ module emu
 
 		.ipl        ( _cpuIPL ),
 		.berr       ( cpu_berr ),
-		.din        ( slot_space ? 16'hFFFF : dataControllerDataOut ),
+		.din        ( cpu_din_muxed ),
 		.dout       ( tg68_dout ),
 		.longword   ( tg68_longword ),
 		.addr       ( tg68_a ),
