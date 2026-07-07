@@ -1736,16 +1736,25 @@ PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, me
 			IF Reset='1' THEN
 				last_data_read <= (OTHERS => '0');
 			ELSIF clkena_in='1' THEN
-				IF state="00" OR exec(update_ld)='1' THEN 
-					last_data_read <= data_read;
-					IF state(1)='0' AND memmask(1)='0' THEN
-						last_data_read(31 downto 16) <= last_opc_read;
-					ELSIF state(1)='0' OR memread(1)='1' THEN
-						last_data_read(31 downto 16) <= (OTHERS=>data_in(15));
+				-- LC II walk-exposure FIX A (2026-07-07): last_data_in is a SHIFT
+				-- register fed from the raw bus on EVERY clkena_in edge; clkena_in
+				-- keeps firing during PMMU walks, so a walk shifts walker
+				-- page-table words through it — destroying beat 1 of a
+				-- page-straddling longword read while beat 2's translation walks.
+				-- Hold both registers during any CPU-access walk (4th member of
+				-- the walk-hold family: data-addr June, memmask June-pt2,
+				-- fetch-addr v9, this).
+				IF NOT (pmmu_busy='1' AND (state="00" OR state(1)='1')) THEN
+					IF state="00" OR exec(update_ld)='1' THEN
+						last_data_read <= data_read;
+						IF state(1)='0' AND memmask(1)='0' THEN
+							last_data_read(31 downto 16) <= last_opc_read;
+						ELSIF state(1)='0' OR memread(1)='1' THEN
+							last_data_read(31 downto 16) <= (OTHERS=>data_in(15));
+						END IF;
 					END IF;
+					last_data_in <= last_data_in(15 downto 0)&data_in(15 downto 0);
 				END IF;
-				last_data_in <= last_data_in(15 downto 0)&data_in(15 downto 0);
-				
 			END IF;
 		END IF;
 				long_start <= to_bit(NOT memmask(1));
@@ -2535,14 +2544,12 @@ PROCESS (clk)
 				--   5. micro_state=trap0, useStackframe2=1 -> $2xxx fmt/vec   (role B)
 				--   6. micro_state=trap0 (else)            -> $0xxx fmt/vec   (role B)
 				--   7. micro_state=int3                    -> $1xxx fmt/vec   (role B, Fmt$1 throwaway)
-				-- 7.1 WILD-RTS FIX part 2 (2026-07-02): hold data_write_tmp while a
-				-- CPU data access is stalled on a PMMU walk (pmmu_busy & state(1)) —
-				-- the beats of a stalled longword push must not re-sample a moving
-				-- source (writePC follows the live TG68_PC). Mirrors the June
-				-- memaddr/use_base hold in the address datapath.
-				IF pmmu_busy='1' AND state(1)='1' THEN
-					data_write_tmp <= data_write_tmp;
-				ELSIF writePC='1' THEN
+				-- (The 2026-07-02 "hold data_write_tmp during walks" arm that lived
+				-- here was DEAD CODE and was removed 2026-07-07: this block is inside
+				-- the ELSIF clkena_lw='1' arm, and clkena_lw is gated on
+				-- pmmu_busy='0' at its :~1575 derivation — the hold condition could
+				-- never be true. The REAL v7 F-line fix was the TG68_PC brw gate.)
+				IF writePC='1' THEN
 					-- Priority 1: explicit PC push (trap0/1 68000-style, int4 Fmt$1 PC,
 					-- JSR/BSR target, DIV0 return PC, etc.)
 					data_write_tmp <= TG68_PC;
@@ -3550,7 +3557,16 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 					-- CRITICAL: Use next_micro_state, not micro_state! At this clock edge,
 					-- micro_state still has the OLD value. next_micro_state has the value
 					-- that micro_state will become, which is pmove_decode when getbrief fired.
-						IF next_micro_state = pmove_decode AND fline_context_valid = '0' AND getbrief = '1' THEN
+						-- LC II walk-exposure FIX B (2026-07-07): this capture is a
+						-- ONE-SHOT (it sets fline_context_valid and disarms itself).
+						-- If it fires mid-walk, the clkena_lw='0' arm below samples
+						-- data_in = walker page-table words and LOCKS the garbage in
+						-- (PMMU instruction misdecode). Suspend the one-shot while a
+						-- CPU access is walking: the trigger (frozen micro_state
+						-- family) persists, so the capture still fires on the
+						-- walk-completing edge with the real extension word.
+						IF next_micro_state = pmove_decode AND fline_context_valid = '0' AND getbrief = '1'
+						   AND NOT (pmmu_busy='1' AND (state="00" OR state(1)='1')) THEN
 						fline_opcode_latch <= opcode;
 						-- Capture from SAME source as brief to avoid timing issues
 						IF clkena_lw='0' THEN
@@ -3598,7 +3614,12 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 							pmove_dn_mode <= '0';  -- Clear for non-Dn modes
 						END IF;
 					-- BUG #198 FIX: Increment pmove_dn_regnum for second half of 64-bit PMOVE
-					ELSIF micro_state = pmove_dn_hi THEN
+					-- LC II walk-exposure HARDENING (2026-07-07): the increment was
+					-- LEVEL-triggered on micro_state alone in a clkena_in block —
+					-- any stall that keeps clkena_in firing while micro_state is
+					-- frozen (PMMU walk, longword first beat) would multi-increment.
+					-- Gate on clkena_lw: exactly one increment per state visit.
+					ELSIF micro_state = pmove_dn_hi AND clkena_lw='1' THEN
 						-- Transition from pmove_dn_hi to pmove_dn_lo: increment for Dn+1
 						pmove_dn_regnum <= pmove_dn_regnum + "001";
 					END IF;
