@@ -1098,6 +1098,20 @@ int verilate() {
 					uint32_t colour = 0xFF000000 | VERTOPINTERN->VGA_B << 16 | VERTOPINTERN->VGA_G << 8 | VERTOPINTERN->VGA_R;
 					video.Clock(VERTOPINTERN->VGA_HB, VERTOPINTERN->VGA_VB, VERTOPINTERN->VGA_HS, VERTOPINTERN->VGA_VS, colour);
 				}
+				// [RAWVID] un-CE-gated colour range at the top-level pins: every
+				// rising edge, active area only. Distinguishes "module output is
+				// uniform" from "CE_PIXEL sampling misses the colours".
+				if (clk_sys.IsRising()) {
+					static uint8_t rmin = 0xFF, rmax = 0; static uint64_t rawn = 0;
+					if (!VERTOPINTERN->VGA_HB && !VERTOPINTERN->VGA_VB) {
+						uint8_t r = VERTOPINTERN->VGA_R;
+						if (r < rmin) rmin = r; if (r > rmax) rmax = r;
+					}
+					if ((++rawn % 5000000) == 0) {
+						fprintf(stderr, "[RAWVID] n=%llu rmin=%02X rmax=%02X\n", (unsigned long long)rawn, rmin, rmax);
+						rmin = 0xFF; rmax = 0;
+					}
+				}
 		
 				if (clk_sys.IsRising()) {
 					// Serial terminal: tick soft UART and drive SCC RX

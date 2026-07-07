@@ -144,10 +144,19 @@ ghdl synth -fsynopsys -fexplicit --latches --out=verilog
 
 ```bash
 cd verilator && make clean && make
-./obj_dir/Vemu --screenshot 350 --stop-at-frame 351 2>/dev/null 1>/dev/null
+./check_boot.sh --run 30    # PASS + "ADVANCING" required
 ```
 
-Check `screenshot_frame_0350.png` — it must show the grey/black alternating line pattern (memory test). Uniform grey means the SR change broke Egret communication.
+A broken Egret handshake stalls the CPU polling IFR, which check_boot reports
+as FAIL or LOOP. **STALE-GATE WARNING (cost a 5-hour false regression hunt on
+2026-07-07): the old check here — "screenshot at F350 must show grey/black
+alternating lines; uniform grey = broken" — NO LONGER HOLDS.** The ROM
+programs the Ariel CLUT all-grey (every entry $7F7F7F) early in boot, so a
+no-disk boot renders a UNIFORM GREY screen at least through F360 even on a
+known-good build (verified against the HW-validated v9 tree, 2026-07-07).
+Real palette content only arrives during System-disk video init — the visual
+gate is a `--scsi0` 7.1 boot reaching the desktop (screenshots ~F1400-2000),
+not any no-disk frame.
 
 **SR edge-detection patterns (history + FPGA caveat):**
 - `cb2_latched` (shift-in: capturing CB2 at the CB1 rising edge) — **removed; do not re-introduce.** Shift-in uses live `cb2_i`. Re-introducing it hung the 4th Egret SR transfer in Verilator (CPU stuck polling IFR bit 2 at `0xA14E5E`).
