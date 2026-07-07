@@ -376,8 +376,8 @@ module emu
 		.ps2_mouse(ps2_mouse)
 	);
 
-	assign CLK_VIDEO = clk_sys;
-	assign CE_PIXEL  = v8_ce_pix;
+	assign CLK_VIDEO = clk_vid;
+	assign CE_PIXEL  = v8_ce_pix;   // constant 1 now (pix_ce tied high below)
 
 	// Video Output — straight V8 video, no overlays.
 	assign VGA_R  = v8_vga_r;
@@ -388,6 +388,110 @@ module emu
 	assign VGA_HS = v8_hsync;
 	assign VGA_F1 = 0;
 	assign VGA_SL = 0;
+
+	// ------------------------------------------------------------------------
+	// Dedicated pixel clock (pll_video) — true per-monitor scanout rates.
+	// (Ported from MacLC 536a0a3+56b9888+78e484c, end state.) The V8 used to
+	// scan out at clk_sys/2 = 16.25 MHz in every mode, so VGA 640x480 (800x525
+	// total) refreshed at 38.7 Hz. clk_vid now carries 25.175 MHz (VGA,
+	// 59.94 Hz) / 15.664 MHz (12" RGB, 60.14 Hz) / 58.742 MHz (Portrait tap,
+	// OSD-unreachable today). CPU/SDRAM/System-Tick stay on clk_sys (CPU speed
+	// and the a937c4c tick are pixel-clock independent by construction — do
+	// NOT re-tie ticks/onesec to vblank).
+	//
+	// The rate switch is a runtime PLL RECONFIG of the single output counter
+	// (ao486 pattern, sys/pll_cfg): CLK_VIDEO must be a raw PLL output —
+	// sys_top's clock-select blocks reject a muxed clock (Fitter Err 15836),
+	// which killed the earlier cyclonev_clkselect approach. Only C0 changes;
+	// the VCO (704.9 MHz) stays put, so one register write + start suffices.
+	// The static config is C0=28 (25.175 MHz VGA — see rtl/pll_video.v:21): a
+	// VGA boot performs NO reconfig at all (the earlier /12-static +
+	// boot-time-retarget variant glitched CLK_VIDEO during the HPS SD mount →
+	// BERR storms). An OSD switch to 12" RGB (C0=45, SLOWER than the 25.175
+	// constraint = STA-safe) retargets mid-session; Portrait (C0=12) stays
+	// OSD-unreachable until the static constraint moves back to /12.
+	// (Video is reset-held until first lock via vidrst below.)
+	wire clk_vid, pll_video_locked;
+	wire [63:0] reconfig_to_pll, reconfig_from_pll;
+	pll_video pllv
+	(
+		.refclk(CLK_50M),
+		.rst(1'b0),
+		.outclk_0(clk_vid),
+		.locked(pll_video_locked),
+		.reconfig_to_pll(reconfig_to_pll),
+		.reconfig_from_pll(reconfig_from_pll)
+	);
+
+	wire        pixcfg_waitrequest;
+	reg         pixcfg_write;
+	reg   [5:0] pixcfg_address;
+	reg  [31:0] pixcfg_data;
+	pll_cfg pll_video_cfg
+	(
+		.mgmt_clk(CLK_50M),
+		.mgmt_reset(0),
+		.mgmt_waitrequest(pixcfg_waitrequest),
+		.mgmt_read(0),
+		.mgmt_readdata(),
+		.mgmt_write(pixcfg_write),
+		.mgmt_address(pixcfg_address),
+		.mgmt_writedata(pixcfg_data),
+		.reconfig_to_pll(reconfig_to_pll),
+		.reconfig_from_pll(reconfig_from_pll)
+	);
+
+	// C0 counter value per monitor: {[22:18] counter#=0, [17] odd-div,
+	// [16] bypass, [15:8] high count, [7:0] low count} — layout per
+	// sys/pll_cfg/altera_pll_reconfig_core.v:557-569.
+	wire [31:0] pix_c0 = (v8_monitor_id == 4'h2) ? 32'h00021716 :  // /45 = 15.664 MHz
+	                     (v8_monitor_id == 4'h1) ? 32'h00000606 :  // /12 = 58.742 MHz
+	                                               32'h00000E0E;   // /28 = 25.175 MHz
+	always @(posedge CLK_50M) begin : pix_reconfig
+		reg [31:0] c0_cur = 32'h00000E0E;  // = the static /28 VGA config: a VGA
+		                                   // boot performs NO reconfig (the boot-
+		                                   // time PLL glitch BERR-stormed the HPS
+		                                   // SCSI path); only an OSD switch to
+		                                   // 12" retargets, mid-session
+		reg [31:0] c0_s1, c0_s2;
+		reg [2:0]  state = 0;
+		c0_s1 <= pix_c0;                   // settle across clk_sys -> CLK_50M
+		c0_s2 <= c0_s1;
+		if (!pixcfg_waitrequest) begin
+			pixcfg_write <= 0;
+			if (pll_video_locked) begin
+				if (state) state <= state + 1'd1;
+				case (state)
+					0: if (c0_s2 == c0_s1 && c0_s2 != c0_cur) begin
+							c0_cur <= c0_s2;
+							state  <= 1;
+						end
+					1: begin pixcfg_address <= 0; pixcfg_data <= 0;      pixcfg_write <= 1; end // polled mode
+					3: begin pixcfg_address <= 5; pixcfg_data <= c0_cur; pixcfg_write <= 1; end // C0 counter
+					5: begin pixcfg_address <= 2; pixcfg_data <= 0;      pixcfg_write <= 1; end // start
+				endcase
+			end
+		end
+	end
+
+	// Video-domain reset: hold scanout in reset until its PLL locks, released
+	// synchronously in clk_vid. (*_meta = 2FF first stage, false-pathed in
+	// MacLCii.sdc.)
+	reg vidrst_meta = 1'b1, vidrst_s = 1'b1;
+	always @(posedge clk_vid) begin
+		vidrst_meta <= ~n_reset || ~pll_video_locked;
+		vidrst_s    <= vidrst_meta;
+	end
+
+	// clk_vid -> clk_sys: VBL/HBL levels for the guest-facing consumers
+	// (pseudovia VBL IRQ, VIA PB7 debug input, dbg_probes).
+	reg vbl_meta, v8_vblank_s, hbl_meta, v8_hblank_s;
+	always @(posedge clk_sys) begin
+		vbl_meta    <= v8_vblank;
+		v8_vblank_s <= vbl_meta;
+		hbl_meta    <= v8_hblank;
+		v8_hblank_s <= hbl_meta;
+	end
 
 	// ASC samples drive AUDIO_L/R directly (Commit C). Legacy DMA gone.
 	assign AUDIO_L = asc_sample_l;
@@ -916,6 +1020,7 @@ module emu
 
 	ariel_ramdac ariel(
 		.clk_sys(clk_sys),
+		.clk_pix(clk_vid),   // video lookup port in the scanout clock domain
 		.reset(~n_reset),
 		.reg_addr(cpuAddr[10:0]),
 		.uds_n(_cpuUDS),
@@ -946,7 +1051,7 @@ module emu
 		.data_out(pseudovia_dout),
 		.we(selectPseudoVIA && !_cpuRW && cpuBusControl),
 		.req(selectPseudoVIA && cpuBusControl),
-		.vblank_irq(v8_vblank),
+		.vblank_irq(v8_vblank_s),   // 2FF-synced from the clk_vid scanout domain
 		.slot_irq(pds_slot_irq),
 		.asc_irq(asc_irq),
 		// SCSI flags RE-TIED-OFF (2026-06-12 evening). History of reversals:
@@ -1204,7 +1309,7 @@ module emu
 		.asc_irq(asc_irq),
 		.asc_sample_l(asc_sample_l),
 		.pvia_video_config(pvia_video_config),
-		.v8_vblank(v8_vblank),
+		.v8_vblank(v8_vblank_s),
 		// BERR investigation (#3 cold-boot reboot loop): the ACTUAL bus-error
 		// signals, not the vector-read inference PEXC/PFR use.
 		.cpu_berr(cpu_berr),
@@ -1235,9 +1340,10 @@ module emu
 	);
 
 	maclc_v8_video v8_video(
-		.clk_sys(clk_sys),
+		.clk_sys(clk_vid),      // scanout runs on the dedicated pixel clock
 		.clk8_en_p(clk8_en_p),
-		.reset(~n_reset),
+		.pix_ce(1'b1),          // every clk_vid edge = one pixel
+		.reset(vidrst_s),
 
 		// Configuration
 		.video_mode(v8_video_mode),
@@ -1267,10 +1373,12 @@ module emu
 		.vram_rdata(v8_vram_rdata)
 	);
 
-	// On-chip framebuffer (BRAM). Video reads port B (Phase 2); CPU VRAM writes
-	// are mirrored into port A. Single clk_sys domain => coherent, no CDC.
+	// On-chip framebuffer (BRAM). CPU VRAM writes land on port A (clk_sys);
+	// video reads port B in the pixel-clock domain — the CDC lives inside the
+	// dual-clock M10K primitive.
 	vram_bram vram_fb(
-		.clk(clk_sys),
+		.a_clk(clk_sys),
+		.b_clk(clk_vid),
 		.a_addr(vram_bram_waddr),
 		.a_din(memoryDataOut),
 		.a_be({~_cpuUDS, ~_cpuLDS}),
@@ -1428,8 +1536,8 @@ module emu
 		.timestamp(TIMESTAMP),
 
 		// video
-		._hblank(~v8_hblank),
-		._vblank(~v8_vblank),
+		._hblank(~v8_hblank_s),
+		._vblank(~v8_vblank_s),
 		.vid_alt(vid_alt),
 
 

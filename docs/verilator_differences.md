@@ -14,6 +14,21 @@ silently diverge. (This has bitten us before — e.g. sim once hardwired
 
 Last audited: 2026-06-12 (cold-load reset hardening added FPGA-only — see below).
 
+**2026-07-06 — per-monitor pixel clock (clk_vid) + VPA read register (MacLC
+ports):**
+- `periph_din_reg` (VPA peripheral-read register, MacLC 0c8844b port) is in
+  **both tops identically** — sim exercises the +1-latency registered path.
+- Video: the FPGA scanout now runs on a dedicated reconfigurable PLL
+  (`rtl/pll_video.v` → `clk_vid` = 25.175 / 15.664 / 58.742 MHz by monitor;
+  `maclc_v8_video` gained a `pix_ce` input, `vram_bram` is dual-clock,
+  `ariel_ramdac` gained `clk_pix`). **The sim stays single-domain**: it ties
+  `b_clk`/`clk_pix` to `clk_sys` and drives `pix_ce` with a /2 enable
+  (`sim_pix_ce`), preserving the historic 16.25 MHz cadence so boot frame
+  counts (screenshot @350 etc.) are unchanged. Consequently the true refresh
+  rates, the PLL reconfig FSM, and every clk_sys↔clk_vid CDC (2FF `*_meta`
+  syncs, `v8_vblank_s`/`v8_hblank_s`, dual-clock M10Ks) are **FPGA-only** —
+  sim consumers keep the raw `v8_vblank` (one domain, no sync needed).
+
 **2026-06-13 — floppy byte-demux fix (both tops, kept identical):** the disk
 image is packed 2 bytes/SDRAM-word; the byte returned to the track encoder must
 be selected by `dskReadAddr[0]`, but both tops used `memoryAddr[0]` — which is
@@ -80,6 +95,7 @@ These must stay identical; they were checked and match today.
 | RAM size | `configRAMSize = 8'h24` (2 MB, hardwired) | `status[4] ? 8'hE4 : 8'h24` (2 MB / 10 MB) | **10 MB / SIMM path never exercised in sim** |
 | Monitor ID | `v8_monitor_id = 4'h6` (640×480, hardwired) | `status[11:10]`-selected | **Other resolutions are FPGA-only** |
 | `clk_sys` | 32 MHz from the testbench | PLL `outclk_1` | same frequency; no functional diff |
+| Pixel clock | scanout on `clk_sys` with `pix_ce` = /2 enable (16.25 MHz cadence) | dedicated `pll_video` `clk_vid` (25.175/15.664/58.742 MHz), runtime reconfig on OSD monitor switch | **true refresh rates + all clk_vid CDC are FPGA-only** |
 | Debug HUD / ports | absent | Row-M overlay, `*_dbg_*`, `selectUnmapped`, `synthesis keep` taps | FPGA-only observability; harmless |
 | Framework | bespoke C++ harness (`sim_main.cpp`) | `sys/` (HPS I/O, HDMI/scaler, OSD, audio out) | sim has no HPS/HDMI/scaler |
 | PRAM NVRAM persistence | `dataController_top` `pram_*` ports tied off (`pram_load_wr=0`, `pram_save_addr=0`, outputs open) | FSM in `MacLC.sv` (SD slot 2 save image, load-on-mount / flush-on-OSD / Reset PRAM&Core) drives them | **PRAM save/restore is FPGA-only**; sim still boots with `egret.pram` (zeros). The Egret `pram[]` mirror + `pram_load_*/save_*` ports in `egret_wrapper.sv` are shared and identical. |
