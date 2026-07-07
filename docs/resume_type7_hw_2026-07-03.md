@@ -1,4 +1,16 @@
-# RESUME — 7.1 "type 7 / bad F-Line" Finder-launch bomb: FIXED IN SIM (v9), NEXT = HW VALIDATION (2026-07-03 evening)
+# RESUME — 7.1 "type 7 / bad F-Line" Finder-launch bomb: FIXED IN SIM (v9) — ✅ HW-VALIDATED 2026-07-06
+
+**STATUS 2026-07-06: DONE.** v9 deployed to the MiSTer (md5 `143d902b`,
+coreRunning verified), pristine `MacLC_7-1.hda` + PRAM restored, cold boot:
+**stable Finder desktop at t=60s** (exactly where v7 bombed), unchanged
+through t=240s, and at t=300s the machine was in live interactive use
+("About This Macintosh": LC II, System 7.1, 10,240K — the 10MB config, so the
+SDRAM-walk fix holds too). No "type 7", no bomb. Frames:
+`scratch/hw_v9_t{060..300}.png`, `scratch/hw_v9_final.png`. Release copy:
+`releases/MacLCii_flineFix_v9_20260703.rbf`. Remaining work = the follow-ups
+section only. Original resume text below, kept for the record.
+
+(original header: FIXED IN SIM (v9), NEXT = HW VALIDATION, 2026-07-03 evening)
 
 Read cold to continue. The multi-day type-7 chase is DONE in simulation: root
 cause captured cycle-exact, one-condition fix applied, full 7.1 sim boot runs
@@ -43,7 +55,9 @@ this bug but kept as hardening. `.v` regenerated via the conv_lf.sh flow.
 - ✅ v9 RBF: `output_files/MacLCii.rbf` (2026-07-03 16:01). STA: core domains
   clean (emu|pll +0.477/+2.030); pll_hdmi −0.355 = framework-domain fit noise,
   same class as every recent build (running v7 had −0.523).
-- ⬜ **HW validation — WAITING ON USER GO.**
+- ✅ **HW validation — PASSED 2026-07-06** (user power-cycled the box and said
+  it's back up = go). Deploy per the steps below went clean on the first try;
+  Finder desktop stable from t=60s, interactive use at t=300s, no type 7.
 
 ## HW VALIDATION STEPS (when the user says go)
 1. **Power-cycle the MiSTer first** (192.168.99.143, scripts/local.env). It
