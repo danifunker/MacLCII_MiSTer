@@ -80,3 +80,13 @@ __pycache__/
 # GHDL work artifacts (regen via rtl/tg68k/conv_lf.sh)
 rtl/tg68k/*.o
 rtl/tg68k/work-obj*.cf
+
+# Quartus crash reports
+cr_ie_info.json
+
+# ad-hoc sim-run CWDs (parallel Vemu runs; screenshots/traces land there)
+sim*run/
+
+# MAME rom lanes — Apple ROM images, regenerated from releases/boot0.rom (docs/mame_compare.md)
+verilator/mame/roms/
+verilator/mame/roms_nomemcheck/
