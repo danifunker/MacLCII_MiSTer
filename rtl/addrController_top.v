@@ -73,7 +73,11 @@ module addrController_top(
 	input [21:0] dskReadAddrInt,
 	output dskReadAckInt,
 	input [21:0] dskReadAddrExt,
-	output dskReadAckExt
+	output dskReadAckExt,
+
+	// H1-stretch: 1 while the extra SDRAM slot is needed (a floppy motor is on OR
+	// an HPS ROM/image download is streaming). When 0, the CPU is lent slot 10.
+	input extra_busy
 );
 
 	// Legacy Mac-Plus sound DMA removed in Commit C.
@@ -111,13 +115,20 @@ module addrController_top(
 	end
 
 	// H1 (perf): video scanout reads the on-chip BRAM framebuffer (vram_bram),
-	// not SDRAM, so the CPU owns slots 00/01/11 (3 of 4 slots). The remaining
-	// "extra" slot (10) serves floppy disk reads. NOTE: the dtack glue in
-	// MacLC.sv/sim.v must assert per-cpu-slot (the 3 slots 11,00,01 are
-	// CONTIGUOUS, so a rising-edge detector would see only one edge per round
-	// and HALVE throughput).
-	assign cpuBusControl = (busCycle == 2'b00) || (busCycle == 2'b01) || (busCycle == 2'b11);
-	wire extraBusControl = (busCycle == 2'b10);
+	// not SDRAM, so the CPU owns slots 00/01/11 (3 of 4). The 4th slot (10) is
+	// the "extra" slot for floppy reads + HPS downloads.
+	// H1-stretch (perf): when the extra slot is idle (extra_busy=0 — the common
+	// case: SCSI boot + normal app use, no floppy spinning, no download) LEND it
+	// to the CPU too => 4/4 slots (~+33% memory bandwidth). It reverts to the
+	// extra path whenever a floppy motor is on or a download streams, so disk
+	// reads / image loads are never starved.
+	// NOTE: the dtack glue in MacLC.sv/sim.v asserts per-cpu-slot (mem_latch_d at
+	// each slot start), so it already handles up to 4 CONTIGUOUS cpu slots — a
+	// rising-edge detector would collapse them to one ack/round and throttle.
+	wire extra_slot = (busCycle == 2'b10);
+	assign cpuBusControl = (busCycle == 2'b00) || (busCycle == 2'b01) || (busCycle == 2'b11)
+	                       || (extra_slot && !extra_busy);
+	wire extraBusControl = extra_slot && extra_busy;
 
 	// ============================================================
 	// Memory control signals

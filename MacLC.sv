@@ -943,12 +943,17 @@ module emu
 		.dskReadAddrInt(dskReadAddrInt),
 		.dskReadAckInt(dskReadAckInt),
 		.dskReadAddrExt(dskReadAddrExt),
-		.dskReadAckExt(dskReadAckExt)
+		.dskReadAckExt(dskReadAckExt),
+		.extra_busy(extra_slot_busy)
 	);
 
 
 	wire [1:0] diskEject;
 	wire [1:0] diskMotor, diskAct;
+	// H1-stretch (perf): the extra SDRAM slot is only needed while a floppy is
+	// spinning or an HPS ROM/image download streams; otherwise the CPU is lent
+	// slot 10 (4/4 slots). diskMotor + dio_download are its only two consumers.
+	wire extra_slot_busy = (|diskMotor) || dio_download;
 	
 	// Video Mode Selection Logic
 	// 0=1bpp, 1=2bpp, 2=4bpp, 3=8bpp, 4=16bpp

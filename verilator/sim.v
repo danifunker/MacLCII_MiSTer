@@ -593,7 +593,8 @@ module emu
 		.dskReadAddrInt(dskReadAddrInt),
 		.dskReadAckInt(dskReadAckInt),
 		.dskReadAddrExt(dskReadAddrExt),
-		.dskReadAckExt(dskReadAckExt)
+		.dskReadAckExt(dskReadAckExt),
+		.extra_busy(extra_slot_busy)
 	);
 
 	wire [1:0] diskEject;
@@ -880,6 +881,9 @@ module emu
 	//////////////////////// DOWNLOADING ///////////////////////////
 
 	wire dio_download = ioctl_download;
+	// H1-stretch (perf): mirror MacLC.sv — extra SDRAM slot busy only when a
+	// floppy motor is on or a download streams; else the CPU gets slot 10 (4/4).
+	wire extra_slot_busy = (|diskMotor) || dio_download;
 	wire [23:0] dio_addr = ioctl_addr[24:1];
 	wire [7:0] dio_index = ioctl_index;
 
