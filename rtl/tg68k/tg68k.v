@@ -75,11 +75,19 @@ wire  [1:0] tg68_busstate;
 // 68030 on-chip I/D cache enable (TG68K_Cache_030).
 //   0 = run uncached (today's behaviour, every fetch/load hits the Mac bus)
 //   1 = caches live (read-hit bypass + line fill).
-// Kept at 0 until the Phase 5 sim+MAME+FPGA validation. With it 0 the cache
-// subsystem below is in the generate `else` arm (cache_read_hit tied 0), so the
-// bus FSM is provably identical to the uncached design.
+// ENABLED 2026-07-08 (I-cache live; D-side answer path tied off at d_req).
+// Sim-validated on the post-v9 kernel: no-disk boot reaches the idle loop at
+// F310 vs F396 uncached (-22%), march loops run fetch-free (2 bus fetches per
+// 60-frame window), berr ledger identical to the uncached baseline (the ROM's
+// normal FC=7 device probes). The June "10x slower" verdict was the pre-4/4-
+// slot bus + a thrash-phase measurement, not this design. Required fixes that
+// made cache-ON safe (all 2026-07-08, see the fill FSM + berr isolation
+// below): FC=5 override during fills, same-edge fill launch (fill_launch_now),
+// borrowed-cycle berr isolation, fill abort-on-berr.
+// With the flag 0 the cache subsystem is in the generate `else` arm
+// (cache_read_hit tied 0), so the bus FSM reduces to the uncached design.
 // ---------------------------------------------------------------------------
-localparam USE_68030_CACHE = 1'b0;
+localparam USE_68030_CACHE = 1'b1;
 wire        cache_read_hit;     // current CPU access is a cacheable read that HIT the cache
 wire [15:0] cache_kernel_data;  // 16-bit word fed to the kernel on a cache hit (skips the bus)
 
@@ -87,8 +95,13 @@ wire [15:0] cache_kernel_data;  // 16-bit word fed to the kernel on a cache hit 
 // pipeline does not advance during a page-table walk. On a cache read-hit the
 // access completes with no bus cycle, so clkena pulses immediately (like a
 // busstate=01 no-access cycle) instead of waiting for s_state 7.
-wire        tg68_clkena = phi1 && (s_state == 7 || tg68_busstate == 2'b01 || cache_read_hit)
-                          && !walk_cycle && !fill_active;
+// fill_launch_now (v2, 2026-07-08): the fill engine launches on THIS phi1 —
+// suppress the kernel's idle-step on the same edge so it cannot advance into
+// staging an access (IACK/probe) under the fill. Replaces the v1 FILL_ARM
+// double-sample, which starved fills in dense loops (idle windows are 1 phi
+// wide in the RAM-march/QuickDraw hot paths → cache went inert).
+wire        tg68_clkena = phi1 && (s_state == 7 || (tg68_busstate == 2'b01 && !fill_launch_now) || cache_read_hit)
+                          && !walk_cycle && !fill_freeze;
 wire [31:0] tg68_addr;
 wire [15:0] tg68_din;
 reg  [15:0] tg68_din_r;
@@ -192,6 +205,8 @@ wire [15:0] walk_dout_word = walk_word ? pmmu_walker_wdat[15:0]     : pmmu_walke
 // All of these are tied 0 when USE_68030_CACHE=0 (no_cache arm), so eff_*,
 // clkena and the s_state FSM reduce exactly to the uncached design.
 wire        fill_active;     // 1 = fill engine is reading a line on the (parked) bus
+wire        fill_freeze;     // 1 = fill owns/is taking the bus: kernel clkena held
+wire        fill_launch_now; // 1 = fill launches on THIS phi1 (suppresses the kernel's idle-step)
 wire [31:0] fill_bus_addr;   // current 16-bit read address during a fill
 
 // Effective bus controls: the walker (highest priority) or the fill engine drive
@@ -392,16 +407,27 @@ end
 	// (berr_exception_active), where it re-samples make_berr and mistakes the SAME
 	// fault for a *second* one -> double bus fault -> cpu_halted. (The old 68000/020
 	// kernel had no double-fault detector, so holding to s_state 0 was harmless.)
+	// Kernel-owned-cycle isolation (2026-07-08): berrs raised during BORROWED bus
+	// cycles (PMMU walker / cache line fill) must never reach the kernel. The
+	// walker's berrs have no consumer (pmmu_walker_berr is tied 0 — the PMMU
+	// times out instead) and previously latched berr_hold, relying on the
+	// phi1&s0 release firing before the kernel's next clkena — a full bus cycle
+	// away when uncached. A cache HIT completes at s_state 0 on the SAME phi1
+	// edge as that release, so the kernel could sample the stale hold and
+	// dispatch a bus error from an innocent hit-completed instruction. The fill
+	// engine additionally aborts a berr'd fill (fill_berr) so no poisoned line
+	// is ever populated.
+	wire berr_kernel_cycle = berr & ~walk_cycle & ~fill_active;
 	reg berr_hold;
 	always @(posedge clk) begin
 		if (reset)
 			berr_hold <= 1'b0;
 		else if (kernel_make_berr || kernel_trap_berr || (phi1 && s_state == 0))
 			berr_hold <= 1'b0;
-		else if (berr)
+		else if (berr_kernel_cycle)
 			berr_hold <= 1'b1;
 	end
-	wire berr_held = (berr | berr_hold) & ~(kernel_make_berr | kernel_trap_berr);
+	wire berr_held = (berr_kernel_cycle | berr_hold) & ~(kernel_make_berr | kernel_trap_berr);
 
 	// 68030 cache-control taps from the kernel. These kernel outputs were
 	// previously left unconnected; they feed the cache subsystem in the generate
@@ -422,6 +448,43 @@ end
 	wire        cache_inv_req;
 	wire [1:0]  cache_op_scope, cache_op_cache;
 	wire [31:0] cache_op_addr;
+
+	// FC pin override during cache line fills (forensics 2026-07-08): the fill
+	// borrows the bus while the kernel is frozen, but the kernel's FC stays on
+	// the pins. Parked FC=7 (the ROM's MOVES probes / a staged interrupt-
+	// acknowledge) + a fill's RAM address made the top-level fc7 decode fire a
+	// spurious BERR INTO the fill read -> berr#4+ storm from F9 and the F236
+	// IACK-flavor corrupt-restart loop. Drive supervisor-data (FC=5, what a
+	// real 030 emits for its own bus-master activity) while the fill owns the
+	// bus. The walker keeps kernel FC (never 7 mid-translatable-access).
+	// The cache TAG ports keep kernel_fc — tags must record the CPU's own FC.
+	wire [2:0]  kernel_fc;
+	assign      fc = fill_active ? 3'b101 : kernel_fc;
+
+`ifdef SIMULATION
+	// Cache-ON forensics (2026-07-08): when do CACR enables flip and when does
+	// the ROM actually flush? A dropped flush = stale-line execution = the
+	// F236 wild-read divergence. $time is edge-count; ~1.68M/frame.
+	reg dbg_cacr_ie_d, dbg_cacr_de_d, dbg_inv_d;
+	reg dbg_berr_d;
+	always @(posedge clk) begin
+		dbg_cacr_ie_d <= cacr_ie;
+		dbg_cacr_de_d <= cacr_de;
+		dbg_inv_d     <= cache_inv_req;
+		if (cacr_ie != dbg_cacr_ie_d || cacr_de != dbg_cacr_de_d)
+			$display("[CACR] ie=%b de=%b (was %b/%b) @%0t", cacr_ie, cacr_de, dbg_cacr_ie_d, dbg_cacr_de_d, $time);
+		if (cache_inv_req && !dbg_inv_d)
+			$display("[CACR] INV scope=%b cache=%b addr=%h @%0t", cache_op_scope, cache_op_cache, cache_op_addr, $time);
+		// BERR-input context probe: the exact bus state at the edge the top
+		// asserts berr into the wrapper — is a fill/walk on the bus (collision
+		// class) or is the kernel's own access faulting (re-execution class)?
+		dbg_berr_d <= berr;
+		if (berr && !dbg_berr_d)
+			$display("[BERRIN] addr=%h fc=%b rw=%b as_n=%b ss=%0d kbs=%b walk=%b fillA=%b fillF=%b hit=%b @%0t",
+				addr, fc, rw_n, as_n, s_state, tg68_busstate, walk_cycle,
+				fill_active, fill_freeze, cache_read_hit, $time);
+	end
+`endif
 
 	TG68KdotC_Kernel tg68k (
 		.clk            ( clk           ),
@@ -444,7 +507,7 @@ end
 		.busstate       ( tg68_busstate ), // 00-> fetch code 10->read data 11->write data 01->no memaccess
 		.longword       ( longword      ),
 		.nResetOut      ( reset_n       ),
-		.FC             ( fc            ),
+		.FC             ( kernel_fc     ),
 
 		// 68030 PMMU table-walker memory interface — wired to the Mac bus via the
 		// walker bus master below, so page-table walks read/write real RAM.
@@ -604,7 +667,15 @@ end
 		wire        xlate_ready = 1'b1;
 
 		wire i_req = is_030 & cacr_ie & (tg68_busstate == 2'b00) & xlate_ready;
-		wire d_req = is_030 & cacr_de & (tg68_busstate == 2'b10 || tg68_busstate == 2'b11) & xlate_ready;
+		// D-cache DISABLED (2026-07-08 diagnostic B): the first cache-ON run on the
+		// post-v9 kernel diverged in late boot (wild read faddr=FFFFFFF2 @A472CE,
+		// ~12 extra BERRs, SCC-poll wedge instead of the F396 idle loop). The
+		// D-side carries the write-coherency complexity and is the low-value half
+		// (fetches = 65-86% of traffic; framebuffer is uncacheable anyway). Tie
+		// d_req off to isolate: clean boot => D-side implicated, I-only is the
+		// ship shape; still dirty => fill-borrow/kernel-hold class (the a254a02
+		// walk holds don't know about fills).
+		wire d_req = 1'b0 & is_030 & cacr_de & (tg68_busstate == 2'b10 || tg68_busstate == 2'b11) & xlate_ready;
 		wire d_we  = (tg68_busstate == 2'b11);
 
 		// Cacheable physical regions on the V8 24-bit map (rtl/addrDecoder.v):
@@ -626,6 +697,7 @@ end
 		// hit-wait and the engine can never deadlock.
 		localparam FILL_IDLE = 1'b0, FILL_READ = 1'b1;
 		reg          fill_st;        // FILL_IDLE / FILL_READ
+		reg          fill_berr;      // sticky: a berr landed during this fill — abandon, never populate
 		reg   [2:0]  fill_word;      // 0..7: which 16-bit word of the line
 		reg          fill_is_i;      // 1 = fill the I-cache, 0 = the D-cache
 		reg  [31:0]  fill_base;      // line-aligned (16-byte) physical base (cache's i/d_fill_addr)
@@ -633,6 +705,17 @@ end
 		reg          i_fill_valid_r, d_fill_valid_r;
 
 		assign       fill_active   = (fill_st == FILL_READ);             // bus-owning read phase
+		assign       fill_freeze   = (fill_st != FILL_IDLE);             // kernel clkena hold while the fill owns the bus
+		// v2 launch protocol (2026-07-08): launch and kernel-hold on the SAME
+		// phi1. fill_launch_now suppresses the kernel's idle-step in the clkena
+		// expression on the launch edge, so the kernel can never advance into
+		// staging an access (IACK/probe, FC=7) under the fill — the v1 hazard —
+		// while dense loops (1-phi idle windows) still get fills (the v1 ARM
+		// double-sample starved them and made the cache inert exactly in the
+		// hot paths).
+		assign       fill_launch_now = (fill_st == FILL_IDLE) && (s_state == 3'd0) &&
+		                               (tg68_busstate == 2'b01) && !walk_cycle && !pmmu_walker_req &&
+		                               (i_fill_req | d_fill_req);
 		assign       fill_bus_addr = {fill_base[31:4], fill_word, 1'b0};  // base + 2*word
 
 		wire [127:0] i_fill_data  = fill_buf;
@@ -668,7 +751,7 @@ end
 
 			.i_addr          ( cache_addr_log  ),
 			.i_addr_phys     ( cache_addr_phys ),
-			.i_fc            ( fc              ),
+			.i_fc            ( kernel_fc       ),
 			.i_req           ( i_req           ),
 			.i_cache_inhibit ( fill_inhibit    ),
 			.i_data          ( i_data          ),
@@ -680,7 +763,7 @@ end
 
 			.d_addr          ( cache_addr_log  ),
 			.d_addr_phys     ( cache_addr_phys ),
-			.d_fc            ( fc              ),
+			.d_fc            ( kernel_fc       ),
 			.d_req           ( d_req           ),
 			.d_we            ( d_we            ),
 			.d_cache_inhibit ( fill_inhibit    ),
@@ -726,6 +809,7 @@ end
 			if (reset) begin
 				fill_st        <= FILL_IDLE;
 				fill_word      <= 3'd0;
+				fill_berr      <= 1'b0;
 				fill_is_i      <= 1'b0;
 				fill_base      <= 32'd0;
 				fill_buf       <= 128'd0;
@@ -736,18 +820,24 @@ end
 				d_fill_valid_r <= 1'b0;
 				case (fill_st)
 					FILL_IDLE:
-						if (phi1 && s_state == 3'd0 && tg68_busstate == 2'b01 &&
-						    !walk_cycle && !pmmu_walker_req && (i_fill_req | d_fill_req)) begin
+						if (phi1 && fill_launch_now) begin
+							// The clkena expression suppresses the kernel's idle-step on
+							// this same edge (fill_launch_now term), so the kernel is
+							// parked bus-idle for the whole fill.
 							fill_st   <= FILL_READ;
 							fill_word <= 3'd0;
+							fill_berr <= 1'b0;
 							fill_is_i <= i_fill_req;                        // I-cache has priority
 							fill_base <= i_fill_req ? i_fill_addr : d_fill_addr;
 						end
 					FILL_READ: begin
+						if (berr) fill_berr <= 1'b1;             // poison: never populate a berr'd line
 						if (phi2 && s_state == 3'd6)
 							fill_buf[fill_word*16 +: 16] <= din;     // capture line word k
 						if (phi1 && s_state == 3'd7) begin
-							if (fill_word != 3'd7)
+							if (fill_berr || berr)
+								fill_st <= FILL_IDLE;                 // abandon at the word boundary
+							else if (fill_word != 3'd7)
 								fill_word <= fill_word + 1'b1;       // next word
 							else begin
 								fill_st <= FILL_IDLE;                 // 16 bytes read -> populate + done
@@ -791,6 +881,8 @@ end
 		assign cache_read_hit    = 1'b0;
 		assign cache_kernel_data = 16'h0;
 		assign fill_active       = 1'b0;
+		assign fill_freeze       = 1'b0;
+		assign fill_launch_now   = 1'b0;
 		assign fill_bus_addr     = 32'd0;
 	end endgenerate
 
