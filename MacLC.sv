@@ -412,67 +412,18 @@ module emu
 	// OSD-unreachable until the static constraint moves back to /12.
 	// (Video is reset-held until first lock via vidrst below.)
 	wire clk_vid, pll_video_locked;
-	wire [63:0] reconfig_to_pll, reconfig_from_pll;
 	pll_video pllv
 	(
 		.refclk(CLK_50M),
 		.rst(1'b0),
 		.outclk_0(clk_vid),
-		.locked(pll_video_locked),
-		.reconfig_to_pll(reconfig_to_pll),
-		.reconfig_from_pll(reconfig_from_pll)
+		.locked(pll_video_locked)
 	);
 
-	wire        pixcfg_waitrequest;
-	reg         pixcfg_write;
-	reg   [5:0] pixcfg_address;
-	reg  [31:0] pixcfg_data;
-	pll_cfg pll_video_cfg
-	(
-		.mgmt_clk(CLK_50M),
-		.mgmt_reset(0),
-		.mgmt_waitrequest(pixcfg_waitrequest),
-		.mgmt_read(0),
-		.mgmt_readdata(),
-		.mgmt_write(pixcfg_write),
-		.mgmt_address(pixcfg_address),
-		.mgmt_writedata(pixcfg_data),
-		.reconfig_to_pll(reconfig_to_pll),
-		.reconfig_from_pll(reconfig_from_pll)
-	);
-
-	// C0 counter value per monitor: {[22:18] counter#=0, [17] odd-div,
-	// [16] bypass, [15:8] high count, [7:0] low count} — layout per
-	// sys/pll_cfg/altera_pll_reconfig_core.v:557-569.
-	wire [31:0] pix_c0 = (v8_monitor_id == 4'h2) ? 32'h00021716 :  // /45 = 15.664 MHz
-	                     (v8_monitor_id == 4'h1) ? 32'h00000606 :  // /12 = 58.742 MHz
-	                                               32'h00000E0E;   // /28 = 25.175 MHz
-	always @(posedge CLK_50M) begin : pix_reconfig
-		reg [31:0] c0_cur = 32'h00000E0E;  // = the static /28 VGA config: a VGA
-		                                   // boot performs NO reconfig (the boot-
-		                                   // time PLL glitch BERR-stormed the HPS
-		                                   // SCSI path); only an OSD switch to
-		                                   // 12" retargets, mid-session
-		reg [31:0] c0_s1, c0_s2;
-		reg [2:0]  state = 0;
-		c0_s1 <= pix_c0;                   // settle across clk_sys -> CLK_50M
-		c0_s2 <= c0_s1;
-		if (!pixcfg_waitrequest) begin
-			pixcfg_write <= 0;
-			if (pll_video_locked) begin
-				if (state) state <= state + 1'd1;
-				case (state)
-					0: if (c0_s2 == c0_s1 && c0_s2 != c0_cur) begin
-							c0_cur <= c0_s2;
-							state  <= 1;
-						end
-					1: begin pixcfg_address <= 0; pixcfg_data <= 0;      pixcfg_write <= 1; end // polled mode
-					3: begin pixcfg_address <= 5; pixcfg_data <= c0_cur; pixcfg_write <= 1; end // C0 counter
-					5: begin pixcfg_address <= 2; pixcfg_data <= 0;      pixcfg_write <= 1; end // start
-				endcase
-			end
-		end
-	end
+	// FIXED PIXEL CLOCK (2026-07-07): pll_cfg / altera_pll_reconfig REMOVED.
+	// pll_video is now a plain fixed 25.175 MHz General PLL (see rtl/pll_video.v).
+	// Root cause of the HW black-screen was fit density (97% ALM): the reconfig
+	// core left the pixel PLL no placement margin, so its lock died in service.
 
 	// Video-domain reset: hold scanout in reset until its PLL locks, released
 	// synchronously in clk_vid. (*_meta = 2FF first stage, false-pathed in
@@ -1085,6 +1036,10 @@ module emu
 		.ram_configured(pvia_ram_configured)
 	);
 
+`ifdef USE_DEBUG_PROBES
+	// GATED (2026-07-07): compiled ONLY when USE_DEBUG_PROBES is defined (see
+	// MacLCii.qsf). Stripped from release builds -- the deck cost ~1k+ ALMs and
+	// that 97%-ALM density was the video PLL black-screen root cause.
 	// JTAG In-System probes (SCSI / CPU loop sampler / ASC / video).
 	// FPGA-only — never instantiate in verilator/sim.v (altsource_probe is an
 	// Altera primitive). Read with: bash scripts/read_probes.sh
@@ -1338,6 +1293,7 @@ module emu
 		.selectUnmapped(selectUnmapped),
 		.cpuBusControl(cpuBusControl)
 	);
+`endif
 
 	maclc_v8_video v8_video(
 		.clk_sys(clk_vid),      // scanout runs on the dedicated pixel clock
