@@ -668,7 +668,16 @@ int verilate() {
 				const int       CAP = 120;
 
 				int mb = (int)KB(make_berr);
-				if (mb && !mb_prev) mb_total++;
+				if (mb && !mb_prev) {
+					mb_total++;
+					// Forensic (2026-07-08): print EVERY dispatch edge with its frame.
+					// The DISP line below dedupes on frame_pc, hiding same-pc repeats —
+					// which hid the onset of the cache-ON corrupt-restart loop (berr#3).
+					// Frame regs may lag this edge by a few cycles; live_pc is live.
+					if (mb_total > 3 && bf_n < CAP)
+						fprintf(stderr, "[BERRFRAME] EDGE berr#%d F%d live_pc=%08X\n",
+						        mb_total, video.count_frame, (uint32_t)KB(tg68_pc));
+				}
 				mb_prev = mb;
 
 				uint32_t bf = (uint32_t)KB(berr_frame_pc);

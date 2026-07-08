@@ -220,7 +220,7 @@ module emu
 	wire E_rising, E_falling;
 	wire [2:0] _cpuIPL;       // final IPL to CPU (Level-7 NMI applied below)
 	wire [2:0] _cpuIPL_dc;    // raw IPL from dataController (VIA1 / PseudoVIA / SCC)
-	wire [2:0] cpuFC;
+	wire [2:0] cpuFC /* verilator public_flat_rd */;  // referenced by name from sim_main.cpp; without this the net is optimized into an alias when the cache generate-arm is off
 	wire [7:0] cpuAddrHi;
 	wire [31:0] cpuAddr;
 	assign cpuAddr[0] = 1'b0;
@@ -400,6 +400,7 @@ module emu
 	wire        tg68_reset_n;
 	wire        tg68_longword;   // 32-bit access flag — drives SCSI pseudo-DMA byte packing
 	wire [1:0]  tg68_busstate;
+	wire        sim_walk_cycle;  // PMMU walker borrowing the bus (perf tax measurement)
 
 	// BERR: autovector path only for now. Unmapped-BERR disabled — see
 	// docs/plan_040526.md: enabling it regresses boot because the CPU
@@ -479,7 +480,8 @@ module emu
 		.dout       ( tg68_dout ),
 		.longword   ( tg68_longword ),
 		.addr       ( tg68_a ),
-		.busstate   ( tg68_busstate )
+		.busstate   ( tg68_busstate ),
+		.dbg_walk_cycle_o ( sim_walk_cycle )
 	);
 
 	// CPU debug - capture PC and opcode during instruction fetch
@@ -764,18 +766,91 @@ module emu
 	// slot-starved stall, vs how many SDRAM cpu transactions actually committed.
 	reg [31:0] perf_clk = 0, perf_as = 0, perf_stall = 0, perf_commit = 0;
 	reg [31:0] perf_last_frame = 0;
+	// ---- H2 diagnosis (2026-07-08): access-mix + PMMU walk tax + shadow I-cache ----
+	// Splits AS traffic by kernel busstate (00 fetch / 10 read / 11 write), counts
+	// bus time+cycles the PMMU walker borrows, and models shadow I-caches on the
+	// fetch stream (MacLC PCH0 methodology, sim-side: word-granular direct-mapped
+	// tags, write-snooped). Observation only — no behavior change, sim-only file.
+	reg [31:0] perf_f = 0, perf_dr = 0, perf_dw = 0, perf_walks = 0;
+	reg [31:0] perf_f_clk = 0, perf_dr_clk = 0, perf_dw_clk = 0, perf_walk_clk = 0;
+	reg [31:0] perf_hit256 = 0, perf_hit1k = 0, perf_hit4k = 0;
+	reg        perf_as_d = 1, perf_walk_d = 0;
+	reg          v256 [0:127];  reg [15:0] t256 [0:127];   // 256 B (real 030 I-cache size)
+	reg          v1k  [0:511];  reg [13:0] t1k  [0:511];   // 1 KB (MacLC fetch_cache size)
+	reg          v4k  [0:2047]; reg [11:0] t4k  [0:2047];  // 4 KB (upper bound probe)
+	integer perf_si;
+	initial begin
+		for (perf_si=0; perf_si<128;  perf_si=perf_si+1) v256[perf_si] = 0;
+		for (perf_si=0; perf_si<512;  perf_si=perf_si+1) v1k[perf_si]  = 0;
+		for (perf_si=0; perf_si<2048; perf_si=perf_si+1) v4k[perf_si]  = 0;
+	end
+	wire [22:0] perf_wa = cpuAddr[23:1];  // word address on the pins
 	always @(posedge clk_sys) begin
 		perf_clk <= perf_clk + 1;
 		if (!_cpuAS)              perf_as     <= perf_as + 1;
 		if (!_cpuAS && _cpuDTACK) perf_stall  <= perf_stall + 1;
 		if (cpuBusControl && memoryLatch && (selectRAM || selectVRAM || selectROM))
 		                          perf_commit <= perf_commit + 1;
+
+		// Bus-time split. During a walk the kernel is stalled mid-access, so the
+		// pin-level AS belongs to the walker — classify it as walk, not fetch.
+		if (!_cpuAS) begin
+			if (sim_walk_cycle)               perf_walk_clk <= perf_walk_clk + 1;
+			else case (tg68_busstate)
+				2'b00: perf_f_clk  <= perf_f_clk  + 1;
+				2'b10: perf_dr_clk <= perf_dr_clk + 1;
+				2'b11: perf_dw_clk <= perf_dw_clk + 1;
+				default: ;
+			endcase
+		end
+		perf_walk_d <= sim_walk_cycle;
+		if (sim_walk_cycle && !perf_walk_d) perf_walks <= perf_walks + 1;
+
+		// Access counting + shadow I-cache at each AS falling edge
+		perf_as_d <= _cpuAS;
+		if (perf_as_d && !_cpuAS && !sim_walk_cycle) begin
+			case (tg68_busstate)
+			2'b00: begin
+				perf_f <= perf_f + 1;
+				if (v256[perf_wa[6:0]] && t256[perf_wa[6:0]] == perf_wa[22:7])
+					perf_hit256 <= perf_hit256 + 1;
+				else begin v256[perf_wa[6:0]] <= 1'b1; t256[perf_wa[6:0]] <= perf_wa[22:7]; end
+				if (v1k[perf_wa[8:0]] && t1k[perf_wa[8:0]] == perf_wa[22:9])
+					perf_hit1k <= perf_hit1k + 1;
+				else begin v1k[perf_wa[8:0]] <= 1'b1; t1k[perf_wa[8:0]] <= perf_wa[22:9]; end
+				if (v4k[perf_wa[10:0]] && t4k[perf_wa[10:0]] == perf_wa[22:11])
+					perf_hit4k <= perf_hit4k + 1;
+				else begin v4k[perf_wa[10:0]] <= 1'b1; t4k[perf_wa[10:0]] <= perf_wa[22:11]; end
+			end
+			2'b10: perf_dr <= perf_dr + 1;
+			2'b11: begin
+				perf_dw <= perf_dw + 1;
+				// write snoop: kill any shadow word this write aliases
+				if (v256[perf_wa[6:0]] && t256[perf_wa[6:0]] == perf_wa[22:7])  v256[perf_wa[6:0]] <= 1'b0;
+				if (v1k[perf_wa[8:0]]  && t1k[perf_wa[8:0]]  == perf_wa[22:9])  v1k[perf_wa[8:0]]  <= 1'b0;
+				if (v4k[perf_wa[10:0]] && t4k[perf_wa[10:0]] == perf_wa[22:11]) v4k[perf_wa[10:0]] <= 1'b0;
+			end
+			default: ;
+			endcase
+		end
+
 		if (sim_frame_count != perf_last_frame && (sim_frame_count % 60 == 0)) begin
 			perf_last_frame <= sim_frame_count;
 			$display("[F%0d] PERF: clk=%0d as=%0d stall=%0d (%0d%% of as) commits=%0d",
 				sim_frame_count, perf_clk, perf_as, perf_stall,
 				perf_as ? (perf_stall * 100 / perf_as) : 0, perf_commit);
+			$display("[F%0d] PERF2: acc f=%0d dr=%0d dw=%0d walkrd=%0d | asclk f=%0d dr=%0d dw=%0d walk=%0d",
+				sim_frame_count, perf_f, perf_dr, perf_dw, perf_walks,
+				perf_f_clk, perf_dr_clk, perf_dw_clk, perf_walk_clk);
+			$display("[F%0d] PERF3: ihit 256B=%0d/%0d (%0d%%) 1K=%0d (%0d%%) 4K=%0d (%0d%%)",
+				sim_frame_count, perf_hit256, perf_f,
+				perf_f ? (perf_hit256 * 100 / perf_f) : 0,
+				perf_hit1k, perf_f ? (perf_hit1k * 100 / perf_f) : 0,
+				perf_hit4k, perf_f ? (perf_hit4k * 100 / perf_f) : 0);
 			perf_clk <= 0; perf_as <= 0; perf_stall <= 0; perf_commit <= 0;
+			perf_f <= 0; perf_dr <= 0; perf_dw <= 0; perf_walks <= 0;
+			perf_f_clk <= 0; perf_dr_clk <= 0; perf_dw_clk <= 0; perf_walk_clk <= 0;
+			perf_hit256 <= 0; perf_hit1k <= 0; perf_hit4k <= 0;
 		end
 	end
 `endif
