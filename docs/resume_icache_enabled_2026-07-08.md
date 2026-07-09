@@ -44,22 +44,36 @@ page tables + the SCSI driver cache-ON. Check `simDiskRun/diskboot.log`
 ([HB] advancing, `EDGE berr` count, screenshots = desktop). If it derailed,
 that's the repro to debug IN SIM before further HW reliance.
 
-## NEXT STEPS (in order)
-1. **Speedometer 3.23 Color Benchmarks** on the box (user-run; input injection
-   into the Mac is not established). Baseline to beat: **0.677 ×MacII avg**
-   (38f8a3d). Real LC II ≈ 1.3–1.4. Expect a large jump in all four tests;
-   mono is the one MacLC's (different, DTACK-join) cache regressed — watch it.
-2. **Disk-integrity session** (the MacLC fetch-cache corrupted its Speedometer
-   app): run benchmarks, copy some files, restart via OSD (warm — NEVER hard
-   power off mid-write, see [[maclcii-disk-corruption-from-hard-restarts]]),
-   verify apps still launch + Disk First Aid clean. Backups exist per memory.
-3. Check the sim disk-boot gate result (above).
-4. If Speedometer still lags parity: next levers = grow I-cache 256B→1–2KB
-   (constants in TG68K_Cache_030.vhd + ghdl re-convert + BRAM restructure for
-   fit — 27 free M10Ks; register-array style won't fit past ~512B at 89% ALM)
-   and/or enable the D-side answer path after its own validation pass.
-5. Housekeeping: `perf_run_*_20260708.log` files in `verilator/` are throwaway
-   (gitignored); `simDiskRun/` likewise.
+## SPEEDOMETER RESULT (user-run, evening 2026-07-08) — +25%, not parity yet
+Color Benchmarks on the I-cache build (screenshot 20260708_220257):
+Mono 43.650s/**0.747** · 2-bit 47.200/**0.825** · 4-bit 51.533/**0.891** ·
+8-bit 61.367/**0.922** · **Average 0.846 ×MacII** (was 0.677; slots-only era
+0.508). Mono IMPROVED 21% (MacLC's DTACK-join cache regressed mono — ours
+does not). Now within 9% of the MacLC 68020 core (0.932) despite the PMMU
+tax. User verdict: "much faster but still not at the level I expect" — real
+LC II ≈ 1.3–1.4, we're ~62% of real.
+
+## NEXT STEPS (re-ranked after the 0.846 measurement)
+1. **Wrapper phi-cadence compression (the big lever, ~+25–35%).** The 5-clk
+   bus floor (8 phis/cycle in the tg68k.v s_state walk) vs the real 030's
+   3-clock bus. MacLC reached the same conclusion ("next lever is the
+   wrapper/kernel phi cadence — NOT DTACK"). RISKS: E-clock (eCntr) + VIA/IWM
+   timing ride the same phis; the floppy already can't read at 16 MHz. Mono
+   (the worst test, VRAM RMW-bound, cache-immune) is mostly THIS floor.
+2. **I-cache 256B→1–2KB** (+8–15%): residual-miss data shows 92%→97-98% hit at
+   1KB+. Constants in TG68K_Cache_030.vhd + ghdl re-convert + **BRAM
+   restructure** (register arrays won't fit past ~512B at 89% ALM; 27 M10Ks
+   free; hit lookup must become sync-read — the phi cadence has slack for a
+   1-clk registered lookup, hit decision needed by the NEXT phi1).
+3. **Enable the D-side answer path** (+5–15%): un-tie d_req; needs its own
+   corruption-watch pass (write-through + snoop already in the module; the OS
+   sets CACR.DE ~F148 so it activates immediately).
+4. **VRAM-write fast-ack** (+2–5%, contained): BRAM-backed VRAM writes still
+   wait for slot-aligned DTACK they don't need (MacLC.sv/sim.v dtack glue).
+5. **Disk-integrity session** still owed (benchmarks ran fine; do the
+   copy/restart/DFA check per [[maclcii-disk-corruption-from-hard-restarts]]).
+6. Housekeeping: `perf_run_*_20260708.log` + `simDiskRun/` are gitignored
+   throwaways.
 
 ## HARD-WON GOTCHAS THIS SESSION (also in memory `maclcii-cache-fill-fc7-berr-race`)
 - **The ROM bus-errors ~14×/boot BY DESIGN** — the device-table walk re-invokes
