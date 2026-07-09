@@ -1,5 +1,21 @@
 # RESUME — 68030 I-cache ENABLED, HW boots 7.1 to Finder (2026-07-08)
 
+> **UPDATE 2026-07-09 ~01:00 — COMBINED BUILD (I-cache + pseudo-VIA rewrite)
+> DEPLOYED.** After the push surfaced a parallel session's 7.5.5 pseudo-VIA
+> MAME-port rewrite (merged as `52ebac1`), the combined tree was validated and
+> deployed: on the box now = md5 `2031660f84f46bbd3ddee9a54b47ece8` (tree
+> `374f091`, 89% ALM, core TNS 0; HDMI-scaler PLL −1.06 ns = fit-lottery,
+> reseed if shimmer). Boots 7.1 → stable Finder. Sim gate: 14-probe ledger,
+> desktop drawn, live idle at A0786A/72 (the pseudo-VIA shifts the no-disk
+> timeline ~+160 frames BY DESIGN — TimeDBRA delays now run correct length).
+> **D-CACHE PARKED TWICE:** (1) fitter FAILS ROUTING at 98% ALM with it
+> enabled; (2) sim WEDGES at the A4A004 SCC-poll with a gray screen (suspected
+> LOGICAL-TAG ALIASING: flag written via one address mapping, polled via its
+> 24/32-bit mirror = two logical tags, one physical location — poller hits a
+> stale line forever). Constraint: the BRAM restructure must give the D-cache
+> physical tags (or alias-aware invalidation). Speedometer on the combined
+> build = pending (user); prior I-only build measured **0.846 ×MacII**.
+
 Read cold to continue. Branch `video-performance`. The H2 instruction-cache
 lever from the 07-08 morning resume is DONE through HW boot validation: the
 parked-since-June TG68K cache subsystem is enabled (I-side), four wrapper bugs
