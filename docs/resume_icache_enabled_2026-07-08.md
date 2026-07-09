@@ -8,6 +8,10 @@
 > reseed if shimmer). Boots 7.1 → stable Finder. Sim gate: 14-probe ledger,
 > desktop drawn, live idle at A0786A/72 (the pseudo-VIA shifts the no-disk
 > timeline ~+160 frames BY DESIGN — TimeDBRA delays now run correct length).
+> **Speedometer (user-run 2026-07-09 morning): mono 40.100s/0.813 · 2-bit
+> 43.400/0.897 · 4-bit 47.400/0.969 · 8-bit 56.267/1.006 (>Mac II!) —
+> AVERAGE 0.921 ×MacII** (+9% from the pseudo-VIA fix; ladder 0.508 → 0.677 →
+> 0.846 → 0.921; ≈ the MacLC 68020 core's 0.932 despite the PMMU).
 > **D-CACHE PARKED TWICE:** (1) fitter FAILS ROUTING at 98% ALM with it
 > enabled; (2) sim WEDGES at the A4A004 SCC-poll with a gray screen (suspected
 > LOGICAL-TAG ALIASING: flag written via one address mapping, polled via its
