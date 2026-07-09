@@ -667,15 +667,15 @@ end
 		wire        xlate_ready = 1'b1;
 
 		wire i_req = is_030 & cacr_ie & (tg68_busstate == 2'b00) & xlate_ready;
-		// D-cache DISABLED (2026-07-08 diagnostic B): the first cache-ON run on the
-		// post-v9 kernel diverged in late boot (wild read faddr=FFFFFFF2 @A472CE,
-		// ~12 extra BERRs, SCC-poll wedge instead of the F396 idle loop). The
-		// D-side carries the write-coherency complexity and is the low-value half
-		// (fetches = 65-86% of traffic; framebuffer is uncacheable anyway). Tie
-		// d_req off to isolate: clean boot => D-side implicated, I-only is the
-		// ship shape; still dirty => fill-borrow/kernel-hold class (the a254a02
-		// walk holds don't know about fills).
-		wire d_req = 1'b0 & is_030 & cacr_de & (tg68_busstate == 2'b10 || tg68_busstate == 2'b11) & xlate_ready;
+		// D-side answer path ENABLE experiment (2026-07-08 evening): the 0.846
+		// Speedometer build shipped with this tied 1'b0 (diagnostic-B isolation
+		// shape; the D-side was subsequently EXONERATED — the corruption was the
+		// fill FC/launch/berr plumbing, fixed above — but the tie-off shipped as
+		// the minimal-risk first HW build). Re-enable gated on cacr_de as
+		// designed; the OS sets DE ~F148, so the no-disk A/B exercises it live.
+		// Framebuffer stays uncacheable (phys decode); this helps heap/source
+		// reads only. If this build regresses or corrupts: restore the 1'b0 tie.
+		wire d_req = is_030 & cacr_de & (tg68_busstate == 2'b10 || tg68_busstate == 2'b11) & xlate_ready;
 		wire d_we  = (tg68_busstate == 2'b11);
 
 		// Cacheable physical regions on the V8 24-bit map (rtl/addrDecoder.v):
