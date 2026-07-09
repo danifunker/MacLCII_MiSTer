@@ -667,15 +667,15 @@ end
 		wire        xlate_ready = 1'b1;
 
 		wire i_req = is_030 & cacr_ie & (tg68_busstate == 2'b00) & xlate_ready;
-		// D-side answer path ENABLE experiment (2026-07-08 evening): the 0.846
-		// Speedometer build shipped with this tied 1'b0 (diagnostic-B isolation
-		// shape; the D-side was subsequently EXONERATED — the corruption was the
-		// fill FC/launch/berr plumbing, fixed above — but the tie-off shipped as
-		// the minimal-risk first HW build). Re-enable gated on cacr_de as
-		// designed; the OS sets DE ~F148, so the no-disk A/B exercises it live.
-		// Framebuffer stays uncacheable (phys decode); this helps heap/source
-		// reads only. If this build regresses or corrupts: restore the 1'b0 tie.
-		wire d_req = is_030 & cacr_de & (tg68_busstate == 2'b10 || tg68_busstate == 2'b11) & xlate_ready;
+		// D-side answer path: TIED OFF for FPGA fit (2026-07-09). Enabling it
+		// (live d_req) synthesizes the D-cache register arrays + 128-bit muxes
+		// that are otherwise swept, and together with the pseudo-VIA rewrite
+		// the fitter hit 98% ALM and FAILED ROUTING (349 signals, Error 11802).
+		// The D-side is functionally exonerated (sim-clean with it enabled —
+		// the 2026-07-08 corruption was fill FC/launch/berr plumbing, fixed
+		// above); it returns with the planned BRAM restructure, which moves the
+		// cache arrays into M10Ks (27 free) and removes the routing pressure.
+		wire d_req = 1'b0 & is_030 & cacr_de & (tg68_busstate == 2'b10 || tg68_busstate == 2'b11) & xlate_ready;
 		wire d_we  = (tg68_busstate == 2'b11);
 
 		// Cacheable physical regions on the V8 24-bit map (rtl/addrDecoder.v):
