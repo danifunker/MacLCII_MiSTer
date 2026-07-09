@@ -33,7 +33,6 @@ make clean  # Clean build artifacts
 Key options:
 - `--screenshot <frames>` - Save PNG screenshots (comma-separated frame list); PNGs land in the CWD
 - `--stop-at-frame <frame>` - Exit simulation after reaching frame count
-- `--trace` - Enable FST waveform tracing (outputs to `trace.fst`)
 - `--scsi0 <image>` - Mount a SCSI hard-drive image and boot from it. The sim WRITES to the image — always boot a copy, never a master
 - `--headless` - No SDL/ImGui window (use for all long runs)
 - `--heartbeat` - One `[HB] F<n> pc=... a7=...` line per video frame on stderr (progress/wedge diagnosis on long runs)
@@ -41,7 +40,8 @@ Key options:
 - `--trace-frames A,B` - Only write cpu_trace.log lines for frames A..B (bounded forensic capture)
 
 Note: `--help` is stale — the disk/heartbeat/trace-window flags above exist but are not all listed there.
-Note: With no disk, boot reaches the blinking-? desktop in ~360 frames. A full System 7.1 boot from `--scsi0` reaches Finder well past frame 2000; the sim runs roughly 80-100 min per 1000 frames.
+Note: With no disk, boot reaches the blinking-? desktop in ~360 frames. A full System 7.1 boot from `--scsi0` reaches Finder well past frame 2000; the sim runs ~5.4 s/frame (~90 min per 1000 frames) on an Apple M1.
+Note: FST wave tracing is NOT wired up (there is no `--trace` CLI flag; nothing instantiates a tracer). The build deliberately omits Verilator's `--trace-fst`/`--timing` for a ~1.5x sim speedup (see `verilator/Makefile`). Because of this, any internal signal `sim_main.cpp` reads via `rootp->` MUST be listed as `public_flat_rd` in `verilator/tg68k_debug.vlt` or Verilator will optimize it away and the C++ build breaks.
 
 #### CWD requirement / running sims in parallel
 `$readmemh` paths in the RTL are CWD-relative (`../rtl/egret/egret_rom.hex`, `../rtl/egret/egret.pram` under `SIMULATION`), and `cpu_trace.log` + screenshots are written to the CWD. Consequences:
