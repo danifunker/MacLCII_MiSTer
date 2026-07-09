@@ -666,23 +666,34 @@ end
 		// cannot occur mid-walk regardless of this gate.
 		wire        xlate_ready = 1'b1;
 
-		wire i_req = is_030 & cacr_ie & (tg68_busstate == 2'b00) & xlate_ready;
-		// D-side answer path: TIED OFF for FPGA fit (2026-07-09). Enabling it
-		// (live d_req) synthesizes the D-cache register arrays + 128-bit muxes
-		// that are otherwise swept, and together with the pseudo-VIA rewrite
-		// the fitter hit 98% ALM and FAILED ROUTING (349 signals, Error 11802).
-		// The D-side is functionally exonerated (sim-clean with it enabled —
-		// the 2026-07-08 corruption was fill FC/launch/berr plumbing, fixed
-		// above); it returns with the planned BRAM restructure, which moves the
-		// cache arrays into M10Ks (27 free) and removes the routing pressure.
-		wire d_req = 1'b0 & is_030 & cacr_de & (tg68_busstate == 2'b10 || tg68_busstate == 2'b11) & xlate_ready;
+		// PIPT hazard gate (2026-07-09): the BRAM cache tags on phys[23:0] with
+		// NO FC in the tag, so CPU-space (FC=7) cycles — the ROM's moves-probe
+		// reads of $22000, physically RAM — could HIT a cached line and skip
+		// the bus error the probe depends on. Never present FC=7 to the cache.
+		wire fc_cacheable = (kernel_fc != 3'b111);
+		wire i_req = is_030 & cacr_ie & fc_cacheable & (tg68_busstate == 2'b00) & xlate_ready;
+		// D-side answer path: TIED OFF pending root-cause (2026-07-09 bisect).
+		// The first BRAM-module gate ran with D live and wedged in the SCC-poll
+		// spin DESPITE the PIPT tags — so the D wedge is NOT (only) the 24/32-bit
+		// mirror aliasing theory; something in the D path (module or interplay)
+		// is still wrong. Bisect: I-only-2KB must gate clean first (it carries
+		// the measured 97%+ hit-rate win); D returns with its own forensics.
+		wire d_req = 1'b0 & is_030 & cacr_de & fc_cacheable & (tg68_busstate == 2'b10 || tg68_busstate == 2'b11) & xlate_ready;
 		wire d_we  = (tg68_busstate == 2'b11);
 
 		// Cacheable physical regions on the V8 24-bit map (rtl/addrDecoder.v):
 		// RAM $000000-$9FFFFF + ROM $A00000-$AFFFFF. Excludes unmapped $B-$E and
 		// I/O + VRAM ($F). As on the real 030, cache-inhibit (CI) blocks new
 		// ALLOCATION, not hits on already-present lines.
-		wire        phys_cacheable = (cache_addr_phys[23:20] <= 4'hA);
+		// Allocate decode (2026-07-09): the high byte matters — only true RAM
+		// ($00xxxxxx) and the 32-bit ROM window ($40xxxxxx, same bytes as the
+		// 24-bit $A ROM) may FILL. 32-bit slot/superslot space ($Fsxxxxxx) and
+		// anything else must never allocate: with full-32-bit tags they then
+		// simply miss to the bus and bus-error like real hardware.
+		wire        phys_lo_cacheable = (cache_addr_phys[23:20] <= 4'hA);
+		wire        phys_cacheable = phys_lo_cacheable &&
+		                             (cache_addr_phys[31:24] == 8'h00 ||
+		                              (cache_addr_phys[31:24] == 8'h40 && cache_addr_phys[23:20] == 4'hA));
 		wire        fill_inhibit   = cache_inhibit_pmmu | ~phys_cacheable;
 
 		wire [31:0] i_data, d_data_out;
@@ -736,7 +747,10 @@ end
 			endcase
 		end
 
-		TG68K_Cache_030 cache_inst (
+		// BRAM edition (2026-07-09): PIPT on phys[23:0] (logical addr + FC tag
+		// ports are GONE — see the module header + the fc_cacheable gate above),
+		// 2KB+2KB, sync lookup in M10Ks. Same fill/inv/write-through contract.
+		TG68K_Cache_030_bram cache_inst (
 			.clk             ( clk             ),
 			.nreset          ( ~reset          ),
 			.cacr_ie         ( cacr_ie         ),
@@ -749,9 +763,7 @@ end
 			.cache_op_cache  ( cache_op_cache  ),
 			.cache_op_addr   ( cache_op_addr   ),
 
-			.i_addr          ( cache_addr_log  ),
 			.i_addr_phys     ( cache_addr_phys ),
-			.i_fc            ( kernel_fc       ),
 			.i_req           ( i_req           ),
 			.i_cache_inhibit ( fill_inhibit    ),
 			.i_data          ( i_data          ),
@@ -761,9 +773,7 @@ end
 			.i_fill_data     ( i_fill_data     ),
 			.i_fill_valid    ( i_fill_valid    ),
 
-			.d_addr          ( cache_addr_log  ),
 			.d_addr_phys     ( cache_addr_phys ),
-			.d_fc            ( kernel_fc       ),
 			.d_req           ( d_req           ),
 			.d_we            ( d_we            ),
 			.d_cache_inhibit ( fill_inhibit    ),
@@ -776,6 +786,48 @@ end
 			.d_fill_data     ( d_fill_data     ),
 			.d_fill_valid    ( d_fill_valid    )
 		);
+
+`ifdef SIMULATION
+		// BUS-TRUTH CHECKER (2026-07-09 forensics v2; replaced the golden-module
+		// diff, which drowned in legitimate 2KB-vs-256B hit differences). A
+		// mirror of the 24-bit word space is built from ACTUAL BUS TRAFFIC:
+		// every completed read (CPU, walker, fill — all latch din at phi2/s6)
+		// and every write records the word at addr[23:1]. Every cache hit the
+		// kernel consumes is then checked against the mirror: a hit serving
+		// data that memory does not hold is THE defect, printed with both
+		// values. Mirror validity is per-word; unmodeled words are skipped.
+		reg [15:0] btm_data  [0:(1<<23)-1];   // word mirror of the 24-bit space
+		reg        btm_valid [0:(1<<23)-1];
+		integer btm_i;
+		initial for (btm_i = 0; btm_i < (1<<23); btm_i = btm_i + 1) btm_valid[btm_i] = 1'b0;
+		reg [7:0] btm_n = 0;
+		always @(posedge clk) begin
+			// Record completed bus reads (din valid at phi2, s_state 6; the din
+			// capture point every consumer uses) and writes (dout driven).
+			if (phi2 && s_state == 3'd6 && eff_busstate != 2'b01) begin
+				if (eff_rw) begin
+					btm_data [addr[23:1]] <= din;
+					btm_valid[addr[23:1]] <= 1'b1;
+				end else begin
+					// Writes: update the touched byte lanes; a word becomes
+					// (or stays) valid only when both lanes are known.
+					if (!uds_n_r) btm_data[addr[23:1]][15:8] <= dout[15:8];
+					if (!lds_n_r) btm_data[addr[23:1]][7:0]  <= dout[7:0];
+					if (!uds_n_r && !lds_n_r) btm_valid[addr[23:1]] <= 1'b1;
+				end
+			end
+			// Check every consumed cache hit against the mirror.
+			if (phi1 && s_state == 3'd0 && cache_read_hit && !walk_cycle && !fill_freeze &&
+			    btm_valid[cache_addr_phys[23:1]] && btm_n < 8'd24) begin
+				if (cache_kernel_data !== btm_data[cache_addr_phys[23:1]]) begin
+					$display("[BTM] HIT WRONG DATA served=%h mem=%h log=%h phys=%h bs=%b @%0t",
+						cache_kernel_data, btm_data[cache_addr_phys[23:1]],
+						cache_addr_log, cache_addr_phys, tg68_busstate, $time);
+					btm_n <= btm_n + 1'd1;
+				end
+			end
+		end
+`endif
 
 		// 16-bit data demux from the 32-bit cache word, matched to how
 		// TG68K_Cache_030 stores/serves words (ported from upstream
@@ -792,7 +844,18 @@ end
 
 		// Read-hit = present I-line on a fetch, or present D-line on a data read
 		// (never a write). Suppressed during a walk and during a fill.
-		assign cache_read_hit    = ~walk_cycle & ~fill_active &
+		// s_state==0 gate (2026-07-09, THE BRAM-gate wedge root, found by the
+		// bus-truth checker proving all served DATA correct): the registered
+		// lookup can assert a hit one cycle LATE — e.g. when a fill has just
+		// populated the wanted line and the RDW shadow blanks the decision
+		// edge — after the bus cycle already started at phi2. The unconditional
+		// `if (cache_read_hit) s_state <= 0` then TORE the in-flight cycle
+		// (AS asserted, never completed): correct data, corrupted bus protocol,
+		// peripheral FSMs (SCC pointer, probes) seeing phantom/torn accesses.
+		// The old combinational module could never hit mid-own-miss-cycle, so
+		// its unconditional zero was safe. A late hit now simply lets the
+		// started cycle complete via the normal miss path — same data.
+		assign cache_read_hit    = ~walk_cycle & ~fill_active & (s_state == 3'd0) &
 		                           ((i_hit & i_req) | (d_hit & d_req & ~d_we));
 		assign cache_kernel_data = data_out_16;
 

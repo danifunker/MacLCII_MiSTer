@@ -312,27 +312,35 @@ module scc
 			// clear cs_access_done on a genuine external hardware reset.
 			cs_access_done <= ~reset_hw;
 		end else begin
-			// Track CS edges - only process one access per CS assertion
-			if (cen) begin
-				if (!cs) begin
-					cs_access_done <= 0;  // Reset when CS deasserts
-					// Deferred WR0-pointer cleanup: now that the CPU has
-					// completed its bus access and sampled rdata, it's
-					// safe to reset rindex_a/scc_state_a. Previously this
-					// reset fired inside the CS window, causing rdata_mux
-					// to flip from RR1 to RR0 before the CPU's data latch.
-					// MAME consumes m_wr0_ptrbits at the END of the
-					// accessor; we mirror that by deferring to CS deassert.
-					if (pending_cleanup_a) begin
-						rindex_a <= 0;
-						scc_state_a <= 0;
-						pending_cleanup_a <= 0;
-					end
-					if (pending_cleanup_b) begin
-						rindex_b <= 0;
-						scc_state_b <= 0;
-						pending_cleanup_b <= 0;
-					end
+			// Track CS edges - only process one access per CS assertion.
+			// The deassert branch is sampled EVERY clk (2026-07-09): it used to
+			// sit under `if (cen)`, so a CS gap shorter than one pclk-enable
+			// period between two back-to-back SCC accesses was never seen —
+			// cs_access_done stayed set (second access silently DROPPED) and
+			// the deferred WR0-pointer cleanup never ran (rindex stale). The
+			// uncached CPU always padded the gap with fetch cycles; with the
+			// I-cache the ROM's port self-test issues accesses ~4-6 clk apart
+			// and wedged forever polling tx_empty (post_lb=1, rr0=00). A real
+			// 8530 latches its bus interface per access and has no such gap
+			// assumption. Access PROCESSING below stays cen-paced.
+			if (!cs) begin
+				cs_access_done <= 0;  // Reset when CS deasserts
+				// Deferred WR0-pointer cleanup: now that the CPU has
+				// completed its bus access and sampled rdata, it's
+				// safe to reset rindex_a/scc_state_a. Previously this
+				// reset fired inside the CS window, causing rdata_mux
+				// to flip from RR1 to RR0 before the CPU's data latch.
+				// MAME consumes m_wr0_ptrbits at the END of the
+				// accessor; we mirror that by deferring to CS deassert.
+				if (pending_cleanup_a) begin
+					rindex_a <= 0;
+					scc_state_a <= 0;
+					pending_cleanup_a <= 0;
+				end
+				if (pending_cleanup_b) begin
+					rindex_b <= 0;
+					scc_state_b <= 0;
+					pending_cleanup_b <= 0;
 				end
 			end
 			if (cen && cs && !cs_access_done) begin

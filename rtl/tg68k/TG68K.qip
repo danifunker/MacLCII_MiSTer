@@ -10,6 +10,8 @@
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) TG68K_Pack.vhd ]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) TG68K_ALU.vhd ]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) TG68K_PMMU_030.vhd ]
-set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) TG68K_Cache_030.vhd ]
+# TG68K_Cache_030.vhd (256B register-array caches) replaced 2026-07-09 by the
+# BRAM/PIPT SystemVerilog edition; the .vhd stays on disk as reference only.
+set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) TG68K_Cache_030_bram.sv ]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) TG68KdotC_Kernel.vhd ]
 set_global_assignment -name VERILOG_FILE [file join $::quartus(qip_path) tg68k.v ]
